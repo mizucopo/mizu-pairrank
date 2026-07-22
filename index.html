@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>mizu-pairrank</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="intro">
+        <p class="eyebrow">Tauri Desktop App</p>
+        <h1>mizu-pairrank</h1>
+      </section>
+
+      <form class="greeting-form" id="greeting-form">
+        <label for="greeting-name">Name</label>
+        <div class="input-row">
+          <input id="greeting-name" name="name" autocomplete="name" value="Tauri" />
+          <button type="submit">Greet</button>
+        </div>
+      </form>
+
+      <output class="greeting-output" id="greeting-output" for="greeting-name"></output>
+    </main>
+  </body>
+</html>
