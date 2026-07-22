@@ -6,7 +6,7 @@ node_version: '24'
 rust_version: stable
 tauri_identifier: dev.mizu.pairrank
 tauri_product_name: mizu-pairrank
-tauri_version: 0.1.0
+tauri_version: 0.2.0
 use_chrome_extension: false
 use_dependabot_github_actions: true
 use_docker: false
