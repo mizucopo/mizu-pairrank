@@ -1,12 +1,12 @@
 [package]
-name = "test-tauri-app"
+name = "mizu-pairrank"
 version = "0.2.0"
 description = "mizu-pairrank"
 authors = ["\u307f\u305a"]
 edition = "2024"
 
 [lib]
-name = "test_tauri_app_lib"
+name = "mizu_pairrank_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
