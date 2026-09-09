@@ -1,6 +1,6 @@
 {
   "name": "mizu-pairrank",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "mizu-pairrank",
   "private": true,
   "type": "module",
@@ -15,7 +15,7 @@
     "dev": "vite",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "lint": "eslint . --max-warnings=0",
+    "lint": "oxlint --type-aware --deny-warnings .",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest",
@@ -27,13 +27,11 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
-    "@eslint/js": "^10.0.1",
     "@types/node": "^24.13.3",
-    "eslint": "^10.8.1",
-    "globals": "^17.9.0",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
     "prettier": "^3.9.6",
-    "typescript": "^6.0.3",
-    "typescript-eslint": "^8.67.0",
+    "typescript": "^7.0.2",
     "vite": "^8.2.1",
     "vitest": "^4.1.10"
   }

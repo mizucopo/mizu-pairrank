@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "options": {
+    "typeAware": true
+  },
+  "ignorePatterns": ["coverage/**", "dist/**", "node_modules/**"],
+  "rules": {
+    "typescript/consistent-type-definitions": ["error", "type"]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.{js,mjs,cjs}"],
+      "env": {
+        "node": true
+      }
+    },
+    {
+      "files": ["**/*.ts"],
+      "plugins": ["typescript"],
+      "env": {
+        "browser": true
+      }
+    },
+    {
+      "files": ["vite.config.ts", "vitest.config.ts"],
+      "env": {
+        "node": true
+      }
+    }
+  ]
+}
