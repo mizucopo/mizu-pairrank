@@ -1,4 +1,4 @@
-_commit: 7a560e6
+_commit: 0200f145738c6c289ccd90befe1de076a488b5a6
 _src_path: git@github.com:mizucopo/repo-template.git
 author_email: mizu.copo@gmail.com
 author_name: みず
@@ -20,9 +20,5 @@ use_mit_license: false
 use_python: false
 use_rust: false
 use_tauri: true
-repo_template_python_starters_created: false
-repo_template_python_application_starter_created: false
-repo_template_python_package_starter_names: []
-repo_template_rust_starters_created: false
-repo_template_chrome_starters_created: false
-repo_template_tauri_starters_created: true
+use_version_management: true
+repo_template_tauri_branding_assets_created: true

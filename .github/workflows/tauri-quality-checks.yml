@@ -40,8 +40,8 @@ jobs:
             npm install
           fi
 
-      - name: Run ESLint
-        id: eslint
+      - name: Run Oxlint
+        id: oxlint
         continue-on-error: true
         run: npm run lint
 
@@ -86,7 +86,7 @@ jobs:
         id: tauri-quality-report
         if: ${{ !cancelled() }}
         env:
-          ESLINT_OUTCOME: ${{ steps.eslint.outcome }}
+          OXLINT_OUTCOME: ${{ steps.oxlint.outcome }}
           PRETTIER_OUTCOME: ${{ steps.prettier.outcome }}
           TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
           VITEST_OUTCOME: ${{ steps.vitest.outcome }}
@@ -109,7 +109,7 @@ jobs:
 
           | Item | Result |
           |-------------|------|
-          | ESLint | $(format_result "$ESLINT_OUTCOME") |
+          | Oxlint | $(format_result "$OXLINT_OUTCOME") |
           | Prettier | $(format_result "$PRETTIER_OUTCOME") |
           | TypeScript | $(format_result "$TYPECHECK_OUTCOME") |
           | Vitest | $(format_result "$VITEST_OUTCOME") |
@@ -123,7 +123,7 @@ jobs:
 
           HAS_FAILURE=false
           for outcome in \
-            "$ESLINT_OUTCOME" \
+            "$OXLINT_OUTCOME" \
             "$PRETTIER_OUTCOME" \
             "$TYPECHECK_OUTCOME" \
             "$VITEST_OUTCOME" \
