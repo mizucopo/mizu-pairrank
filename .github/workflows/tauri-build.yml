@@ -1,0 +1,107 @@
+name: Tauri Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tauri-build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - platform: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+      ARTIFACT_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ".node-version"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add "$RUST_TARGET"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        run: npm run tauri -- build --target "$RUST_TARGET" --no-bundle
+
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: npm run tauri -- build --target "$RUST_TARGET" --bundles app
+
+      - name: Prepare application artifact
+        id: artifact
+        run: |
+          shopt -s nullglob dotglob
+          cargo_target_dir="$(
+            cd src-tauri
+            cargo metadata --no-deps --format-version 1 |
+              node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).target_directory.replaceAll("\\", "/")'
+          )"
+          release_dir="$cargo_target_dir/$RUST_TARGET/release"
+          artifact_dir="$RUNNER_TEMP/tauri-artifacts"
+          mkdir -p "$artifact_dir"
+
+          if [[ "$ARTIFACT_PLATFORM" == windows-* ]]; then
+            applications=("$release_dir"/*.exe)
+            if [ "${#applications[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one Windows application in $release_dir."
+              exit 1
+            fi
+            app_name="${applications[0]##*/}"
+            artifact_path="$artifact_dir/${app_name%.exe}-$ARTIFACT_PLATFORM.exe"
+            cp "${applications[0]}" "$artifact_path"
+          else
+            applications=("$release_dir"/bundle/macos/*.app)
+            if [ "${#applications[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one macOS application in $release_dir/bundle/macos."
+              exit 1
+            fi
+            app_name="${applications[0]##*/}"
+            artifact_path="$artifact_dir/${app_name%.app}-$ARTIFACT_PLATFORM.tar.gz"
+            tar -czf "$artifact_path" -C "$release_dir/bundle/macos" -- "$app_name"
+          fi
+
+          # Upload the directory so glob characters in app names remain literal.
+          echo "path=$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload application artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.artifact.outputs.path }}
+          archive: false
+          include-hidden-files: true
+          if-no-files-found: error
