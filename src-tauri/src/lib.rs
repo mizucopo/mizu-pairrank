@@ -6,7 +6,7 @@ mod rating;
 
 use database::Database;
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
-use models::{ListState, ListSummary};
+use models::{ImageAsset, ListState, ListSummary};
 use rating::Preference;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
@@ -17,20 +17,80 @@ struct Backend {
     images: Result<Arc<ImageService>, String>,
 }
 
+impl Backend {
+    async fn database_job<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Database) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let database = self.database.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut guard = database.lock().map_err(|_| {
+                "データ操作を続けられません。アプリを再起動してください。".to_string()
+            })?;
+            let database = guard.as_mut().map_err(|error| error.clone())?;
+            operation(database)
+        })
+        .await
+        .map_err(|error| format!("データ処理に失敗しました: {error}"))?
+    }
+
+    async fn change_images<T: Send + 'static>(
+        &self,
+        list_id: i64,
+        image: Option<ImageAsset>,
+        operation: impl FnOnce(&mut Database, Option<ImageAsset>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let images = self.images.clone().ok();
+        let imported = image.clone();
+        let result = self
+            .database_job(move |db| {
+                let previous = db
+                    .get_list(list_id)?
+                    .items
+                    .into_iter()
+                    .filter_map(|item| item.image);
+                let result = operation(db, image)?;
+                if let Some(images) = &images {
+                    remove_unused_images(db, images, previous);
+                }
+                Ok(result)
+            })
+            .await;
+        if let (Err(_), Some(image), Ok(images)) = (&result, imported, &self.images) {
+            let database = self.database.clone();
+            let images = images.clone();
+            // Inspect even a poisoned lock for cleanup, without allowing another mutation.
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let guard = database
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Ok(db) = &*guard {
+                    remove_unused_images(db, &images, [image]);
+                }
+            })
+            .await;
+        }
+        result
+    }
+}
+
+fn remove_unused_images(
+    db: &Database,
+    service: &ImageService,
+    images: impl IntoIterator<Item = ImageAsset>,
+) {
+    for image in images {
+        if db.image_in_use(&image.path) == Ok(false) {
+            service.remove_managed_file(&image.path);
+        }
+    }
+}
+
 async fn database_job<T: Send + 'static>(
     app: AppHandle,
     operation: impl FnOnce(&mut Database) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    let database = app.state::<Backend>().database.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = database
-            .lock()
-            .map_err(|_| "データ操作を続けられません。アプリを再起動してください。".to_string())?;
-        let database = guard.as_mut().map_err(|error| error.clone())?;
-        operation(database)
-    })
-    .await
-    .map_err(|error| format!("データ処理に失敗しました: {error}"))?
+    app.state::<Backend>().database_job(operation).await
 }
 
 fn image_service(app: &AppHandle) -> Result<Arc<ImageService>, String> {
@@ -55,7 +115,9 @@ async fn rename_list(app: AppHandle, list_id: i64, name: String) -> Result<ListS
 }
 #[tauri::command]
 async fn delete_list(app: AppHandle, list_id: i64) -> Result<(), String> {
-    database_job(app, move |db| db.delete_list(list_id)).await
+    app.state::<Backend>()
+        .change_images(list_id, None, move |db, _| db.delete_list(list_id))
+        .await
 }
 #[tauri::command]
 async fn add_items(app: AppHandle, list_id: i64, names: Vec<String>) -> Result<ListState, String> {
@@ -72,7 +134,9 @@ async fn rename_item(
 }
 #[tauri::command]
 async fn delete_item(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListState, String> {
-    database_job(app, move |db| db.delete_item(list_id, item_id)).await
+    app.state::<Backend>()
+        .change_images(list_id, None, move |db, _| db.delete_item(list_id, item_id))
+        .await
 }
 #[tauri::command]
 async fn resume_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
@@ -178,11 +242,12 @@ async fn set_local_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<L
     })
     .await
     .map_err(|error| error.to_string())??;
-    database_job(app, move |db| match image {
-        Some(image) => db.set_image(list_id, item_id, Some(image)),
-        None => db.get_list(list_id),
-    })
-    .await
+    app.state::<Backend>()
+        .change_images(list_id, image, move |db, image| match image {
+            Some(image) => db.set_image(list_id, item_id, Some(image)),
+            None => db.get_list(list_id),
+        })
+        .await
 }
 #[tauri::command]
 async fn set_remote_image(
@@ -192,11 +257,19 @@ async fn set_remote_image(
     candidate: ImageCandidate,
 ) -> Result<ListState, String> {
     let image = image_service(&app)?.import_remote(candidate).await?;
-    database_job(app, move |db| db.set_image(list_id, item_id, Some(image))).await
+    app.state::<Backend>()
+        .change_images(list_id, Some(image), move |db, image| {
+            db.set_image(list_id, item_id, image)
+        })
+        .await
 }
 #[tauri::command]
 async fn remove_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListState, String> {
-    database_job(app, move |db| db.set_image(list_id, item_id, None)).await
+    app.state::<Backend>()
+        .change_images(list_id, None, move |db, image| {
+            db.set_image(list_id, item_id, image)
+        })
+        .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -238,4 +311,222 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn backend() -> (tempfile::TempDir, Backend) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        let images = ImageService::new(directory.path().to_owned()).unwrap();
+        (
+            directory,
+            Backend {
+                database: Arc::new(Mutex::new(Ok(database))),
+                images: Ok(Arc::new(images)),
+            },
+        )
+    }
+
+    async fn list_with_image(backend: &Backend) -> (i64, i64, ImageAsset) {
+        let image = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let asset = image.clone();
+        backend
+            .database_job(move |db| {
+                let list = db.create_list("Images".into())?;
+                let list = db.add_items(list.id, vec!["First".into(), "Second".into()])?;
+                let item_id = list.items[0].id;
+                db.set_image(list.id, item_id, Some(image))?;
+                Ok((list.id, item_id, asset))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_an_image_removes_its_managed_file_after_saving_the_item() {
+        let (_directory, backend) = backend();
+        let (list_id, item_id, image) = list_with_image(&backend).await;
+        let state = backend
+            .change_images(list_id, None, move |db, image| {
+                db.set_image(list_id, item_id, image)
+            })
+            .await
+            .unwrap();
+        assert!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .image
+                .is_none()
+        );
+        assert!(!Path::new(&image.path).exists());
+    }
+    #[tokio::test]
+    async fn failed_image_association_cleans_the_import_and_preserves_the_previous_image() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, previous) = list_with_image(&backend).await;
+        let image = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let imported_path = image.path.clone();
+        rusqlite::Connection::open(directory.path().join("test.sqlite3")).unwrap()
+            .execute_batch("CREATE TRIGGER fail_image AFTER UPDATE OF image_path ON items BEGIN SELECT RAISE(ABORT, 'disk failure'); END;").unwrap();
+        assert!(
+            backend
+                .change_images(list_id, Some(image), move |db, image| db
+                    .set_image(list_id, item_id, image))
+                .await
+                .is_err()
+        );
+        let state = backend
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .path,
+            previous.path
+        );
+        assert!(Path::new(&previous.path).exists());
+        assert!(!Path::new(&imported_path).exists());
+    }
+
+    #[tokio::test]
+    async fn replacements_and_deletions_keep_shared_and_in_flight_images_until_unused() {
+        let (_directory, backend) = backend();
+        let (list_id, item_id, previous) = list_with_image(&backend).await;
+        let service = backend.images.as_ref().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png");
+        let image = service.import_local(source.clone()).unwrap();
+        let image_path = image.path.clone();
+        let in_flight = service.import_local(source.clone()).unwrap();
+        let shared = image.clone();
+        backend
+            .change_images(list_id, Some(image), move |db, image| {
+                db.set_image(list_id, item_id, image)
+            })
+            .await
+            .unwrap();
+        assert!(!Path::new(&previous.path).exists());
+        assert!(Path::new(&image_path).exists());
+        let second_id = backend
+            .database_job(move |db| {
+                let list = db.create_list("Second list".into())?;
+                let list = db.add_items(list.id, vec!["Shared image".into()])?;
+                db.set_image(list.id, list.items[0].id, Some(shared))?;
+                Ok(list.id)
+            })
+            .await
+            .unwrap();
+        backend
+            .change_images(list_id, None, move |db, _| db.delete_item(list_id, item_id))
+            .await
+            .unwrap();
+        assert!(Path::new(&image_path).exists());
+        backend
+            .change_images(second_id, None, move |db, _| db.delete_list(second_id))
+            .await
+            .unwrap();
+        assert!(!Path::new(&image_path).exists());
+        assert!(Path::new(&in_flight.path).exists());
+        assert!(source.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_association_preserves_referenced_images_even_when_database_lock_is_poisoned() {
+        let (_directory, backend) = backend();
+        let (list_id, item_id, image) = list_with_image(&backend).await;
+        let path = image.path.clone();
+        let database = backend.database.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = database.lock().unwrap();
+            panic!("simulated prior worker failure");
+        })
+        .join();
+        assert!(
+            backend
+                .change_images(list_id, Some(image), move |db, image| db
+                    .set_image(list_id, item_id, image))
+                .await
+                .is_err()
+        );
+        assert!(Path::new(&path).exists());
+        let unused = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let unused_path = unused.path.clone();
+        assert!(
+            backend
+                .change_images(list_id, Some(unused), move |db, image| db
+                    .set_image(list_id, item_id, image))
+                .await
+                .is_err()
+        );
+        assert!(!Path::new(&unused_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_external_files_and_does_not_fail_a_committed_removal() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, image) = list_with_image(&backend).await;
+        std::fs::remove_file(&image.path).unwrap();
+        std::fs::create_dir(&image.path).unwrap();
+        let state = backend
+            .change_images(list_id, None, move |db, image| {
+                db.set_image(list_id, item_id, image)
+            })
+            .await
+            .unwrap();
+        assert!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .image
+                .is_none()
+        );
+        assert!(Path::new(&image.path).is_dir());
+        let external = directory
+            .path()
+            .join(format!("{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&external, b"keep external source").unwrap();
+        let asset = ImageAsset {
+            path: external.to_string_lossy().into_owned(),
+            source_url: None,
+        };
+        backend
+            .database_job(move |db| db.set_image(list_id, item_id, Some(asset)))
+            .await
+            .unwrap();
+        backend
+            .change_images(list_id, None, move |db, _| db.delete_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(external).unwrap(), b"keep external source");
+    }
 }

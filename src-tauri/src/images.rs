@@ -4,7 +4,7 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -305,6 +305,7 @@ pub struct ImageService {
     directory: PathBuf,
     credentials: Arc<dyn CredentialStore>,
     transport: Arc<dyn ImageTransport>,
+    decode_gate: Arc<Mutex<()>>,
 }
 
 impl ImageService {
@@ -319,7 +320,30 @@ impl ImageService {
             directory,
             credentials: Arc::new(SystemCredentials),
             transport: Arc::new(HttpTransport),
+            decode_gate: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub fn remove_managed_file(&self, path: &str) {
+        let path = Path::new(path);
+        if path.parent() != Some(self.directory.as_path())
+            || path.extension().and_then(|value| value.to_str()) != Some("png")
+            || path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_none()
+        {
+            return;
+        }
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+            && path
+                .canonicalize()
+                .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
+        {
+            // Cleanup must never turn a committed database operation into a failure.
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     pub fn settings(&self) -> Result<SearchSettings, String> {
@@ -387,7 +411,13 @@ impl ImageService {
                     break;
                 };
                 let transport = self.transport.clone();
-                active.spawn(async move { (position, prepare_candidate(transport, seed).await) });
+                let decode_gate = self.decode_gate.clone();
+                active.spawn(async move {
+                    (
+                        position,
+                        prepare_candidate(transport, decode_gate, seed).await,
+                    )
+                });
             }
             let Some(result) = active.join_next().await else {
                 break;
@@ -410,7 +440,11 @@ impl ImageService {
         validate_public_url(&candidate.source_url)?;
         let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
         let directory = self.directory.clone();
+        let decode_gate = self.decode_gate.clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = decode_gate
+                .lock()
+                .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
             save_image(&directory, &resource.bytes, Some(candidate.source_url))
         })
         .await
@@ -431,6 +465,10 @@ impl ImageService {
         file.take(MAX_IMAGE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
+        let _permit = self
+            .decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
         save_image(&self.directory, &bytes, None)
     }
 }
@@ -489,6 +527,7 @@ fn parse_search_response(
 
 async fn prepare_candidate(
     transport: Arc<dyn ImageTransport>,
+    decode_gate: Arc<Mutex<()>>,
     seed: CandidateSeed,
 ) -> Result<ImageCandidate, String> {
     let (image_url, source_url) = if let Some(image_url) = seed.image_url {
@@ -504,9 +543,14 @@ async fn prepare_candidate(
         .filter(|url| validate_public_url(url).is_ok())
         .unwrap_or_else(|| image_url.clone());
     let resource = transport.fetch(&thumbnail_url, MAX_IMAGE_BYTES).await?;
-    let thumbnail = tokio::task::spawn_blocking(move || normalize_image(&resource.bytes, 320))
-        .await
-        .map_err(|_| "画像のプレビューを作成できませんでした。".to_owned())??;
+    let thumbnail = tokio::task::spawn_blocking(move || {
+        let _permit = decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        normalize_image(&resource.bytes, 320)
+    })
+    .await
+    .map_err(|_| "画像のプレビューを作成できませんでした。".to_owned())??;
     Ok(ImageCandidate {
         id: image_url,
         title: seed.title,
@@ -701,6 +745,7 @@ mod tests {
             directory: directory.path().to_owned(),
             credentials: Arc::new(MemoryCredentials::default()),
             transport: transport.clone(),
+            decode_gate: Arc::new(Mutex::new(())),
         };
         (directory, service, transport)
     }
@@ -986,5 +1031,124 @@ mod tests {
             parse_search_response(SearchProvider::Brave, br#"{"error":"invalid key"}"#).is_err()
         );
         assert!(parse_search_response(SearchProvider::Brave, b"broken json").is_err());
+    }
+    #[tokio::test]
+    async fn shared_decode_budget_bounds_searches_and_imports_without_serializing_network_fetches()
+    {
+        struct ParallelTransport {
+            response: Vec<u8>,
+            bytes: Vec<u8>,
+            fetches: tokio::sync::Barrier,
+            fetched: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        impl ImageTransport for ParallelTransport {
+            fn search<'a>(
+                &'a self,
+                _: SearchProvider,
+                _: &'a str,
+                _: &'a str,
+            ) -> NetworkFuture<'a, Vec<u8>> {
+                Box::pin(async { Ok(self.response.clone()) })
+            }
+            fn fetch<'a>(&'a self, url: &'a str, _: usize) -> NetworkFuture<'a, Resource> {
+                Box::pin(async move {
+                    self.fetches.wait().await;
+                    self.fetched.send(()).unwrap();
+                    Ok(Resource {
+                        bytes: self.bytes.clone(),
+                        final_url: url.into(),
+                    })
+                })
+            }
+        }
+        let (directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+        let (fetched, mut fetches) = tokio::sync::mpsc::unbounded_channel();
+        service.transport = Arc::new(ParallelTransport {
+            response: serde_json::to_vec(
+                &serde_json::json!({ "results": (0..4).map(|n| serde_json::json!({
+                "url": format!("https://example.com/{n}"),
+                "properties": { "url": format!("https://example.com/{n}.png") }
+            })).collect::<Vec<_>>() }),
+            )
+            .unwrap(),
+            bytes: png(4, 2),
+            fetches: tokio::sync::Barrier::new(9),
+            fetched,
+        });
+        service
+            .set_api_key(SearchProvider::Brave, "test-key".into())
+            .unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let gate = service.decode_gate.clone();
+        let (occupied, occupied_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let decoder = std::thread::spawn(move || {
+            let _permit = gate.lock().unwrap();
+            occupied.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        occupied_rx.recv().unwrap();
+        let service = Arc::new(service);
+        let mut searches = Vec::new();
+        for _ in 0..2 {
+            let service = service.clone();
+            searches.push(tokio::spawn(async move {
+                service.search(SearchProvider::Brave, "image".into()).await
+            }));
+        }
+        let remote_service = service.clone();
+        let remote = tokio::spawn(async move {
+            remote_service
+                .import_remote(ImageCandidate {
+                    id: "https://example.com/import.png".into(),
+                    title: "Image".into(),
+                    preview_url: String::new(),
+                    source_url: "https://example.com/import".into(),
+                })
+                .await
+        });
+        let local_service = service.clone();
+        let local = tokio::task::spawn_blocking(move || local_service.import_local(source));
+        let network_parallel = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..9 {
+                fetches.recv().await.unwrap();
+            }
+        })
+        .await
+        .is_ok();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waited_for_budget = searches.iter().all(|search| !search.is_finished())
+            && !remote.is_finished()
+            && !local.is_finished();
+        release.send(()).unwrap();
+        decoder.join().unwrap();
+        assert!(
+            network_parallel,
+            "both searches and import must fetch while decoding is occupied"
+        );
+        assert!(
+            waited_for_budget,
+            "search previews and both imports must share the decode budget"
+        );
+        for search in searches {
+            assert_eq!(search.await.unwrap().unwrap().len(), 4);
+        }
+        assert!(Path::new(&remote.await.unwrap().unwrap().path).exists());
+        assert!(Path::new(&local.await.unwrap().unwrap().path).exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_follow_a_replaced_images_directory_outside_app_data() {
+        let app_data = tempfile::tempdir().unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let filename = format!("{}.png", Uuid::new_v4());
+        let original = external.path().join(&filename);
+        std::fs::write(&original, b"external image").unwrap();
+        std::fs::remove_dir(&service.directory).unwrap();
+        std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+        service.remove_managed_file(service.directory.join(filename).to_str().unwrap());
+        assert_eq!(std::fs::read(original).unwrap(), b"external image");
     }
 }

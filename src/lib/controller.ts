@@ -32,6 +32,7 @@ export type AppState = {
   settings: SearchSettings | null;
   candidates: ImageCandidate[];
   searched: boolean;
+  searching: boolean;
   provider: SearchProvider;
   drafts: { name: string; items: string; query: string; braveKey: string; ollamaKey: string };
 };
@@ -63,9 +64,12 @@ export class AppController {
     settings: null,
     candidates: [],
     searched: false,
+    searching: false,
     provider: "brave",
     drafts: { name: "", items: "", query: "", braveKey: "", ollamaKey: "" },
   };
+
+  private imageSearch: symbol | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -158,7 +162,12 @@ export class AppController {
   }
 
   closeModal(): void {
-    if (this.state.busy) return;
+    if (this.state.busy && !this.state.searching) return;
+    if (this.state.searching) {
+      this.imageSearch = null;
+      this.state.searching = false;
+      this.state.busy = false;
+    }
     this.state.modal = null;
     this.state.error = "";
     this.changed();
@@ -178,8 +187,10 @@ export class AppController {
     if (!modal || !name) return;
     await this.perform(async () => {
       let result: ListState;
-      if (modal.kind === "create-list") result = await this.api.createList(name);
-      else if (modal.kind === "rename-list" && list)
+      if (modal.kind === "create-list") {
+        result = await this.api.createList(name);
+        this.state.drafts.items = "";
+      } else if (modal.kind === "rename-list" && list)
         result = await this.api.renameList(list.id, name);
       else if (modal.kind === "rename-item" && list)
         result = await this.api.renameItem(list.id, modal.itemId, name);
@@ -200,6 +211,8 @@ export class AppController {
         this.state.active = null;
         this.state.pair = null;
         this.state.modal = null;
+        this.state.drafts.items = "";
+        this.state.lists = this.state.lists.filter((entry) => entry.id !== list.id);
         this.state.lists = await this.api.listSummaries();
         const first = this.state.lists[0];
         if (first) this.state.active = await this.api.getList(first.id);
@@ -256,13 +269,32 @@ export class AppController {
 
   async searchImages(): Promise<void> {
     const query = this.state.drafts.query.trim();
-    if (!query || this.state.modal?.kind !== "image") return;
-    await this.perform(async () => {
-      this.state.candidates = [];
-      this.state.searched = false;
-      this.state.candidates = await this.api.searchImages(this.state.provider, query);
+    if (this.state.busy || !query || this.state.modal?.kind !== "image") return;
+    const search = Symbol();
+    this.imageSearch = search;
+    this.state.busy = true;
+    this.state.searching = true;
+    this.state.error = "";
+    this.state.notice = "";
+    this.state.candidates = [];
+    this.state.searched = false;
+    this.changed();
+    try {
+      const candidates = await this.api.searchImages(this.state.provider, query);
+      if (this.imageSearch !== search) return;
+      this.state.candidates = candidates;
       this.state.searched = true;
-    });
+    } catch (error) {
+      if (this.imageSearch === search) this.state.error = errorMessage(error);
+    } finally {
+      // A dismissed read must not update a reopened dialog or release a later operation.
+      if (this.imageSearch === search) {
+        this.imageSearch = null;
+        this.state.searching = false;
+        this.state.busy = false;
+        this.changed();
+      }
+    }
   }
 
   async changeImage(source: "local" | "none" | ImageCandidate): Promise<void> {

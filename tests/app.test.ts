@@ -261,6 +261,101 @@ describe("desktop app interaction", () => {
     expect(api.setRemoteImage).not.toHaveBeenCalled();
   });
 
+  it.each(["close button", "Escape"] as const)(
+    "dismisses a pending image search with %s and ignores its late failure",
+    async (dismissal) => {
+      const { root, controller, api, state } = setup();
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: true,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+      });
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      let rejectSearch: ((error: Error) => void) | undefined;
+      api.searchImages.mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectSearch = reject;
+          }),
+      );
+      const pending = controller.searchImages();
+      expect(controller.state.busy).toBe(true);
+      expect(button(root, '[data-action="local-image"]').disabled).toBe(true);
+      if (dismissal === "close button") button(root, '[data-action="close-modal"]').click();
+      else {
+        const dialog = root.querySelector("dialog");
+        if (!dialog) throw new Error("Missing image dialog");
+        dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+      }
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(controller.state.busy).toBe(false);
+      await controller.navigate("ranking");
+      if (!rejectSearch) throw new Error("The search was not started");
+      rejectSearch(new Error("古い検索に失敗しました"));
+      await pending;
+      expect(controller.state.view).toBe("ranking");
+      expect(controller.state.active).toEqual(state);
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      expect(controller.state.candidates).toEqual([]);
+    },
+  );
+
+  it.each(["result", "error"] as const)(
+    "keeps an image write protected when a dismissed search returns a late %s",
+    async (outcome) => {
+      const { root, controller, api, state } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      let finishSearch: (() => void) | undefined;
+      api.searchImages.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishSearch = () => {
+              if (outcome === "result") resolve([]);
+              else reject(new Error("古い検索に失敗しました"));
+            };
+          }),
+      );
+      const search = controller.searchImages();
+      button(root, '[data-action="close-modal"]').click();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      let finishWrite: (() => void) | undefined;
+      const saved = {
+        ...state,
+        items: state.items.map((item) => ({
+          ...item,
+          image: { path: "/images/new.png", sourceUrl: null },
+        })),
+      };
+      api.setLocalImage.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishWrite = () => resolve(saved);
+          }),
+      );
+      const write = controller.changeImage("local");
+      if (!finishSearch || !finishWrite) throw new Error("The search and write must have started");
+      finishSearch();
+      await search;
+      expect(controller.state.busy).toBe(true);
+      expect(button(root, '[data-action="close-modal"]').disabled).toBe(true);
+      button(root, '[data-action="close-modal"]').click();
+      const dialog = root.querySelector("dialog");
+      if (!dialog) throw new Error("The writing modal was closed");
+      dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+      expect(root.querySelector("dialog")).not.toBeNull();
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      await controller.changeImage("none");
+      expect(api.removeImage).not.toHaveBeenCalled();
+      finishWrite();
+      await write;
+      expect(controller.state.active).toEqual(saved);
+      expect(controller.state.busy).toBe(false);
+      expect(root.querySelector("dialog")).toBeNull();
+    },
+  );
+
   it("shows migration failure without exposing normal actions or resetting data", async () => {
     const { root, controller, api } = setup();
     api.listSummaries.mockRejectedValue(

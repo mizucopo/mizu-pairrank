@@ -174,6 +174,16 @@ impl Database {
         })
     }
 
+    pub fn image_in_use(&self, path: &str) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM items WHERE image_path = ?1 AND deleted = 0)",
+                [path],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
     pub fn resume_list(&mut self, list_id: i64) -> Result<ListState, String> {
         self.mutate_list(list_id, |transaction| reset_snapshots(transaction, list_id))
     }

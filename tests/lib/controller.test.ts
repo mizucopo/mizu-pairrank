@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { AppController } from "../../src/lib/controller.js";
-import type { AppApi, ListState, ListSummary, PairProposal } from "../../src/lib/types.js";
+import type {
+  AppApi,
+  ImageCandidate,
+  ListState,
+  ListSummary,
+  PairProposal,
+} from "../../src/lib/types.js";
 
 function list(id = 1): ListState {
   return {
@@ -128,6 +134,97 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.error).toBe("保存できません");
   });
 
+  it.each(["remaining list", "new list"] as const)(
+    "does not transfer item drafts from a deleted list to the %s",
+    async (destination) => {
+      const first = list();
+      const second = list(2);
+      const api = backend(first, second);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      controller.state.drafts.items = "only for the deleted list";
+      await controller.openModal({ kind: "delete-list" });
+      api.listSummaries.mockResolvedValue(
+        destination === "remaining list" ? [summary(second)] : [],
+      );
+      await controller.confirmDelete();
+      if (destination === "new list") {
+        api.createList.mockResolvedValue(second);
+        await controller.openModal({ kind: "create-list" });
+        controller.state.drafts.name = second.name;
+        await controller.saveName();
+      }
+      expect(controller.state.active?.id).toBe(second.id);
+      expect(controller.state.drafts.items).toBe("");
+      await controller.addItems();
+      expect(api.addItems).not.toHaveBeenCalled();
+    },
+  );
+
+  it("removes a committed list deletion locally even if refreshing summaries fails", async () => {
+    const first = list();
+    const second = list(2);
+    const api = backend(first, second);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.state.drafts.items = "deleted list draft";
+    await controller.openModal({ kind: "delete-list" });
+    api.listSummaries.mockRejectedValueOnce(new Error("一覧の更新に失敗しました"));
+    await controller.confirmDelete();
+    expect(controller.state.lists).toEqual([summary(second)]);
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.error).toBe("一覧の更新に失敗しました");
+    await controller.selectList(second.id);
+    expect(controller.state.active).toEqual(second);
+  });
+
+  it("retains the active list, summaries, and draft when deletion itself fails", async () => {
+    const { controller, api, initial } = await comparison();
+    const summaries = controller.state.lists;
+    controller.state.drafts.items = "keep this draft";
+    await controller.openModal({ kind: "delete-list" });
+    api.deleteList.mockRejectedValueOnce(new Error("削除できません"));
+    await controller.confirmDelete();
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.lists).toEqual(summaries);
+    expect(controller.state.pair).toEqual(proposal(initial));
+    expect(controller.state.modal).toEqual({ kind: "delete-list" });
+    expect(controller.state.drafts.items).toBe("keep this draft");
+    expect(controller.state.error).toBe("削除できません");
+  });
+
+  it("does not transfer the previous list's item draft when creating a new list", async () => {
+    const first = list();
+    const second = list(2);
+    const api = backend(first, second);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.state.drafts.items = "only for the previous list";
+    await controller.openModal({ kind: "create-list" });
+    controller.state.drafts.name = second.name;
+    api.createList.mockResolvedValueOnce(second);
+    await controller.saveName();
+    expect(controller.state.active).toEqual(second);
+    expect(controller.state.drafts.items).toBe("");
+    await controller.addItems();
+    expect(api.addItems).not.toHaveBeenCalled();
+  });
+
+  it("retains the previous list and its item draft when creating a new list fails", async () => {
+    const { controller, api, initial } = await comparison();
+    controller.state.drafts.items = "keep the previous list draft";
+    await controller.openModal({ kind: "create-list" });
+    controller.state.drafts.name = "new list";
+    api.createList.mockRejectedValueOnce(new Error("作成できません"));
+    await controller.saveName();
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.drafts.items).toBe("keep the previous list draft");
+    expect(controller.state.modal).toEqual({ kind: "create-list" });
+    expect(controller.state.error).toBe("作成できません");
+  });
+
   it("accepts only one answer while a save is pending", async () => {
     const { controller, api, initial, saved } = await comparison();
     let finish: ((value: ListState) => void) | undefined;
@@ -225,4 +322,68 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.pair).toEqual(proposal(initial));
     expect(controller.state.error).toBe("読み込み失敗");
   });
+
+  it.each([
+    ["result", "before"],
+    ["error", "before"],
+    ["result", "after"],
+    ["error", "after"],
+  ] as const)(
+    "ignores a dismissed image search's %s arriving %s the reopened modal's search completes",
+    async (outcome, order) => {
+      const initial = list();
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      const oldCandidate: ImageCandidate = {
+        id: "old",
+        title: "Old image",
+        previewUrl: "data:image/png;base64,AA==",
+        sourceUrl: "https://example.org/old",
+      };
+      const newCandidate = { ...oldCandidate, id: "new", title: "New image" };
+      let finishOld: (() => void) | undefined;
+      let finishNew: (() => void) | undefined;
+      api.searchImages
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve, reject) => {
+              finishOld = () => {
+                if (outcome === "result") resolve([oldCandidate]);
+                else reject(new Error("古い検索のエラー"));
+              };
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishNew = () => resolve([newCandidate]);
+            }),
+        );
+      await controller.initialize();
+      await controller.openModal({ kind: "image", itemId: 11 });
+      const oldSearch = controller.searchImages();
+      controller.closeModal();
+      await controller.openModal({ kind: "image", itemId: 12 });
+      const newSearch = controller.searchImages();
+      if (!finishOld || !finishNew) throw new Error("Both searches must have started");
+      if (order === "before") {
+        finishOld();
+        await oldSearch;
+        expect(controller.state.busy).toBe(true);
+        expect(controller.state.candidates).toEqual([]);
+        expect(controller.state.searched).toBe(false);
+      }
+      finishNew();
+      await newSearch;
+      if (order === "after") {
+        finishOld();
+        await oldSearch;
+      }
+      expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
+      expect(controller.state.busy).toBe(false);
+      expect(controller.state.searched).toBe(true);
+      expect(controller.state.candidates).toEqual([newCandidate]);
+      expect(controller.state.error).toBe("");
+    },
+  );
 });
