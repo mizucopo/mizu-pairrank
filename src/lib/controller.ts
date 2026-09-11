@@ -95,30 +95,33 @@ export class AppController {
   async initialize(): Promise<void> {
     await this.perform(async () => {
       try {
-        this.state.lists = await this.api.listSummaries();
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          const first = this.state.lists[0];
-          if (!first) break;
-          try {
-            this.state.active = await this.api.getList(first.id);
-            this.state.view = this.state.active.convergence.converged ? "ranking" : "items";
-            break;
-          } catch (error) {
-            // Another window may delete the list after the summaries were read.
-            if (errorMessage(error) !== "リストが見つかりません。") throw error;
-            this.state.lists = await this.api.listSummaries();
-          }
-        }
-        if (!this.state.active && this.state.lists.length > 0) {
-          this.state.notice =
-            "起動中にリストが変更されました。リストを選択するか、新しく作成してください。";
-        }
+        this.state.active = await this.loadFirstAvailableList();
+        this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
         this.state.initialized = true;
       } catch (error) {
         this.state.fatal = true;
         throw error;
       }
     });
+  }
+
+  private async loadFirstAvailableList(): Promise<ListState | null> {
+    this.state.lists = await this.api.listSummaries();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const first = this.state.lists[0];
+      if (!first) return null;
+      try {
+        return await this.api.getList(first.id);
+      } catch (error) {
+        // Another window may delete the list after the summaries were read.
+        if (errorMessage(error) !== "リストが見つかりません。") throw error;
+        this.state.lists = await this.api.listSummaries();
+      }
+    }
+    if (this.state.lists.length > 0) {
+      this.state.notice = "リストが変更されました。リストを選択するか、新しく作成してください。";
+    }
+    return null;
   }
 
   async selectList(id: number): Promise<void> {
@@ -239,9 +242,7 @@ export class AppController {
         this.state.modal = null;
         this.state.drafts.items = "";
         this.state.lists = this.state.lists.filter((entry) => entry.id !== list.id);
-        this.state.lists = await this.api.listSummaries();
-        const first = this.state.lists[0];
-        if (first) this.state.active = await this.api.getList(first.id);
+        this.state.active = await this.loadFirstAvailableList();
       } else if (modal.kind === "delete-item") {
         const result = await this.api.deleteItem(list.id, modal.itemId);
         this.state.modal = null;
