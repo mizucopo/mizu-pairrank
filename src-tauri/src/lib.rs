@@ -4,7 +4,7 @@ mod images;
 mod models;
 mod rating;
 
-use database::Database;
+use database::{Database, ImageChange};
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
 use models::{ImageAsset, ListState, ListSummary};
 use rating::Preference;
@@ -36,24 +36,20 @@ impl Backend {
 
     async fn change_images<T: Send + 'static>(
         &self,
-        list_id: i64,
         image: Option<ImageAsset>,
-        operation: impl FnOnce(&mut Database, Option<ImageAsset>) -> Result<T, String> + Send + 'static,
+        operation: impl FnOnce(&mut Database, Option<ImageAsset>) -> Result<ImageChange<T>, String>
+        + Send
+        + 'static,
     ) -> Result<T, String> {
         let images = self.images.clone().ok();
         let imported = image.clone();
         let result = self
             .database_job(move |db| {
-                let previous = db
-                    .get_list(list_id)?
-                    .items
-                    .into_iter()
-                    .filter_map(|item| item.image);
-                let result = operation(db, image)?;
+                let change = operation(db, image)?;
                 if let Some(images) = &images {
-                    remove_unused_images(db, images, previous);
+                    remove_unused_images(db, images, change.cleanup_paths);
                 }
-                Ok(result)
+                Ok(change.value)
             })
             .await;
         if let (Err(_), Some(image), Ok(images)) = (&result, imported, &self.images) {
@@ -65,7 +61,7 @@ impl Backend {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Ok(db) = &*guard {
-                    remove_unused_images(db, &images, [image]);
+                    remove_unused_images(db, &images, [image.path]);
                 }
             })
             .await;
@@ -77,11 +73,11 @@ impl Backend {
 fn remove_unused_images(
     db: &Database,
     service: &ImageService,
-    images: impl IntoIterator<Item = ImageAsset>,
+    paths: impl IntoIterator<Item = String>,
 ) {
-    for image in images {
-        if db.image_in_use(&image.path) == Ok(false) {
-            service.remove_managed_file(&image.path);
+    for path in paths {
+        if db.image_in_use(&path) == Ok(false) {
+            service.remove_managed_file(&path);
         }
     }
 }
@@ -116,7 +112,7 @@ async fn rename_list(app: AppHandle, list_id: i64, name: String) -> Result<ListS
 #[tauri::command]
 async fn delete_list(app: AppHandle, list_id: i64) -> Result<(), String> {
     app.state::<Backend>()
-        .change_images(list_id, None, move |db, _| db.delete_list(list_id))
+        .change_images(None, move |db, _| db.delete_list(list_id))
         .await
 }
 #[tauri::command]
@@ -135,7 +131,7 @@ async fn rename_item(
 #[tauri::command]
 async fn delete_item(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListState, String> {
     app.state::<Backend>()
-        .change_images(list_id, None, move |db, _| db.delete_item(list_id, item_id))
+        .change_images(None, move |db, _| db.delete_item(list_id, item_id))
         .await
 }
 #[tauri::command]
@@ -250,7 +246,7 @@ async fn set_local_image(
         return Ok(None);
     };
     app.state::<Backend>()
-        .change_images(list_id, Some(image), move |db, image| {
+        .change_images(Some(image), move |db, image| {
             db.set_image(list_id, item_id, image)
         })
         .await
@@ -265,7 +261,7 @@ async fn set_remote_image(
 ) -> Result<ListState, String> {
     let image = image_service(&app)?.import_remote(candidate).await?;
     app.state::<Backend>()
-        .change_images(list_id, Some(image), move |db, image| {
+        .change_images(Some(image), move |db, image| {
             db.set_image(list_id, item_id, image)
         })
         .await
@@ -273,9 +269,7 @@ async fn set_remote_image(
 #[tauri::command]
 async fn remove_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListState, String> {
     app.state::<Backend>()
-        .change_images(list_id, None, move |db, image| {
-            db.set_image(list_id, item_id, image)
-        })
+        .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
         .await
 }
 
@@ -363,9 +357,7 @@ mod tests {
         let (_directory, backend) = backend();
         let (list_id, item_id, image) = list_with_image(&backend).await;
         let state = backend
-            .change_images(list_id, None, move |db, image| {
-                db.set_image(list_id, item_id, image)
-            })
+            .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
             .await
             .unwrap();
         assert!(
@@ -394,7 +386,7 @@ mod tests {
             .execute_batch("CREATE TRIGGER fail_image AFTER UPDATE OF image_path ON items BEGIN SELECT RAISE(ABORT, 'disk failure'); END;").unwrap();
         assert!(
             backend
-                .change_images(list_id, Some(image), move |db, image| db
+                .change_images(Some(image), move |db, image| db
                     .set_image(list_id, item_id, image))
                 .await
                 .is_err()
@@ -430,7 +422,7 @@ mod tests {
         let in_flight = service.import_local(source.clone()).unwrap();
         let shared = image.clone();
         backend
-            .change_images(list_id, Some(image), move |db, image| {
+            .change_images(Some(image), move |db, image| {
                 db.set_image(list_id, item_id, image)
             })
             .await
@@ -447,12 +439,12 @@ mod tests {
             .await
             .unwrap();
         backend
-            .change_images(list_id, None, move |db, _| db.delete_item(list_id, item_id))
+            .change_images(None, move |db, _| db.delete_item(list_id, item_id))
             .await
             .unwrap();
         assert!(Path::new(&image_path).exists());
         backend
-            .change_images(second_id, None, move |db, _| db.delete_list(second_id))
+            .change_images(None, move |db, _| db.delete_list(second_id))
             .await
             .unwrap();
         assert!(!Path::new(&image_path).exists());
@@ -473,7 +465,7 @@ mod tests {
         .join();
         assert!(
             backend
-                .change_images(list_id, Some(image), move |db, image| db
+                .change_images(Some(image), move |db, image| db
                     .set_image(list_id, item_id, image))
                 .await
                 .is_err()
@@ -488,7 +480,7 @@ mod tests {
         let unused_path = unused.path.clone();
         assert!(
             backend
-                .change_images(list_id, Some(unused), move |db, image| db
+                .change_images(Some(unused), move |db, image| db
                     .set_image(list_id, item_id, image))
                 .await
                 .is_err()
@@ -503,9 +495,7 @@ mod tests {
         std::fs::remove_file(&image.path).unwrap();
         std::fs::create_dir(&image.path).unwrap();
         let state = backend
-            .change_images(list_id, None, move |db, image| {
-                db.set_image(list_id, item_id, image)
-            })
+            .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
             .await
             .unwrap();
         assert!(
@@ -531,9 +521,54 @@ mod tests {
             .await
             .unwrap();
         backend
-            .change_images(list_id, None, move |db, _| db.delete_list(list_id))
+            .change_images(None, move |db, _| db.delete_list(list_id))
             .await
             .unwrap();
         assert_eq!(std::fs::read(external).unwrap(), b"keep external source");
+    }
+    #[tokio::test]
+    async fn image_cleanup_tracks_a_replacement_committed_by_another_connection() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, _) = list_with_image(&backend).await;
+        let service = backend.images.as_ref().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png");
+        let replacement = service.import_local(source.clone()).unwrap();
+        let replacement_path = replacement.path.clone();
+        let in_flight = service.import_local(source).unwrap();
+        let mut other = Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        backend
+            .change_images(None, move |db, image| {
+                other.set_image(list_id, item_id, Some(replacement))?;
+                db.set_image(list_id, item_id, image)
+            })
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&replacement_path).exists(),
+            "cleanup must include the image replaced immediately before this transaction"
+        );
+        assert!(Path::new(&in_flight.path).exists());
+    }
+
+    #[tokio::test]
+    async fn list_deletion_cleans_a_replacement_committed_by_another_connection() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, _) = list_with_image(&backend).await;
+        let replacement = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let replacement_path = replacement.path.clone();
+        let mut other = Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        backend
+            .change_images(None, move |db, _| {
+                other.set_image(list_id, item_id, Some(replacement))?;
+                db.delete_list(list_id)
+            })
+            .await
+            .unwrap();
+        assert!(!Path::new(&replacement_path).exists());
     }
 }

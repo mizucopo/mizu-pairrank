@@ -147,6 +147,20 @@ describe("desktop app interaction", () => {
     expect(api.answer).toHaveBeenCalledExactlyOnceWith(expect.anything(), "b_strong");
   });
 
+  it("preserves item drafts when returning from settings to the same list", async () => {
+    const { root, controller } = setup();
+    await controller.initialize();
+    const input = root.querySelector("textarea");
+    if (!(input instanceof HTMLTextAreaElement)) throw new Error("Missing bulk input");
+    input.value = "あとで登録する果物\nぶどう";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await click(root, controller, '[data-view="settings"]');
+    await click(root, controller, '[data-action="select-list"][data-id="1"]');
+    const restored = root.querySelector("textarea");
+    if (!(restored instanceof HTMLTextAreaElement)) throw new Error("Missing restored bulk input");
+    expect(restored.value).toBe("あとで登録する果物\nぶどう");
+  });
+
   it("keeps keyboard shortcuts working after navigation and answer buttons are replaced", async () => {
     const { root, controller, api, pair } = setup();
     const pressKeyAtFocus = (key: string) => {

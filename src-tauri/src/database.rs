@@ -20,6 +20,12 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations/001_initial.sql"),
 }];
 
+#[derive(Debug)]
+pub struct ImageChange<T> {
+    pub value: T,
+    pub cleanup_paths: Vec<String>,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -93,16 +99,21 @@ impl Database {
         })
     }
 
-    pub fn delete_list(&mut self, id: i64) -> Result<(), String> {
+    pub fn delete_list(&mut self, id: i64) -> Result<ImageChange<()>, String> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
         ensure_supported_model(&transaction, id)?;
+        let cleanup_paths = read_image_paths(&transaction, id, None)?;
         transaction
             .execute("DELETE FROM lists WHERE id = ?1", [id])
             .map_err(db_error)?;
-        transaction.commit().map_err(db_error)
+        transaction.commit().map_err(db_error)?;
+        Ok(ImageChange {
+            value: (),
+            cleanup_paths,
+        })
     }
 
     pub fn get_list(&self, id: i64) -> Result<ListState, String> {
@@ -148,8 +159,12 @@ impl Database {
         })
     }
 
-    pub fn delete_item(&mut self, list_id: i64, item_id: i64) -> Result<ListState, String> {
-        self.mutate_list(list_id, |transaction| {
+    pub fn delete_item(
+        &mut self,
+        list_id: i64,
+        item_id: i64,
+    ) -> Result<ImageChange<ListState>, String> {
+        self.mutate_images(list_id, item_id, |transaction| {
             require_item_change(transaction.execute(
                 "UPDATE items SET deleted = 1 WHERE id = ?1 AND list_id = ?2 AND deleted = 0",
                 params![item_id, list_id],
@@ -163,8 +178,8 @@ impl Database {
         list_id: i64,
         item_id: i64,
         image: Option<ImageAsset>,
-    ) -> Result<ListState, String> {
-        self.mutate_list(list_id, |transaction| {
+    ) -> Result<ImageChange<ListState>, String> {
+        self.mutate_images(list_id, item_id, |transaction| {
             require_item_change(transaction.execute(
                 "UPDATE items SET image_path = ?1, image_source_url = ?2
                  WHERE id = ?3 AND list_id = ?4 AND deleted = 0",
@@ -265,17 +280,43 @@ impl Database {
             .map_err(db_error)
     }
 
+    fn mutate_images(
+        &mut self,
+        list_id: i64,
+        item_id: i64,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<(), String>,
+    ) -> Result<ImageChange<ListState>, String> {
+        let (value, cleanup_paths) = self.mutate_list_with_result(list_id, |transaction| {
+            let paths = read_image_paths(transaction, list_id, Some(item_id))?;
+            operation(transaction)?;
+            Ok(paths)
+        })?;
+        Ok(ImageChange {
+            value,
+            cleanup_paths,
+        })
+    }
+
     fn mutate_list(
         &mut self,
         list_id: i64,
         operation: impl FnOnce(&Transaction<'_>) -> Result<(), String>,
     ) -> Result<ListState, String> {
+        self.mutate_list_with_result(list_id, operation)
+            .map(|(state, ())| state)
+    }
+
+    fn mutate_list_with_result<T>(
+        &mut self,
+        list_id: i64,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T, String>,
+    ) -> Result<(ListState, T), String> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
         ensure_supported_model(&transaction, list_id)?;
-        operation(&transaction)?;
+        let result = operation(&transaction)?;
         transaction
             .execute(
                 "UPDATE lists SET revision = revision + 1 WHERE id = ?1",
@@ -284,8 +325,27 @@ impl Database {
             .map_err(db_error)?;
         let state = read_list(&transaction, list_id)?;
         transaction.commit().map_err(db_error)?;
-        Ok(state)
+        Ok((state, result))
     }
+}
+
+fn read_image_paths(
+    transaction: &Transaction<'_>,
+    list_id: i64,
+    item_id: Option<i64>,
+) -> Result<Vec<String>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT DISTINCT image_path FROM items
+         WHERE list_id = ?1 AND deleted = 0 AND image_path IS NOT NULL
+           AND (?2 IS NULL OR id = ?2)",
+        )
+        .map_err(db_error)?;
+    statement
+        .query_map(params![list_id, item_id], |row| row.get(0))
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)
 }
 
 fn db_error(error: rusqlite::Error) -> String {
@@ -567,7 +627,9 @@ mod tests {
                 }))
                 .unwrap();
             sender
-                .send(Event::Finished(database.delete_list(list.id)))
+                .send(Event::Finished(
+                    database.delete_list(list.id).map(|change| change.value),
+                ))
                 .unwrap();
         });
         let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -630,7 +692,8 @@ mod tests {
                         source_url: Some("https://example.org/one".to_owned()),
                     }),
                 )
-                .unwrap();
+                .unwrap()
+                .value;
             serde_json::to_value(state).unwrap()
         };
         let database = Database::open(&path).unwrap();
@@ -972,7 +1035,7 @@ mod tests {
             Rating::default().sigma
         );
         let answered = answer_once(&mut database, &added);
-        let deleted = database.delete_item(state.id, existing.id).unwrap();
+        let deleted = database.delete_item(state.id, existing.id).unwrap().value;
         assert_eq!(deleted.items.len(), 2);
         assert_eq!(deleted.comparison_count, answered.comparison_count);
         assert_eq!(deleted.convergence.observed_answers, 0);
@@ -1163,7 +1226,9 @@ mod tests {
             .pragma_update(None, "journal_mode", "WAL")
             .unwrap();
         let mut writer = Database::open(&path).unwrap();
-        let concurrent = write_after_first_select(&reader, move || writer.delete_list(second.id));
+        let concurrent = write_after_first_select(&reader, move || {
+            writer.delete_list(second.id).map(|change| change.value)
+        });
         let observed = reader.list_summaries();
         concurrent.assert_committed();
         drop(concurrent);

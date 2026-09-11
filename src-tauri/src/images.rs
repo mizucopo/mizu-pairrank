@@ -12,6 +12,7 @@ use image::{ImageDecoder, ImageFormat, ImageReader};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use url::{Host, Url};
 use uuid::Uuid;
@@ -24,6 +25,7 @@ const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PIXELS: u64 = 32_000_000;
 const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
+const MAX_BUFFERED_IMAGES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +308,7 @@ pub struct ImageService {
     credentials: Arc<dyn CredentialStore>,
     transport: Arc<dyn ImageTransport>,
     decode_gate: Arc<Mutex<()>>,
+    buffer_slots: Arc<Semaphore>,
 }
 
 impl ImageService {
@@ -323,6 +326,7 @@ impl ImageService {
             credentials: Arc::new(SystemCredentials),
             transport: Arc::new(HttpTransport),
             decode_gate: Arc::new(Mutex::new(())),
+            buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
         })
     }
 
@@ -414,10 +418,11 @@ impl ImageService {
                 };
                 let transport = self.transport.clone();
                 let decode_gate = self.decode_gate.clone();
+                let buffer_slots = self.buffer_slots.clone();
                 active.spawn(async move {
                     (
                         position,
-                        prepare_candidate(transport, decode_gate, seed).await,
+                        prepare_candidate(transport, decode_gate, buffer_slots, seed).await,
                     )
                 });
             }
@@ -440,14 +445,23 @@ impl ImageService {
     pub async fn import_remote(&self, candidate: ImageCandidate) -> Result<ImageAsset, String> {
         validate_public_url(&candidate.id)?;
         validate_public_url(&candidate.source_url)?;
+        let buffer_permit = self
+            .buffer_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
         let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
         let directory = self.directory.clone();
         let decode_gate = self.decode_gate.clone();
         tokio::task::spawn_blocking(move || {
+            // Keep the encoded buffer charged even if the invoking future is cancelled.
+            let _buffer_permit = buffer_permit;
+            let bytes = resource.bytes;
             let _permit = decode_gate
                 .lock()
                 .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-            save_image(&directory, &resource.bytes, Some(candidate.source_url))
+            save_image(&directory, &bytes, Some(candidate.source_url))
         })
         .await
         .map_err(|_| "画像保存処理を完了できませんでした。".to_owned())?
@@ -463,14 +477,14 @@ impl ImageService {
         if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES as u64 {
             return Err("20MiB以下の画像ファイルを選択してください。".to_owned());
         }
-        let mut bytes = Vec::new();
-        file.take(MAX_IMAGE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
         let _permit = self
             .decode_gate
             .lock()
             .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
         save_image(&self.directory, &bytes, None)
     }
 }
@@ -530,8 +544,13 @@ fn parse_search_response(
 async fn prepare_candidate(
     transport: Arc<dyn ImageTransport>,
     decode_gate: Arc<Mutex<()>>,
+    buffer_slots: Arc<Semaphore>,
     seed: CandidateSeed,
 ) -> Result<ImageCandidate, String> {
+    let buffer_permit = buffer_slots
+        .acquire_owned()
+        .await
+        .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
     let (image_url, source_url) = if let Some(image_url) = seed.image_url {
         (image_url, seed.source_url)
     } else {
@@ -546,10 +565,13 @@ async fn prepare_candidate(
         .unwrap_or_else(|| image_url.clone());
     let resource = transport.fetch(&thumbnail_url, MAX_IMAGE_BYTES).await?;
     let thumbnail = tokio::task::spawn_blocking(move || {
+        // A cancelled search cannot release capacity while its blocking decoder owns bytes.
+        let _buffer_permit = buffer_permit;
+        let bytes = resource.bytes;
         let _permit = decode_gate
             .lock()
             .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-        normalize_image(&resource.bytes, 320)
+        normalize_image(&bytes, 320)
     })
     .await
     .map_err(|_| "画像のプレビューを作成できませんでした。".to_owned())??;
@@ -708,6 +730,7 @@ mod tests {
         response: Result<Vec<u8>, String>,
         resources: HashMap<String, Resource>,
         searches: Mutex<Vec<(SearchProvider, String)>>,
+        fetches: Mutex<Vec<String>>,
     }
 
     impl ImageTransport for MockTransport {
@@ -726,6 +749,7 @@ mod tests {
 
         fn fetch<'a>(&'a self, url: &'a str, limit: usize) -> NetworkFuture<'a, Resource> {
             Box::pin(async move {
+                self.fetches.lock().unwrap().push(url.to_owned());
                 validate_public_url(url)?;
                 match self.resources.get(url) {
                     Some(resource) if resource.bytes.len() <= limit => Ok(resource.clone()),
@@ -761,12 +785,14 @@ mod tests {
             response,
             resources: resources.into_iter().collect(),
             searches: Mutex::default(),
+            fetches: Mutex::default(),
         });
         let service = ImageService {
             directory: directory.path().to_owned(),
             credentials: Arc::new(MemoryCredentials::default()),
             transport: transport.clone(),
             decode_gate: Arc::new(Mutex::new(())),
+            buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
         };
         (directory, service, transport)
     }
@@ -1054,12 +1080,10 @@ mod tests {
         assert!(parse_search_response(SearchProvider::Brave, b"broken json").is_err());
     }
     #[tokio::test]
-    async fn shared_decode_budget_bounds_searches_and_imports_without_serializing_network_fetches()
-    {
+    async fn shared_budgets_bound_fetch_buffers_and_decodes_across_searches_and_imports() {
         struct ParallelTransport {
             response: Vec<u8>,
             bytes: Vec<u8>,
-            fetches: tokio::sync::Barrier,
             fetched: tokio::sync::mpsc::UnboundedSender<()>,
         }
         impl ImageTransport for ParallelTransport {
@@ -1073,7 +1097,6 @@ mod tests {
             }
             fn fetch<'a>(&'a self, url: &'a str, _: usize) -> NetworkFuture<'a, Resource> {
                 Box::pin(async move {
-                    self.fetches.wait().await;
                     self.fetched.send(()).unwrap();
                     Ok(Resource {
                         bytes: self.bytes.clone(),
@@ -1093,7 +1116,6 @@ mod tests {
             )
             .unwrap(),
             bytes: png(4, 2),
-            fetches: tokio::sync::Barrier::new(9),
             fetched,
         });
         service
@@ -1132,13 +1154,15 @@ mod tests {
         let local_service = service.clone();
         let local = tokio::task::spawn_blocking(move || local_service.import_local(source));
         let network_parallel = tokio::time::timeout(Duration::from_secs(2), async {
-            for _ in 0..9 {
+            for _ in 0..4 {
                 fetches.recv().await.unwrap();
             }
         })
         .await
         .is_ok();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let buffers_bounded = tokio::time::timeout(Duration::from_millis(100), fetches.recv())
+            .await
+            .is_err();
         let waited_for_budget = searches.iter().all(|search| !search.is_finished())
             && !remote.is_finished()
             && !local.is_finished();
@@ -1146,7 +1170,11 @@ mod tests {
         decoder.join().unwrap();
         assert!(
             network_parallel,
-            "both searches and import must fetch while decoding is occupied"
+            "up to four images must fetch in parallel while decoding is occupied"
+        );
+        assert!(
+            buffers_bounded,
+            "additional image bodies must not queue ahead of decoding"
         );
         assert!(
             waited_for_budget,
@@ -1158,6 +1186,68 @@ mod tests {
         assert!(Path::new(&remote.await.unwrap().unwrap().path).exists());
         assert!(Path::new(&local.await.unwrap().unwrap().path).exists());
     }
+    #[tokio::test]
+    async fn cancelling_a_search_keeps_its_buffers_reserved_until_blocking_decodes_finish() {
+        let urls: Vec<_> = (0..4)
+            .map(|id| format!("https://example.com/{id}.png"))
+            .collect();
+        let response = serde_json::to_vec(&serde_json::json!({
+            "results": urls.iter().map(|url| serde_json::json!({
+                "url": url, "properties": { "url": url }
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let (_directory, service, transport) = service(
+            Ok(response),
+            urls.iter().map(|url| resource(url, png(4, 2))).collect(),
+        );
+        service
+            .set_api_key(SearchProvider::Brave, "test-key".into())
+            .unwrap();
+        let gate = service.decode_gate.clone();
+        let (occupied, occupied_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let decoder = std::thread::spawn(move || {
+            let _permit = gate.lock().unwrap();
+            occupied.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        occupied_rx.recv().unwrap();
+        let service = Arc::new(service);
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .search(SearchProvider::Brave, "old".into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.fetches.lock().unwrap().len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let next =
+            tokio::spawn(async move { service.search(SearchProvider::Brave, "new".into()).await });
+        let bounded_after_cancel = tokio::time::timeout(Duration::from_millis(100), async {
+            while transport.fetches.lock().unwrap().len() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err();
+        release.send(()).unwrap();
+        decoder.join().unwrap();
+        assert!(
+            bounded_after_cancel,
+            "cancelling the async caller must not free capacity still used by a blocking worker"
+        );
+        assert_eq!(next.await.unwrap().unwrap().len(), 4);
+        assert_eq!(transport.fetches.lock().unwrap().len(), 8);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cleanup_does_not_follow_a_replaced_images_directory_outside_app_data() {

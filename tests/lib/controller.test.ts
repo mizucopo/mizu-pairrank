@@ -101,6 +101,83 @@ async function comparison() {
 }
 
 describe("comparison state and persistence boundaries", () => {
+  it("opens a remaining list when the initial list is deleted before loading", async () => {
+    const first = list();
+    const second = list(2);
+    const api = backend(first, second);
+    api.listSummaries
+      .mockResolvedValueOnce([summary(first), summary(second)])
+      .mockResolvedValueOnce([summary(second)]);
+    api.getList.mockRejectedValueOnce("リストが見つかりません。");
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.fatal).toBe(false);
+    expect(controller.state.initialized).toBe(true);
+    expect(controller.state.active).toEqual(second);
+    expect(controller.state.lists).toEqual([summary(second)]);
+    expect(controller.state.error).toBe("");
+  });
+
+  it("opens an empty interactive state when no lists remain after the startup deletion", async () => {
+    const api = backend();
+    api.listSummaries.mockResolvedValueOnce([summary(list())]).mockResolvedValueOnce([]);
+    api.getList.mockRejectedValueOnce("リストが見つかりません。");
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.fatal).toBe(false);
+    expect(controller.state.initialized).toBe(true);
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.lists).toEqual([]);
+    expect(controller.state.error).toBe("");
+    await controller.openModal({ kind: "create-list" });
+    expect(controller.state.modal).toEqual({ kind: "create-list" });
+  });
+
+  it("stops retrying repeated startup deletions and permits selecting a fresh list", async () => {
+    const remaining = list(4);
+    const api = backend();
+    api.listSummaries
+      .mockResolvedValueOnce([summary(list(1))])
+      .mockResolvedValueOnce([summary(list(2))])
+      .mockResolvedValueOnce([summary(list(3))])
+      .mockResolvedValueOnce([summary(remaining)]);
+    api.getList
+      .mockRejectedValueOnce("リストが見つかりません。")
+      .mockRejectedValueOnce("リストが見つかりません。")
+      .mockRejectedValueOnce("リストが見つかりません。")
+      .mockResolvedValueOnce(remaining);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.fatal).toBe(false);
+    expect(controller.state.initialized).toBe(true);
+    expect(controller.state.busy).toBe(false);
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.lists).toEqual([summary(remaining)]);
+    expect(controller.state.notice).toContain("リストを選択");
+    await controller.selectList(remaining.id);
+    expect(controller.state.active).toEqual(remaining);
+  });
+
+  it.each(["initial summaries", "lookup", "refreshed summaries"] as const)(
+    "retains a fatal startup state for a database error in %s",
+    async (failure) => {
+      const api = backend();
+      const error = "データベースを読み込めません。";
+      if (failure === "initial summaries") api.listSummaries.mockRejectedValueOnce(error);
+      else if (failure === "lookup") api.getList.mockRejectedValueOnce(error);
+      else {
+        api.getList.mockRejectedValueOnce("リストが見つかりません。");
+        api.listSummaries.mockResolvedValueOnce([summary(list())]).mockRejectedValueOnce(error);
+      }
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      expect(controller.state.fatal).toBe(true);
+      expect(controller.state.initialized).toBe(false);
+      expect(controller.state.error).toBe(error);
+      expect(controller.state.active).toBeNull();
+    },
+  );
+
   it("trims bulk input, retains duplicate names, and submits only to the selected list", async () => {
     const first = list();
     const second = list(2);

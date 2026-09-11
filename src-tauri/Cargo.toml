@@ -25,7 +25,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 scraper = "0.24"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
 rand = "0.9"
 base64 = "0.22"
 

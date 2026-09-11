@@ -96,10 +96,22 @@ export class AppController {
     await this.perform(async () => {
       try {
         this.state.lists = await this.api.listSummaries();
-        const first = this.state.lists[0];
-        if (first) {
-          this.state.active = await this.api.getList(first.id);
-          this.state.view = this.state.active.convergence.converged ? "ranking" : "items";
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const first = this.state.lists[0];
+          if (!first) break;
+          try {
+            this.state.active = await this.api.getList(first.id);
+            this.state.view = this.state.active.convergence.converged ? "ranking" : "items";
+            break;
+          } catch (error) {
+            // Another window may delete the list after the summaries were read.
+            if (errorMessage(error) !== "リストが見つかりません。") throw error;
+            this.state.lists = await this.api.listSummaries();
+          }
+        }
+        if (!this.state.active && this.state.lists.length > 0) {
+          this.state.notice =
+            "起動中にリストが変更されました。リストを選択するか、新しく作成してください。";
         }
         this.state.initialized = true;
       } catch (error) {
@@ -112,10 +124,10 @@ export class AppController {
   async selectList(id: number): Promise<void> {
     await this.perform(async () => {
       const list = await this.api.getList(id);
+      if (list.id !== this.state.active?.id) this.state.drafts.items = "";
       this.state.active = list;
       this.state.pair = null;
       this.state.modal = null;
-      this.state.drafts.items = "";
       this.state.view = list.convergence.converged ? "ranking" : "items";
     });
   }
