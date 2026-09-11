@@ -5,12 +5,12 @@ author_name: みず
 node_version: '26'
 project_description: 2つの候補を比較して順位付けするデスクトップアプリ
 project_name: mizu-pairrank
-project_version: 0.2.2
+project_version: 0.3.0
 rust_version: stable
 tauri_identifier: dev.mizu.pairrank
 tauri_package_name: mizu-pairrank
 tauri_product_name: mizu-pairrank
-tauri_version: 0.2.2
+tauri_version: 0.3.0
 use_chrome_extension: false
 use_dependabot_github_actions: true
 use_docker: false

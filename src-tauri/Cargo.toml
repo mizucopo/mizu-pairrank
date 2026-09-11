@@ -1,6 +1,6 @@
 [package]
 name = "mizu-pairrank"
-version = "0.2.2"
+version = "0.3.0"
 description = "mizu-pairrank"
 authors = ["\u307f\u305a"]
 edition = "2024"
