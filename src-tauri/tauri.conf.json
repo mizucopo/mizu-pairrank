@@ -18,8 +18,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'",
-      "devCsp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 ws://*:1421; style-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost pairrank-image: http://pairrank-image.localhost data:; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'",
+      "devCsp": "default-src 'self'; img-src 'self' asset: http://asset.localhost pairrank-image: http://pairrank-image.localhost data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 ws://*:1421; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/images/**"]

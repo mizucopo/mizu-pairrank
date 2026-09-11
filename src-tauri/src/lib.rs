@@ -203,11 +203,7 @@ async fn search_settings(app: AppHandle) -> Result<SearchSettings, String> {
         .map_err(|error| error.to_string())?
 }
 #[tauri::command]
-async fn set_api_key(
-    app: AppHandle,
-    provider: SearchProvider,
-    key: String,
-) -> Result<SearchSettings, String> {
+async fn set_api_key(app: AppHandle, provider: SearchProvider, key: String) -> Result<(), String> {
     let service = image_service(&app)?;
     tauri::async_runtime::spawn_blocking(move || service.set_api_key(provider, key))
         .await
@@ -278,6 +274,22 @@ async fn remove_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<List
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .register_asynchronous_uri_scheme_protocol(
+            "pairrank-image",
+            |context, request, responder| {
+                let images = context.app_handle().state::<Backend>().images.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let response = match images {
+                        Ok(service) => service.image_response(&request),
+                        Err(_) => tauri::http::Response::builder()
+                            .status(503)
+                            .body(Vec::new())
+                            .unwrap(),
+                    };
+                    responder.respond(response);
+                });
+            },
+        )
         .setup(|app| {
             let directory = app
                 .path()
@@ -361,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn removing_an_image_removes_its_managed_file_after_saving_the_item() {
-        let (_directory, backend) = backend();
+        let (directory, backend) = backend();
         let (list_id, item_id, image) = list_with_image(&backend).await;
         let state = backend
             .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
@@ -376,7 +388,7 @@ mod tests {
                 .image
                 .is_none()
         );
-        assert!(!Path::new(&image.path).exists());
+        assert!(!directory.path().join("images").join(&image.path).exists());
     }
     #[tokio::test]
     async fn failed_image_association_cleans_the_import_and_preserves_the_previous_image() {
@@ -414,13 +426,25 @@ mod tests {
                 .path,
             previous.path
         );
-        assert!(Path::new(&previous.path).exists());
-        assert!(!Path::new(&imported_path).exists());
+        assert!(
+            directory
+                .path()
+                .join("images")
+                .join(&previous.path)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join("images")
+                .join(&imported_path)
+                .exists()
+        );
     }
 
     #[tokio::test]
     async fn replacements_and_deletions_keep_shared_and_in_flight_images_until_unused() {
-        let (_directory, backend) = backend();
+        let (directory, backend) = backend();
         let (list_id, item_id, previous) = list_with_image(&backend).await;
         let service = backend.images.as_ref().unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png");
@@ -434,8 +458,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!Path::new(&previous.path).exists());
-        assert!(Path::new(&image_path).exists());
+        assert!(
+            !directory
+                .path()
+                .join("images")
+                .join(&previous.path)
+                .exists()
+        );
+        assert!(directory.path().join("images").join(&image_path).exists());
         let second_id = backend
             .database_job(move |db| {
                 let list = db.create_list("Second list".into())?;
@@ -449,19 +479,25 @@ mod tests {
             .change_images(None, move |db, _| db.delete_item(list_id, item_id))
             .await
             .unwrap();
-        assert!(Path::new(&image_path).exists());
+        assert!(directory.path().join("images").join(&image_path).exists());
         backend
             .change_images(None, move |db, _| db.delete_list(second_id))
             .await
             .unwrap();
-        assert!(!Path::new(&image_path).exists());
-        assert!(Path::new(&in_flight.path).exists());
+        assert!(!directory.path().join("images").join(&image_path).exists());
+        assert!(
+            directory
+                .path()
+                .join("images")
+                .join(&in_flight.path)
+                .exists()
+        );
         assert!(source.exists());
     }
 
     #[tokio::test]
     async fn failed_association_preserves_referenced_images_even_when_database_lock_is_poisoned() {
-        let (_directory, backend) = backend();
+        let (directory, backend) = backend();
         let (list_id, item_id, image) = list_with_image(&backend).await;
         let path = image.path.clone();
         let database = backend.database.clone();
@@ -477,7 +513,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(Path::new(&path).exists());
+        assert!(directory.path().join("images").join(&path).exists());
         let unused = backend
             .images
             .as_ref()
@@ -492,15 +528,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(!Path::new(&unused_path).exists());
+        assert!(!directory.path().join("images").join(&unused_path).exists());
     }
 
     #[tokio::test]
     async fn cleanup_preserves_external_files_and_does_not_fail_a_committed_removal() {
         let (directory, backend) = backend();
         let (list_id, item_id, image) = list_with_image(&backend).await;
-        std::fs::remove_file(&image.path).unwrap();
-        std::fs::create_dir(&image.path).unwrap();
+        std::fs::remove_file(directory.path().join("images").join(&image.path)).unwrap();
+        std::fs::create_dir(directory.path().join("images").join(&image.path)).unwrap();
         let state = backend
             .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
             .await
@@ -514,7 +550,7 @@ mod tests {
                 .image
                 .is_none()
         );
-        assert!(Path::new(&image.path).is_dir());
+        assert!(directory.path().join("images").join(&image.path).is_dir());
         let external = directory
             .path()
             .join(format!("{}.png", uuid::Uuid::new_v4()));
@@ -551,10 +587,20 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !Path::new(&replacement_path).exists(),
+            !directory
+                .path()
+                .join("images")
+                .join(&replacement_path)
+                .exists(),
             "cleanup must include the image replaced immediately before this transaction"
         );
-        assert!(Path::new(&in_flight.path).exists());
+        assert!(
+            directory
+                .path()
+                .join("images")
+                .join(&in_flight.path)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -576,6 +622,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!Path::new(&replacement_path).exists());
+        assert!(
+            !directory
+                .path()
+                .join("images")
+                .join(&replacement_path)
+                .exists()
+        );
     }
 }

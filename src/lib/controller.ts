@@ -276,9 +276,13 @@ export class AppController {
       this.state.pair = null;
       this.state.view = "compare";
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        const current = await this.api.resumeList(list.id);
+        const current = await this.api
+          .resumeList(list.id)
+          .catch((error: unknown) => this.handleComparisonError(list.id, error));
         this.acceptCommittedList(current);
-        const pair = await this.api.nextPair(list.id);
+        const pair = await this.api
+          .nextPair(list.id)
+          .catch((error: unknown) => this.handleComparisonError(list.id, error));
         if (pair && pair.revision !== current.revision) continue;
         if (!pair && current.items.length >= 2) continue;
         this.state.lists = await this.api.listSummaries();
@@ -288,6 +292,20 @@ export class AppController {
       }
       throw new Error(comparisonRetryMessage);
     });
+  }
+
+  private async handleComparisonError(listId: number, error: unknown): Promise<never> {
+    if (errorMessage(error) === "リストが見つかりません。") {
+      this.state.pair = null;
+      this.state.active = null;
+      this.state.modal = null;
+      this.state.drafts.items = "";
+      this.state.lists = this.state.lists.filter((entry) => entry.id !== listId);
+      this.state.view = "items";
+      this.state.active = await this.loadFirstAvailableList();
+      this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
+    }
+    throw error;
   }
 
   async answer(preference: Preference): Promise<void> {
@@ -302,7 +320,7 @@ export class AppController {
           this.state.pair = null;
           throw new Error(comparisonRetryMessage, { cause: error });
         }
-        throw error;
+        return this.handleComparisonError(pair.listId, error);
       }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
       this.acceptCommittedList(result);
@@ -312,7 +330,9 @@ export class AppController {
       }
       this.state.lists = await this.api.listSummaries();
       if (!result.convergence.converged) {
-        const next = await this.api.nextPair(result.id);
+        const next = await this.api
+          .nextPair(result.id)
+          .catch((error: unknown) => this.handleComparisonError(result.id, error));
         if (!next || next.revision !== result.revision) throw new Error(comparisonRetryMessage);
         this.state.pair = next;
       }
@@ -369,10 +389,22 @@ export class AppController {
     const key = remove ? "" : this.state.drafts[field].trim();
     if (!remove && !key) return;
     await this.perform(async () => {
-      this.state.settings = await this.api.setApiKey(provider, key);
-      this.state.provider = this.state.settings.defaultProvider;
+      await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
       this.state.notice = remove ? "APIキーを削除しました。" : "APIキーを保存しました。";
+      if (this.state.settings) {
+        const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+        const settings = { ...this.state.settings, [configured]: !remove };
+        settings.defaultProvider =
+          settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
+        this.state.settings = settings;
+        this.state.provider = settings.defaultProvider;
+      }
+      try {
+        await this.loadSettings();
+      } catch (error) {
+        this.state.error = `設定状態を再取得できませんでした: ${errorMessage(error)}`;
+      }
     });
   }
 }

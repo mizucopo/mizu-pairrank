@@ -28,7 +28,14 @@ export function mountApp(
       focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement
         ? ([focus.selectionStart, focus.selectionEnd] as const)
         : null;
-    root.innerHTML = renderApp(controller.state, assetUrl);
+    root.innerHTML = renderApp(controller.state, (path) =>
+      assetUrl(
+        path,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.png$/.test(path)
+          ? "pairrank-image"
+          : "asset",
+      ),
+    );
     const dialog = root.querySelector("dialog");
     if (dialog instanceof HTMLDialogElement) {
       dialog.showModal();

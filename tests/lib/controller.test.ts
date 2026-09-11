@@ -72,7 +72,7 @@ function backend(first = list(), second = list(2)) {
     nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(proposal(first)),
     answer: vi.fn<AppApi["answer"]>().mockResolvedValue(first),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
-    setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(settings),
+    setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(first),
     setRemoteImage: vi.fn<AppApi["setRemoteImage"]>().mockResolvedValue(first),
@@ -111,6 +111,79 @@ async function listSelection(context: "startup" | "after deletion") {
   const load = () => (context === "startup" ? controller.initialize() : controller.confirmDelete());
   return { api, controller, load };
 }
+
+describe("credential mutation acknowledgments", () => {
+  it.each([
+    ["brave", false, "brave"],
+    ["brave", true, "ollama"],
+    ["ollama", false, "ollama"],
+    ["ollama", true, "brave"],
+  ] as const)(
+    "keeps successful %s key changes (remove=%s) when refreshing settings fails",
+    async (provider, remove, defaultProvider) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: remove,
+        ollamaConfigured: remove,
+        defaultProvider: "brave",
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      const field = provider === "brave" ? "braveKey" : "ollamaKey";
+      controller.state.drafts[field] = "saved-key";
+      api.searchSettings.mockRejectedValueOnce(new Error("keyring read failed"));
+      await controller.saveKey(provider, remove);
+      expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
+      expect(controller.state.drafts[field]).toBe("");
+      expect(controller.state.notice).toBe(
+        remove ? "APIキーを削除しました。" : "APIキーを保存しました。",
+      );
+      expect(controller.state.settings).toEqual({
+        braveConfigured: provider === "brave" ? !remove : remove,
+        ollamaConfigured: provider === "ollama" ? !remove : remove,
+        defaultProvider,
+      });
+      expect(controller.state.provider).toBe(defaultProvider);
+      expect(controller.state.error).toContain("設定状態を再取得できませんでした");
+      expect(controller.state.error).toContain("keyring read failed");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it("keeps the draft and known settings when the credential mutation itself fails", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    const before = controller.state.settings;
+    controller.state.drafts.braveKey = "retry-key";
+    api.setApiKey.mockRejectedValueOnce(new Error("keyring write failed"));
+    await controller.saveKey("brave");
+    expect(controller.state.drafts.braveKey).toBe("retry-key");
+    expect(controller.state.settings).toEqual(before);
+    expect(controller.state.notice).toBe("");
+    expect(controller.state.error).toBe("keyring write failed");
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes both providers after acknowledging a successful key mutation", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    controller.state.drafts.ollamaKey = "saved-key";
+    const current = {
+      braveConfigured: true,
+      ollamaConfigured: true,
+      defaultProvider: "brave" as const,
+    };
+    api.searchSettings.mockResolvedValueOnce(current);
+    await controller.saveKey("ollama");
+    expect(controller.state.settings).toEqual(current);
+    expect(controller.state.provider).toBe("brave");
+    expect(controller.state.drafts.ollamaKey).toBe("");
+    expect(controller.state.notice).toBe("APIキーを保存しました。");
+    expect(controller.state.error).toBe("");
+  });
+});
 
 describe("comparison state and persistence boundaries", () => {
   it("opens a remaining list when the initial list is deleted before loading", async () => {
@@ -434,6 +507,92 @@ describe("comparison state and persistence boundaries", () => {
       expect(controller.state.active).toEqual(updated);
     },
   );
+
+  it.each([
+    ["string", "remaining"],
+    ["Error", "remaining"],
+    ["string", "empty"],
+    ["Error", "empty"],
+  ] as const)(
+    "removes a deleted comparison list after a %s rejection and opens the %s state",
+    async (representation, destination) => {
+      const { controller, api } = await comparison();
+      const remaining = list(2);
+      remaining.convergence.converged = true;
+      const message = "リストが見つかりません。";
+      controller.state.drafts.items = "deleted list draft";
+      api.answer.mockRejectedValueOnce(representation === "string" ? message : new Error(message));
+      api.listSummaries.mockResolvedValue(destination === "remaining" ? [summary(remaining)] : []);
+      api.getList.mockResolvedValue(remaining);
+      await controller.answer("equal");
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.active).toEqual(destination === "remaining" ? remaining : null);
+      expect(controller.state.lists).toEqual(
+        destination === "remaining" ? [summary(remaining)] : [],
+      );
+      expect(controller.state.drafts.items).toBe("");
+      expect(controller.state.view).toBe(destination === "remaining" ? "ranking" : "items");
+      expect(controller.state.error).toBe(message);
+      expect(controller.state.busy).toBe(false);
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps a deleted comparison list removed when refreshing the remaining lists fails", async () => {
+    const { controller, api } = await comparison();
+    controller.state.drafts.items = "deleted list draft";
+    api.answer.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockRejectedValueOnce("一覧を読み込めません。");
+    await controller.answer("equal");
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.lists.map((entry) => entry.id)).toEqual([2]);
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.view).toBe("items");
+    expect(controller.state.error).toBe("一覧を読み込めません。");
+    await controller.answer("equal");
+    expect(api.answer).toHaveBeenCalledOnce();
+    await controller.selectList(2);
+    expect(controller.state.active?.id).toBe(2);
+  });
+
+  it.each(["resume", "pair selection"] as const)(
+    "recovers when the current list disappears during %s after a rejected stale answer",
+    async (failure) => {
+      const { controller, api } = await comparison();
+      api.answer.mockRejectedValueOnce(
+        "リストが更新されています。最新の比較を読み直してください。",
+      );
+      await controller.answer("equal");
+      const message = "リストが見つかりません。";
+      if (failure === "resume") api.resumeList.mockRejectedValueOnce(message);
+      else api.nextPair.mockRejectedValueOnce(message);
+      api.listSummaries.mockResolvedValue([summary(list(2))]);
+      await controller.startComparison();
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.active?.id).toBe(2);
+      expect(controller.state.lists.map((entry) => entry.id)).toEqual([2]);
+      expect(controller.state.view).toBe("items");
+      expect(controller.state.error).toBe(message);
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("recovers if a successfully answered list is deleted before automatic pair selection", async () => {
+    const { controller, api, saved } = await comparison();
+    api.answer.mockResolvedValueOnce(saved);
+    api.nextPair.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    await controller.answer("equal");
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.lists.map((entry) => entry.id)).toEqual([2]);
+    expect(controller.state.error).toBe("リストが見つかりません。");
+    await controller.answer("equal");
+    expect(api.answer).toHaveBeenCalledOnce();
+  });
 
   it.each(["sidebar", "next pair"] as const)(
     "does not resubmit a committed answer when refreshing the %s fails",

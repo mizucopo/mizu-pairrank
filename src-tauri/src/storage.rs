@@ -85,7 +85,15 @@ pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
         ));
     }
     if metadata.permissions().mode() & 0o7777 != 0o600 {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // An owned file restored without read permission cannot be opened for fchmod.
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                File::open(path)?
+            }
+            Err(error) => return Err(error),
+        };
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
     }
@@ -207,6 +215,49 @@ mod tests {
             "Private ranking"
         );
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn reopening_a_read_only_database_restores_write_access_without_changing_saved_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pairrank.sqlite3");
+        {
+            let mut database = crate::database::Database::open(&path).unwrap();
+            database.create_list("Restored ranking".into()).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut database = crate::database::Database::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            database.list_summaries().unwrap()[0].name,
+            "Restored ranking"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        database.create_list("New ranking".into()).unwrap();
+        assert_eq!(database.list_summaries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn image_storage_restores_restrictive_owned_modes_without_changing_source_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let images = directory.path().join("images");
+        create_private_directory(&images).unwrap();
+        let managed = images.join(format!("{}.png", uuid::Uuid::new_v4()));
+        let source = directory.path().join("source.png");
+        fs::write(&managed, b"managed image").unwrap();
+        fs::write(&source, b"source image").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+
+        for restored_mode in [0o400, 0o200, 0o000] {
+            fs::set_permissions(&managed, fs::Permissions::from_mode(restored_mode)).unwrap();
+            crate::images::ImageService::new(directory.path().to_owned()).unwrap();
+            assert_eq!(mode(&managed), 0o600);
+            assert_eq!(fs::read(&managed).unwrap(), b"managed image");
+            assert_eq!(mode(&source), 0o400);
+            assert_eq!(fs::read(&source).unwrap(), b"source image");
+        }
     }
 
     #[test]

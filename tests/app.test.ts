@@ -12,7 +12,9 @@ import type {
   Preference,
 } from "../src/lib/types.js";
 
-function setup() {
+function setup(
+  assetUrl: (path: string, protocol?: string) => string = (path) => `asset://${path}`,
+) {
   const first = {
     id: 10,
     listId: 1,
@@ -67,7 +69,7 @@ function setup() {
       return { ...state, revision, comparisonCount };
     }),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
-    setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(settings),
+    setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(state),
     setRemoteImage: vi.fn<AppApi["setRemoteImage"]>().mockResolvedValue(state),
@@ -75,7 +77,7 @@ function setup() {
   } satisfies AppApi;
   const root = document.createElement("div");
   document.body.append(root);
-  const controller = mountApp(root, api, (path) => `asset://${path}`);
+  const controller = mountApp(root, api, assetUrl);
   return { root, controller, api, state, pair };
 }
 
@@ -103,6 +105,28 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it("loads managed image references through their protocol and preserves legacy absolute images", async () => {
+    const { root, controller, api, state } = setup(
+      (path, protocol) => `${protocol}://localhost/${encodeURIComponent(path)}`,
+    );
+    const references = ["c21901c2-7226-43e9-8548-c17f286c17e2.png", "/legacy/images/old.png"];
+    api.getList.mockResolvedValueOnce({
+      ...state,
+      items: state.items.map((item, index) => ({
+        ...item,
+        image: { path: references[index]!, sourceUrl: null },
+      })),
+    });
+    await controller.initialize();
+    const urls = [...root.querySelectorAll<HTMLImageElement>(".item-image")].map((image) =>
+      image.getAttribute("src"),
+    );
+    expect(urls).toEqual([
+      "pairrank-image://localhost/c21901c2-7226-43e9-8548-c17f286c17e2.png",
+      "asset://localhost/%2Flegacy%2Fimages%2Fold.png",
+    ]);
+  });
+
   const preferences: [string, Preference][] = [
     ["Aが大好き", "a_strong"],
     ["Aが好き", "a_weak"],

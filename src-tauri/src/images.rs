@@ -334,17 +334,75 @@ impl ImageService {
     }
 
     pub fn remove_managed_file(&self, path: &str) {
-        let path = Path::new(path);
-        if path.parent() != Some(self.directory.as_path()) || !is_managed_image_name(path) {
+        let Some(path) = self.managed_path(path) else {
             return;
-        }
-        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        };
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
             && path
                 .canonicalize()
                 .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
         {
             // Cleanup must never turn a committed database operation into a failure.
             let _ = std::fs::remove_file(path).and_then(|()| sync_directory(&self.directory));
+        }
+    }
+
+    fn managed_path(&self, reference: &str) -> Option<PathBuf> {
+        // Joining an old absolute reference preserves its original location.
+        let path = self.directory.join(reference);
+        (path.parent() == Some(self.directory.as_path()) && is_managed_image_name(&path))
+            .then_some(path)
+    }
+
+    pub fn image_response(
+        &self,
+        request: &tauri::http::Request<Vec<u8>>,
+    ) -> tauri::http::Response<Vec<u8>> {
+        use tauri::http::{Method, Response, StatusCode};
+        let read = || -> Result<(Vec<u8>, u64), StatusCode> {
+            if request.method() != Method::GET && request.method() != Method::HEAD {
+                return Err(StatusCode::METHOD_NOT_ALLOWED);
+            }
+            let reference = request.uri().path().strip_prefix('/').unwrap_or_default();
+            if reference.contains(['/', '\\']) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            let path = self.managed_path(reference).ok_or(StatusCode::FORBIDDEN)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| StatusCode::NOT_FOUND)?;
+            if !metadata.is_file()
+                || !path
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
+            {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            if metadata.len() > MAX_IMAGE_BYTES as u64 {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            if request.method() == Method::HEAD {
+                return Ok((Vec::new(), metadata.len()));
+            }
+            let file = std::fs::File::open(path).map_err(|_| StatusCode::NOT_FOUND)?;
+            let mut bytes = Vec::new();
+            file.take(MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            let length = bytes.len() as u64;
+            Ok((bytes, length))
+        };
+        let response = Response::builder()
+            .header("Cache-Control", "no-store")
+            .header("X-Content-Type-Options", "nosniff");
+        match read() {
+            Ok((bytes, length)) => response
+                .header("Content-Type", "image/png")
+                .header("Content-Length", length)
+                .body(bytes)
+                .unwrap(),
+            Err(status) => response.status(status).body(Vec::new()).unwrap(),
         }
     }
 
@@ -362,17 +420,12 @@ impl ImageService {
         })
     }
 
-    pub fn set_api_key(
-        &self,
-        provider: SearchProvider,
-        key: String,
-    ) -> Result<SearchSettings, String> {
+    pub fn set_api_key(&self, provider: SearchProvider, key: String) -> Result<(), String> {
         let key = key.trim();
         if key.len() > 4096 || key.chars().any(char::is_control) {
             return Err("APIキーの形式が正しくありません。".to_owned());
         }
-        self.credentials.set(provider, key)?;
-        self.settings()
+        self.credentials.set(provider, key)
     }
 
     pub async fn search(
@@ -703,7 +756,8 @@ fn save_image(
     source_url: Option<String>,
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
-    let path = directory.join(format!("{}.png", Uuid::new_v4()));
+    let filename = format!("{}.png", Uuid::new_v4());
+    let path = directory.join(&filename);
     let mut file = crate::storage::create_private_file(&path)
         .map_err(|_| "画像の保存先を作成できませんでした。".to_owned())?;
     if file
@@ -718,7 +772,7 @@ fn save_image(
         return Err("画像ファイルを保存できませんでした。空き容量を確認してください。".to_owned());
     }
     Ok(ImageAsset {
-        path: path.to_string_lossy().into_owned(),
+        path: filename,
         source_url,
     })
 }
@@ -728,6 +782,171 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn saved_image_reference_is_independent_of_the_storage_directory() {
+        let (directory, service, _) = service(Ok(Vec::new()), vec![]);
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let image = service.import_local(source).unwrap();
+        assert_eq!(Path::new(&image.path).components().count(), 1);
+        assert!(service.directory.join(&image.path).is_file());
+        service.remove_managed_file(&image.path);
+        assert!(!service.directory.join(&image.path).exists());
+    }
+
+    #[test]
+    fn managed_image_protocol_serves_imported_pngs_and_rejects_other_paths() {
+        use tauri::http::{Request, StatusCode};
+        let (directory, service, _) = service(Ok(Vec::new()), vec![]);
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let image = service.import_local(source).unwrap();
+        for origin in [
+            "pairrank-image://localhost",
+            "http://pairrank-image.localhost",
+        ] {
+            let request = Request::builder()
+                .uri(format!("{origin}/{}", image.path))
+                .body(Vec::new())
+                .unwrap();
+            let response = service.image_response(&request);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "image/png");
+            assert_eq!(image::load_from_memory(response.body()).unwrap().width(), 4);
+        }
+        for reference in [
+            "source.png",
+            "../source.png",
+            "%2e%2e%2fsource.png",
+            "/source.png",
+        ] {
+            let request = Request::builder()
+                .uri(format!("pairrank-image://localhost/{reference}"))
+                .body(Vec::new())
+                .unwrap();
+            assert_eq!(
+                service.image_response(&request).status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let uri = format!("pairrank-image://localhost/{}", image.path);
+        let head = Request::builder()
+            .method("HEAD")
+            .uri(&uri)
+            .body(Vec::new())
+            .unwrap();
+        let response = service.image_response(&head);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.body().is_empty());
+        assert!(
+            response.headers()["content-length"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 0
+        );
+        let post = Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            service.image_response(&post).status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(service.directory.join(&image.path))
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        let too_large = Request::builder().uri(&uri).body(Vec::new()).unwrap();
+        assert_eq!(
+            service.image_response(&too_large).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        service.remove_managed_file(&image.path);
+        let missing = Request::builder().uri(uri).body(Vec::new()).unwrap();
+        assert_eq!(
+            service.image_response(&missing).status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn cleanup_still_accepts_legacy_absolute_managed_references() {
+        let (directory, service, _) = service(Ok(Vec::new()), vec![]);
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let image = service.import_local(source.clone()).unwrap();
+        let legacy = service.directory.join(&image.path);
+        service.remove_managed_file(legacy.to_str().unwrap());
+        assert!(!legacy.exists());
+        assert!(source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_image_protocol_does_not_serve_symlinks_or_a_replaced_storage_directory() {
+        use tauri::http::{Request, StatusCode};
+        let app_data = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let filename = format!("{}.png", Uuid::new_v4());
+        let source = external.path().join(&filename);
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let request = Request::builder()
+            .uri(format!("pairrank-image://localhost/{filename}"))
+            .body(Vec::new())
+            .unwrap();
+        std::os::unix::fs::symlink(&source, service.directory.join(&filename)).unwrap();
+        assert_eq!(
+            service.image_response(&request).status(),
+            StatusCode::FORBIDDEN
+        );
+        std::fs::rename(&service.directory, app_data.path().join("old-images")).unwrap();
+        std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+        assert_eq!(
+            service.image_response(&request).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_references_round_trip_and_delete_inside_non_utf8_storage() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let app_data = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"app-\xff".to_vec()));
+        let source = root.path().join("source.png");
+        let original = png(4, 2);
+        std::fs::write(&source, &original).unwrap();
+        let service = ImageService::new(app_data).unwrap();
+        let imported = service.import_local(source.clone()).unwrap();
+        let saved: ImageAsset =
+            serde_json::from_str(&serde_json::to_string(&imported).unwrap()).unwrap();
+        assert!(
+            saved.path.is_ascii(),
+            "the stored reference must not encode the native directory"
+        );
+        assert!(service.directory.join(&saved.path).is_file());
+        let request = tauri::http::Request::builder()
+            .uri(format!("pairrank-image://localhost/{}", saved.path))
+            .body(Vec::new())
+            .unwrap();
+        let response = service.image_response(&request);
+        assert_eq!(response.status(), tauri::http::StatusCode::OK);
+        assert_eq!(image::load_from_memory(response.body()).unwrap().width(), 4);
+        service.remove_managed_file(&saved.path);
+        assert_eq!(std::fs::read_dir(&service.directory).unwrap().count(), 0);
+        assert_eq!(std::fs::read(source).unwrap(), original);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -749,7 +968,11 @@ mod tests {
             0o700
         );
         assert_eq!(
-            std::fs::metadata(&image.path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(service.directory.join(&image.path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         assert_eq!(
@@ -879,7 +1102,7 @@ mod tests {
             fetches: Mutex::default(),
         });
         let service = ImageService {
-            directory: directory.path().to_owned(),
+            directory: directory.path().canonicalize().unwrap(),
             credentials: Arc::new(MemoryCredentials::default()),
             transport: transport.clone(),
             decode_gate: Arc::new(Mutex::new(())),
@@ -889,25 +1112,59 @@ mod tests {
     }
 
     #[test]
+    fn successful_credential_mutations_do_not_depend_on_follow_up_keyring_reads() {
+        struct UnreadableCredentials(MemoryCredentials);
+        impl CredentialStore for UnreadableCredentials {
+            fn get(&self, _provider: SearchProvider) -> Result<Option<String>, String> {
+                Err("keyring read failed".to_owned())
+            }
+
+            fn set(&self, provider: SearchProvider, key: &str) -> Result<(), String> {
+                self.0.set(provider, key)
+            }
+        }
+        let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+        let credentials = Arc::new(UnreadableCredentials(MemoryCredentials::default()));
+        service.credentials = credentials.clone();
+        for provider in [SearchProvider::Brave, SearchProvider::Ollama] {
+            assert!(
+                service
+                    .set_api_key(provider, "saved-key".to_owned())
+                    .is_ok()
+            );
+            assert_eq!(
+                credentials.0.get(provider).unwrap().as_deref(),
+                Some("saved-key")
+            );
+            assert!(service.set_api_key(provider, String::new()).is_ok());
+            assert_eq!(credentials.0.get(provider).unwrap(), None);
+        }
+        assert_eq!(service.settings().unwrap_err(), "keyring read failed");
+    }
+
+    #[test]
     fn credentials_can_be_saved_switched_and_removed_without_returning_secrets() {
         let (_directory, service, _) = service(Ok(Vec::new()), vec![]);
         let settings = service.settings().unwrap();
         assert!(!settings.brave_configured && !settings.ollama_configured);
         assert_eq!(settings.default_provider, SearchProvider::Brave);
-        let settings = service
+        service
             .set_api_key(SearchProvider::Ollama, "ollama-secret".to_owned())
             .unwrap();
+        let settings = service.settings().unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Ollama);
-        let settings = service
+        service
             .set_api_key(SearchProvider::Brave, "brave-secret".to_owned())
             .unwrap();
+        let settings = service.settings().unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Brave);
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(serialized.contains("braveConfigured"));
-        let settings = service
+        service
             .set_api_key(SearchProvider::Brave, String::new())
             .unwrap();
+        let settings = service.settings().unwrap();
         assert!(!settings.brave_configured);
         assert_eq!(settings.default_provider, SearchProvider::Ollama);
         assert!(
@@ -1119,10 +1376,10 @@ mod tests {
         let original = png(1800, 900);
         std::fs::write(&source, &original).unwrap();
         let asset = service.import_local(source.clone()).unwrap();
-        assert_ne!(Path::new(&asset.path), source);
+        assert_ne!(service.directory.join(&asset.path), source);
         assert!(asset.source_url.is_none());
         assert_eq!(std::fs::read(source).unwrap(), original);
-        let normalized = image::open(asset.path).unwrap();
+        let normalized = image::open(service.directory.join(asset.path)).unwrap();
         assert_eq!((normalized.width(), normalized.height()), (1600, 800));
         let tiny = image::load_from_memory(&normalize_image(&png(2, 1), 320).unwrap()).unwrap();
         assert_eq!((tiny.width(), tiny.height()), (2, 1));
@@ -1145,12 +1402,12 @@ mod tests {
             asset.source_url.as_deref(),
             Some("https://example.com/item")
         );
-        assert!(Path::new(&asset.path).exists());
+        assert!(service.directory.join(&asset.path).exists());
         let mut missing = candidate;
         missing.id = "https://example.com/missing.png".to_owned();
         assert!(service.import_remote(missing).await.is_err());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-        assert!(Path::new(&asset.path).exists());
+        assert!(service.directory.join(&asset.path).exists());
     }
 
     #[test]
@@ -1274,8 +1531,18 @@ mod tests {
         for search in searches {
             assert_eq!(search.await.unwrap().unwrap().len(), 4);
         }
-        assert!(Path::new(&remote.await.unwrap().unwrap().path).exists());
-        assert!(Path::new(&local.await.unwrap().unwrap().path).exists());
+        assert!(
+            service
+                .directory
+                .join(remote.await.unwrap().unwrap().path)
+                .exists()
+        );
+        assert!(
+            service
+                .directory
+                .join(local.await.unwrap().unwrap().path)
+                .exists()
+        );
     }
     #[tokio::test]
     async fn cancelling_a_search_keeps_its_buffers_reserved_until_blocking_decodes_finish() {
@@ -1395,7 +1662,9 @@ mod tests {
             let bytes = jpeg_with_orientation(orientation);
             std::fs::write(&source, &bytes).unwrap();
             let imported = service.import_local(source.clone()).unwrap();
-            let decoded = image::open(imported.path).unwrap().to_rgb8();
+            let decoded = image::open(service.directory.join(imported.path))
+                .unwrap()
+                .to_rgb8();
             assert_eq!(decoded.dimensions(), dimensions);
             let (width, height) = dimensions;
             for ((x, y), color) in [
@@ -1473,7 +1742,7 @@ mod tests {
             result.is_err(),
             "an import must fail before association if its directory entry cannot be synced"
         );
-        assert!(Path::new(&existing.path).exists());
+        assert!(service.directory.join(&existing.path).exists());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read(source.path()).unwrap(), original);
     }
