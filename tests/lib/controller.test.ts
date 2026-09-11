@@ -385,21 +385,55 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.pair?.revision).toBe(saved.revision);
   });
 
-  it("retains the current proposal and ratings after backend save failure so retry is possible", async () => {
-    const { controller, api, initial, saved } = await comparison();
-    api.answer.mockRejectedValueOnce(new Error("ディスクへの保存に失敗しました"));
-    await controller.answer("equal");
-    expect(controller.state.active).toEqual(initial);
-    expect(controller.state.pair).toEqual(proposal(initial));
-    expect(api.nextPair).toHaveBeenCalledTimes(1);
-    expect(controller.state.error).toContain("保存に失敗");
-    api.answer.mockResolvedValue(saved);
-    api.nextPair.mockResolvedValue(proposal(saved));
-    await controller.answer("equal");
-    expect(api.answer).toHaveBeenCalledTimes(2);
-    expect(controller.state.active).toEqual(saved);
-    expect(controller.state.error).toBe("");
-  });
+  it.each(["string", "Error"] as const)(
+    "retains the current proposal and ratings after a transient save failure reported as %s",
+    async (representation) => {
+      const { controller, api, initial, saved } = await comparison();
+      const message = "ディスクへの保存に失敗しました";
+      api.answer.mockRejectedValueOnce(representation === "string" ? message : new Error(message));
+      await controller.answer("equal");
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.pair).toEqual(proposal(initial));
+      expect(api.nextPair).toHaveBeenCalledTimes(1);
+      expect(controller.state.error).toBe(message);
+      api.answer.mockResolvedValue(saved);
+      api.nextPair.mockResolvedValue(proposal(saved));
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenCalledTimes(2);
+      expect(controller.state.active).toEqual(saved);
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it.each(["string", "Error"] as const)(
+    "discards a revision-rejected proposal reported as %s and resumes with a fresh proposal",
+    async (representation) => {
+      const { controller, api, initial, saved } = await comparison();
+      const message = "リストが更新されています。最新の比較を読み直してください。";
+      api.answer.mockRejectedValueOnce(representation === "string" ? message : new Error(message));
+      await controller.answer("equal");
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.error).toBe(
+        "リストが更新されています。もう一度比較を開始してください。",
+      );
+      expect(controller.state.busy).toBe(false);
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenCalledOnce();
+
+      api.resumeList.mockResolvedValue(saved);
+      api.nextPair.mockResolvedValue(proposal(saved));
+      await controller.startComparison();
+      expect(controller.state.pair).toEqual(proposal(saved));
+      expect(controller.state.error).toBe("");
+      const updated = { ...saved, revision: saved.revision + 1, comparisonCount: 2 };
+      api.answer.mockResolvedValue(updated);
+      api.nextPair.mockResolvedValue(proposal(updated));
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenNthCalledWith(2, proposal(saved), "equal");
+      expect(controller.state.active).toEqual(updated);
+    },
+  );
 
   it.each(["sidebar", "next pair"] as const)(
     "does not resubmit a committed answer when refreshing the %s fails",

@@ -344,7 +344,7 @@ impl ImageService {
                 .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
         {
             // Cleanup must never turn a committed database operation into a failure.
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path).and_then(|()| sync_directory(&self.directory));
         }
     }
 

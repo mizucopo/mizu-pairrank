@@ -553,14 +553,13 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<(), 
     }
     let latest = migrations.last().map_or(0, |migration| migration.version);
     let current = schema_version(connection)?;
-    validate_schema_version(connection, current, latest)?;
-    if current == latest {
+    if current != 0 && current == latest {
         return Ok(());
     }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    // Another process may have completed the migration while this one waited for the lock.
+    // Validate version and schema together: another process may have just initialized the DB.
     let current = schema_version(&transaction)?;
     validate_schema_version(&transaction, current, latest)?;
     for migration in migrations
@@ -722,6 +721,58 @@ mod tests {
             expected
         );
         assert_eq!(snapshot_count(&database, id), 2);
+    }
+
+    #[test]
+    fn concurrent_initial_migration_does_not_misclassify_the_database_as_unmanaged() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        thread_local! {
+            static MIGRATE_AFTER_VERSION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+        fn after_version(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Profile(statement, _) = event
+                && statement.sql().contains("user_version")
+            {
+                let migrate = MIGRATE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
+                if let Some(migrate) = migrate {
+                    migrate();
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("initial-migration.sqlite3");
+        let mut first = Connection::open(&path).unwrap();
+        first.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let mut second = Connection::open(&path).unwrap();
+        let result = Rc::new(RefCell::new(None));
+        let completed = result.clone();
+        MIGRATE_AFTER_VERSION.with(|pending| {
+            *pending.borrow_mut() = Some(Box::new(move || {
+                *completed.borrow_mut() = Some(migrate(&mut second, MIGRATIONS).and_then(|()| {
+                    second.execute(
+                        "INSERT INTO lists (name, model_version, model_parameters) VALUES (?1, ?2, ?3)",
+                        params!["Created by another instance", MODEL_VERSION, MODEL_PARAMETERS_JSON],
+                    ).map(|_| ()).map_err(db_error)
+                }));
+            }));
+        });
+        first.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(after_version),
+        );
+        let migrated = migrate(&mut first, MIGRATIONS);
+        first.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        MIGRATE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
+        assert_eq!(*result.borrow(), Some(Ok(())));
+        migrated.unwrap();
+        assert_eq!(schema_version(&first).unwrap(), 1);
+        let name: String = first
+            .query_row("SELECT name FROM lists", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "Created by another instance");
     }
 
     #[test]

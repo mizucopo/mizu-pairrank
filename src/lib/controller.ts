@@ -294,7 +294,16 @@ export class AppController {
     const pair = this.state.pair;
     if (!pair || this.state.view !== "compare" || this.state.modal) return;
     await this.perform(async () => {
-      const result = await this.api.answer(pair, preference);
+      let result: ListState;
+      try {
+        result = await this.api.answer(pair, preference);
+      } catch (error) {
+        if (errorMessage(error) === "リストが更新されています。最新の比較を読み直してください。") {
+          this.state.pair = null;
+          throw new Error(comparisonRetryMessage, { cause: error });
+        }
+        throw error;
+      }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
       this.acceptCommittedList(result);
       if (result.convergence.converged) {
