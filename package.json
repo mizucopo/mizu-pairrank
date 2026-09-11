@@ -4,7 +4,7 @@
   "description": "mizu-pairrank",
   "private": true,
   "type": "module",
-  "author": "\u307f\u305a",
+  "author": "みず",
   "license": "UNLICENSED",
   "scripts": {
     "build": "tsc -p tsconfig.build.json && vite build",
@@ -28,6 +28,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^26.4.1",
+    "happy-dom": "^20.14.3",
     "oxlint": "^1.78.0",
     "oxlint-tsgolint": "^7.0.2001",
     "prettier": "^3.9.6",
