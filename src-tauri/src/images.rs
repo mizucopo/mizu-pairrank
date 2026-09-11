@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -378,12 +378,12 @@ impl ImageService {
         &self,
         seeds: Vec<CandidateSeed>,
     ) -> Result<Vec<ImageCandidate>, String> {
-        let mut pending: VecDeque<_> = seeds.into_iter().enumerate().collect();
+        let mut pending = seeds.into_iter().enumerate();
         let mut active = JoinSet::new();
         let mut completed = Vec::new();
         loop {
             while active.len() < SEARCH_PARALLELISM {
-                let Some((position, seed)) = pending.pop_front() else {
+                let Some((position, seed)) = pending.next() else {
                     break;
                 };
                 let transport = self.transport.clone();

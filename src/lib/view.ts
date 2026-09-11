@@ -136,13 +136,11 @@ export function renderApp(s: AppState, assetUrl: (path: string) => string): stri
   else if (!s.active)
     content =
       '<section class="empty welcome"><p class="eyebrow">A LITTLE CHOICE, A CLEARER RANKING</p><h1>好き、を並べよう。</h1><p>ふたつを比べて、ひとつ選ぶ。<br />小さな選択を重ねて、あなたのランキングを作ります。</p><button data-action="create-list">最初のリストを作成</button></section>';
-  else
-    content =
-      listHeader(s) +
-      (s.view === "compare"
-        ? comparisonView(s, assetUrl)
-        : s.view === "ranking"
-          ? rankingView(s, assetUrl)
-          : itemsView(s, assetUrl));
+  else {
+    content = listHeader(s);
+    if (s.view === "compare") content += comparisonView(s, assetUrl);
+    else if (s.view === "ranking") content += rankingView(s, assetUrl);
+    else content += itemsView(s, assetUrl);
+  }
   return `${sidebar(s)}<main class="workspace" aria-busy="${s.busy}">${!s.modal && s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${s.notice ? `<div class="notice" role="status">${e(s.notice)}</div>` : ""}${content}<div class="save-status" role="status">${s.busy ? "処理中…" : ""}</div></main>${modalView(s)}`;
 }

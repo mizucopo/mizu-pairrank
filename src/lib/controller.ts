@@ -270,12 +270,10 @@ export class AppController {
     const modal = this.state.modal;
     if (!list || modal?.kind !== "image") return;
     await this.perform(async () => {
-      const result =
-        source === "local"
-          ? await this.api.setLocalImage(list.id, modal.itemId)
-          : source === "none"
-            ? await this.api.removeImage(list.id, modal.itemId)
-            : await this.api.setRemoteImage(list.id, modal.itemId, source);
+      let result: ListState;
+      if (source === "local") result = await this.api.setLocalImage(list.id, modal.itemId);
+      else if (source === "none") result = await this.api.removeImage(list.id, modal.itemId);
+      else result = await this.api.setRemoteImage(list.id, modal.itemId, source);
       this.state.modal = null;
       await this.acceptList(result);
     });
