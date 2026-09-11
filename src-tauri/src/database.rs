@@ -41,8 +41,8 @@ impl Database {
     }
 
     pub fn list_summaries(&self) -> Result<Vec<ListSummary>, String> {
-        let mut statement = self
-            .connection
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let mut statement = transaction
             .prepare("SELECT id FROM lists ORDER BY id")
             .map_err(db_error)?;
         let ids = statement
@@ -52,7 +52,7 @@ impl Database {
             .map_err(db_error)?;
         ids.into_iter()
             .map(|id| {
-                let state = self.get_list(id)?;
+                let state = read_list(&transaction, id)?;
                 Ok(ListSummary {
                     id,
                     name: state.name,
@@ -94,7 +94,10 @@ impl Database {
     }
 
     pub fn delete_list(&mut self, id: i64) -> Result<(), String> {
-        let transaction = self.connection.transaction().map_err(db_error)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
         ensure_supported_model(&transaction, id)?;
         transaction
             .execute("DELETE FROM lists WHERE id = ?1", [id])
@@ -103,7 +106,8 @@ impl Database {
     }
 
     pub fn get_list(&self, id: i64) -> Result<ListState, String> {
-        read_list(&self.connection, id)
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        read_list(&transaction, id)
     }
 
     pub fn add_items(&mut self, list_id: i64, names: Vec<String>) -> Result<ListState, String> {
@@ -366,7 +370,7 @@ fn read_items(connection: &Connection, list_id: i64) -> Result<Vec<Item>, String
         .map_err(db_error)
 }
 
-fn read_list(connection: &Connection, list_id: i64) -> Result<ListState, String> {
+fn read_list(connection: &Transaction<'_>, list_id: i64) -> Result<ListState, String> {
     ensure_supported_model(connection, list_id)?;
     let (name, revision) = connection
         .query_row(
@@ -521,6 +525,68 @@ mod tests {
         database
             .add_items(list.id, vec!["A".to_owned(), "B".to_owned()])
             .unwrap()
+    }
+
+    #[test]
+    fn deletion_waits_for_another_writer_before_reading_validation() {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+
+        enum Event {
+            Waiting,
+            Finished(Result<(), String>),
+        }
+        thread_local! {
+            static NOTIFY_BUSY: RefCell<Option<mpsc::Sender<Event>>> = const { RefCell::new(None) };
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.sqlite3");
+        let mut database = Database::open(&path).unwrap();
+        let list = populated_list(&mut database, "Delete after another writer");
+        let mut other = Connection::open(&path).unwrap();
+        let writer = other
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        writer
+            .execute("UPDATE lists SET name = 'Changed' WHERE id = ?1", [list.id])
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let delete = std::thread::spawn(move || {
+            NOTIFY_BUSY.with(|notify| *notify.borrow_mut() = Some(sender.clone()));
+            database
+                .connection
+                .busy_handler(Some(|_| {
+                    NOTIFY_BUSY.with(|notify| {
+                        if let Some(sender) = notify.borrow_mut().take() {
+                            sender.send(Event::Waiting).unwrap();
+                        }
+                    });
+                    std::thread::sleep(Duration::from_millis(1));
+                    true
+                }))
+                .unwrap();
+            sender
+                .send(Event::Finished(database.delete_list(list.id)))
+                .unwrap();
+        });
+        let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.commit().unwrap();
+        delete.join().unwrap();
+        assert!(
+            matches!(first, Event::Waiting),
+            "deletion must wait for the writer before validation"
+        );
+        let Event::Finished(result) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("missing deletion result");
+        };
+        result.unwrap();
+        assert_eq!(
+            other
+                .query_row("SELECT count(*) FROM lists", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     fn snapshot_count(database: &Database, list_id: i64) -> i64 {
@@ -995,5 +1061,115 @@ mod tests {
                 .contains("評価モデル")
         );
         assert!(database.list_summaries().is_err());
+    }
+    thread_local! {
+        static WRITE_AFTER_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ConcurrentReadWrite<'a> {
+        connection: &'a Connection,
+        result: std::rc::Rc<std::cell::RefCell<Option<Result<(), String>>>>,
+    }
+
+    impl ConcurrentReadWrite<'_> {
+        fn assert_committed(&self) {
+            assert_eq!(
+                *self.result.borrow(),
+                Some(Ok(())),
+                "the second connection must commit during the read"
+            );
+        }
+    }
+
+    impl Drop for ConcurrentReadWrite<'_> {
+        fn drop(&mut self) {
+            self.connection
+                .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            WRITE_AFTER_SELECT.with(|pending| pending.borrow_mut().take());
+        }
+    }
+
+    fn write_after_first_select(
+        reader: &Database,
+        write: impl FnOnce() -> Result<(), String> + 'static,
+    ) -> ConcurrentReadWrite<'_> {
+        fn after_select(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Profile(statement, _) = event
+                && statement.sql().trim_start().starts_with("SELECT")
+            {
+                let write = WRITE_AFTER_SELECT.with(|pending| pending.borrow_mut().take());
+                if let Some(write) = write {
+                    write();
+                }
+            }
+        }
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed = result.clone();
+        WRITE_AFTER_SELECT.with(|pending| {
+            assert!(pending.borrow().is_none());
+            *pending.borrow_mut() = Some(Box::new(move || {
+                *completed.borrow_mut() = Some(write());
+            }));
+        });
+        reader.connection.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(after_select),
+        );
+        ConcurrentReadWrite {
+            connection: &reader.connection,
+            result,
+        }
+    }
+
+    #[test]
+    fn get_list_keeps_model_validation_and_state_in_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshots.sqlite3");
+        let mut reader = Database::open(&path).unwrap();
+        let before = populated_list(&mut reader, "Before");
+        reader
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let writer = Database::open(&path).unwrap();
+        let concurrent = write_after_first_select(&reader, move || {
+            writer.connection.execute_batch("BEGIN IMMEDIATE; UPDATE lists SET model_version = 99, name = 'Changed'; UPDATE items SET name = 'Changed'; COMMIT;").map_err(db_error)
+        });
+        let observed = reader.get_list(before.id).unwrap();
+        concurrent.assert_committed();
+        drop(concurrent);
+        assert_eq!(
+            serde_json::to_value(observed).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(
+            reader
+                .get_list(before.id)
+                .unwrap_err()
+                .contains("評価モデル")
+        );
+    }
+
+    #[test]
+    fn list_summaries_keep_list_membership_and_each_summary_in_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("summary-snapshots.sqlite3");
+        let mut reader = Database::open(&path).unwrap();
+        let first = populated_list(&mut reader, "First");
+        let second = populated_list(&mut reader, "Second");
+        let before = serde_json::to_value(reader.list_summaries().unwrap()).unwrap();
+        reader
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let mut writer = Database::open(&path).unwrap();
+        let concurrent = write_after_first_select(&reader, move || writer.delete_list(second.id));
+        let observed = reader.list_summaries();
+        concurrent.assert_committed();
+        drop(concurrent);
+        assert_eq!(serde_json::to_value(observed.unwrap()).unwrap(), before);
+        let next = reader.list_summaries().unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, first.id);
     }
 }
