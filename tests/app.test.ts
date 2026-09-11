@@ -206,6 +206,27 @@ describe("desktop app interaction", () => {
     expect(root.querySelectorAll(".item-row")).toHaveLength(1);
   });
 
+  it("keeps a created list selectable when refreshing the sidebar fails", async () => {
+    const { root, controller, api, state } = setup();
+    const created: ListState = { ...state, id: 2, name: "新しいリスト", items: [] };
+    await controller.initialize();
+    await click(root, controller, '[data-action="create-list"]');
+    controller.state.drafts.name = created.name;
+    api.createList.mockResolvedValueOnce(created);
+    api.listSummaries.mockRejectedValueOnce(new Error("一覧の更新に失敗しました"));
+    await controller.saveName();
+    expect(root.querySelector('[data-action="select-list"][data-id="2"]')?.textContent).toContain(
+      "新しいリスト",
+    );
+    expect(root.querySelector('[role="alert"]')?.textContent).toBe("一覧の更新に失敗しました");
+    await click(root, controller, '[data-action="select-list"][data-id="1"]');
+    expect(root.querySelector("h1")?.textContent).toBe(state.name);
+    api.getList.mockResolvedValueOnce(created);
+    await click(root, controller, '[data-action="select-list"][data-id="2"]');
+    expect(root.querySelector("h1")?.textContent).toBe(created.name);
+    expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
+  });
+
   it("allows local images and no image while search API keys are unconfigured", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
@@ -219,6 +240,52 @@ describe("desktop app interaction", () => {
     expect(api.removeImage).toHaveBeenCalledExactlyOnceWith(1, 10);
     expect(api.searchImages).not.toHaveBeenCalled();
     expect(api.setApiKey).not.toHaveBeenCalled();
+  });
+
+  it("preserves image choices when the file picker is cancelled and closes after a successful retry", async () => {
+    const { root, controller, api, state } = setup();
+    const candidate: ImageCandidate = {
+      id: "fruit",
+      title: "Fruit image",
+      previewUrl: "data:image/png;base64,AA==",
+      sourceUrl: "https://example.org/fruit",
+    };
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    api.searchImages.mockResolvedValueOnce([candidate]);
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    controller.state.drafts.query = "red apple";
+    await controller.searchImages();
+    api.listSummaries.mockClear();
+    api.setLocalImage.mockResolvedValueOnce(null);
+    await click(root, controller, '[data-action="local-image"]');
+    expect(root.querySelector("dialog")).not.toBeNull();
+    const query = root.querySelector("#image-query");
+    if (!(query instanceof HTMLInputElement)) throw new Error("Missing image query");
+    expect(query.value).toBe("red apple");
+    expect(root.querySelectorAll(".image-result")).toHaveLength(1);
+    expect(controller.state.candidates).toEqual([candidate]);
+    expect(controller.state.searched).toBe(true);
+    expect(controller.state.active).toEqual(state);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(api.listSummaries).not.toHaveBeenCalled();
+
+    const saved: ListState = {
+      ...state,
+      items: state.items.map((item) => ({
+        ...item,
+        image: { path: "/images/picked.png", sourceUrl: null },
+      })),
+    };
+    api.setLocalImage.mockResolvedValueOnce(saved);
+    await click(root, controller, '[data-action="local-image"]');
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(controller.state.active).toEqual(saved);
+    expect(api.listSummaries).toHaveBeenCalledOnce();
   });
 
   it("clears old candidates when switching provider and preserves the item after search failure", async () => {

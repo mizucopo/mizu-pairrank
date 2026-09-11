@@ -59,7 +59,7 @@ export type AppApi = {
   searchSettings: () => Promise<SearchSettings>;
   setApiKey: (provider: SearchProvider, key: string) => Promise<SearchSettings>;
   searchImages: (provider: SearchProvider, query: string) => Promise<ImageCandidate[]>;
-  setLocalImage: (listId: number, itemId: number) => Promise<ListState>;
+  setLocalImage: (listId: number, itemId: number) => Promise<ListState | null>;
   setRemoteImage: (listId: number, itemId: number, candidate: ImageCandidate) => Promise<ListState>;
   removeImage: (listId: number, itemId: number) => Promise<ListState>;
 };

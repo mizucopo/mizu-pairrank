@@ -173,10 +173,24 @@ export class AppController {
     this.changed();
   }
 
-  private async acceptList(list: ListState): Promise<void> {
-    // A committed answer is consumed even if refreshing the sidebar later fails.
+  private acceptCommittedList(list: ListState): void {
+    // Keep committed state usable even if a later sidebar refresh fails.
     this.state.active = list;
     this.state.pair = null;
+    const summary: ListSummary = {
+      id: list.id,
+      name: list.name,
+      itemCount: list.items.length,
+      comparisonCount: list.comparisonCount,
+      converged: list.convergence.converged,
+    };
+    this.state.lists = [...this.state.lists.filter((entry) => entry.id !== list.id), summary].sort(
+      (a, b) => a.id - b.id,
+    );
+  }
+
+  private async acceptList(list: ListState): Promise<void> {
+    this.acceptCommittedList(list);
     this.state.lists = await this.api.listSummaries();
   }
 
@@ -256,8 +270,7 @@ export class AppController {
     await this.perform(async () => {
       const result = await this.api.answer(pair, preference);
       // Drop the used proposal before any later I/O; it must never be submitted twice.
-      this.state.pair = null;
-      this.state.active = result;
+      this.acceptCommittedList(result);
       if (result.convergence.converged) {
         this.state.view = "ranking";
         this.state.notice = "順位ほぼ確定。比較を続けることもできます。";
@@ -302,10 +315,11 @@ export class AppController {
     const modal = this.state.modal;
     if (!list || modal?.kind !== "image") return;
     await this.perform(async () => {
-      let result: ListState;
+      let result: ListState | null;
       if (source === "local") result = await this.api.setLocalImage(list.id, modal.itemId);
       else if (source === "none") result = await this.api.removeImage(list.id, modal.itemId);
       else result = await this.api.setRemoteImage(list.id, modal.itemId, source);
+      if (!result) return;
       this.state.modal = null;
       await this.acceptList(result);
     });

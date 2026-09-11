@@ -225,6 +225,25 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.error).toBe("作成できません");
   });
 
+  it("replaces an existing sidebar summary after a committed edit despite refresh failure", async () => {
+    const first = list();
+    const second = list(2);
+    const api = backend(first, second);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    for (const name of ["一度目の変更", "二度目の変更"]) {
+      await controller.openModal({ kind: "rename-list" });
+      controller.state.drafts.name = name;
+      api.renameList.mockResolvedValueOnce({ ...first, name });
+      api.listSummaries.mockRejectedValueOnce(new Error("一覧の更新に失敗しました"));
+      await controller.saveName();
+      expect(controller.state.lists).toEqual([
+        { id: 1, name, itemCount: 2, comparisonCount: 0, converged: false },
+        summary(second),
+      ]);
+    }
+  });
+
   it("accepts only one answer while a save is pending", async () => {
     const { controller, api, initial, saved } = await comparison();
     let finish: ((value: ListState) => void) | undefined;
@@ -272,6 +291,15 @@ describe("comparison state and persistence boundaries", () => {
       else api.nextPair.mockRejectedValueOnce(new Error("更新失敗"));
       await controller.answer("a_weak");
       expect(controller.state.active).toEqual(saved);
+      if (failure === "sidebar") {
+        expect(controller.state.lists[0]).toEqual({
+          id: 1,
+          name: "リスト1",
+          itemCount: 2,
+          comparisonCount: 1,
+          converged: false,
+        });
+      }
       expect(controller.state.pair).toBeNull();
       expect(controller.state.error).toBe("更新失敗");
       await controller.answer("a_weak");

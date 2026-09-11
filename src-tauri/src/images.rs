@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use image::{ImageFormat, ImageReader};
+use image::{ImageDecoder, ImageFormat, ImageReader};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -313,6 +313,8 @@ impl ImageService {
         let directory = app_data.join("images");
         std::fs::create_dir_all(&directory)
             .map_err(|_| "画像の保存フォルダーを作成できませんでした。".to_owned())?;
+        sync_directory(&app_data)
+            .map_err(|_| "画像の保存フォルダーを同期できませんでした。".to_owned())?;
         let directory = directory
             .canonicalize()
             .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
@@ -608,17 +610,23 @@ fn normalize_image(bytes: &[u8], max_edge: u32) -> Result<Vec<u8>, String> {
     limits.max_alloc = Some(128 * 1024 * 1024);
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits.clone());
-    let (width, height) = reader
-        .into_dimensions()
+    let mut decoder = reader
+        .into_decoder()
         .map_err(|_| "画像サイズを読み取れませんでした。".to_owned())?;
+    let (width, height) = decoder.dimensions();
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err("画像の画素数が上限（3,200万画素）を超えています。".to_owned());
     }
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|_| {
+    let orientation = decoder.orientation().map_err(|_| {
         "画像を読み取れませんでした。画像が破損していないか確認してください。".to_owned()
     })?;
+    drop(decoder);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let mut decoded = reader.decode().map_err(|_| {
+        "画像を読み取れませんでした。画像が破損していないか確認してください。".to_owned()
+    })?;
+    decoded.apply_orientation(orientation);
     let normalized = if decoded.width() > max_edge || decoded.height() > max_edge {
         decoded.thumbnail(max_edge, max_edge)
     } else {
@@ -629,6 +637,17 @@ fn normalize_image(bytes: &[u8], max_edge: u32) -> Result<Vec<u8>, String> {
         .write_to(&mut encoded, ImageFormat::Png)
         .map_err(|_| "画像を保存形式に変換できませんでした。".to_owned())?;
     Ok(encoded.into_inner())
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    // Windows does not support Unix directory fsync; the image file is still flushed.
+    Ok(())
 }
 
 fn save_image(
@@ -646,10 +665,12 @@ fn save_image(
     if file
         .write_all(&normalized)
         .and_then(|()| file.sync_all())
+        .and_then(|()| sync_directory(directory))
         .is_err()
     {
         drop(file);
         let _ = std::fs::remove_file(&path);
+        let _ = sync_directory(directory);
         return Err("画像ファイルを保存できませんでした。空き容量を確認してください。".to_owned());
     }
     Ok(ImageAsset {
@@ -1150,5 +1171,145 @@ mod tests {
         std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
         service.remove_managed_file(service.directory.join(filename).to_str().unwrap());
         assert_eq!(std::fs::read(original).unwrap(), b"external image");
+    }
+
+    fn jpeg_with_orientation(orientation: u8) -> Vec<u8> {
+        let pixels = image::RgbImage::from_fn(32, 16, |x, y| {
+            image::Rgb(match (x < 16, y < 8) {
+                (true, true) => [255, 0, 0],
+                (false, true) => [0, 255, 0],
+                (true, false) => [0, 0, 255],
+                (false, false) => [255, 255, 0],
+            })
+        });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&pixels)
+            .unwrap();
+        // APP1 Exif: little-endian TIFF with one SHORT Orientation (0x0112) entry.
+        let mut oriented = vec![0xff, 0xd8, 0xff, 0xe1, 0, 34];
+        oriented.extend_from_slice(b"Exif\0\0II\x2a\0\x08\0\0\0");
+        oriented.extend_from_slice(b"\x01\0\x12\x01\x03\0\x01\0\0\0");
+        oriented.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+        oriented.extend_from_slice(&jpeg[2..]);
+        oriented
+    }
+
+    #[test]
+    fn local_jpeg_import_applies_exif_rotation_and_reflection_before_discarding_metadata() {
+        let (directory, service, _) = service(Ok(Vec::new()), vec![]);
+        for (orientation, dimensions, expected) in [
+            (
+                6,
+                (16, 32),
+                [[0, 0, 255], [255, 0, 0], [255, 255, 0], [0, 255, 0]],
+            ),
+            (
+                2,
+                (32, 16),
+                [[0, 255, 0], [255, 0, 0], [255, 255, 0], [0, 0, 255]],
+            ),
+        ] {
+            let source = directory.path().join(format!("oriented-{orientation}.jpg"));
+            let bytes = jpeg_with_orientation(orientation);
+            std::fs::write(&source, &bytes).unwrap();
+            let imported = service.import_local(source.clone()).unwrap();
+            let decoded = image::open(imported.path).unwrap().to_rgb8();
+            assert_eq!(decoded.dimensions(), dimensions);
+            let (width, height) = dimensions;
+            for ((x, y), color) in [
+                (width / 4, height / 4),
+                (3 * width / 4, height / 4),
+                (width / 4, 3 * height / 4),
+                (3 * width / 4, 3 * height / 4),
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let actual = decoded.get_pixel(x, y).0;
+                assert!(
+                    actual
+                        .into_iter()
+                        .zip(color)
+                        .all(|(actual, expected)| actual.abs_diff(expected) < 20),
+                    "orientation {orientation}: expected {color:?}, got {actual:?}"
+                );
+            }
+            assert_eq!(std::fs::read(source).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    struct RestorePermissions {
+        path: PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl RestorePermissions {
+        fn write_only_directory(path: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            let original = std::fs::metadata(path).unwrap().permissions();
+            let restore = Self {
+                path: path.to_owned(),
+                original,
+            };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o300)).unwrap();
+            match std::fs::File::open(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Some(restore),
+                Ok(_) => {
+                    eprintln!(
+                        "skipping directory permission-failure scenario: this user bypasses Unix mode bits"
+                    );
+                    None
+                }
+                Err(error) => panic!("unexpected directory permission error: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_unsynced_directory_entries_and_removes_only_the_new_file() {
+        let (directory, service, _) = service(Ok(Vec::new()), vec![]);
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let original = png(4, 2);
+        std::fs::write(source.path(), &original).unwrap();
+        let existing = service.import_local(source.path().to_owned()).unwrap();
+        let Some(permissions) = RestorePermissions::write_only_directory(directory.path()) else {
+            return;
+        };
+        let result = service.import_local(source.path().to_owned());
+        drop(permissions);
+        assert!(
+            result.is_err(),
+            "an import must fail before association if its directory entry cannot be synced"
+        );
+        assert!(Path::new(&existing.path).exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(source.path()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_service_requires_the_initial_images_directory_entry_to_be_synced() {
+        let app_data = tempfile::tempdir().unwrap();
+        let Some(permissions) = RestorePermissions::write_only_directory(app_data.path()) else {
+            return;
+        };
+        let result = ImageService::new(app_data.path().to_owned());
+        drop(permissions);
+        assert!(
+            result.is_err(),
+            "a newly created images directory must be synced in its parent before use"
+        );
+        assert!(ImageService::new(app_data.path().to_owned()).is_ok());
     }
 }

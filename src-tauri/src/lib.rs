@@ -225,7 +225,11 @@ async fn search_images(
     image_service(&app)?.search(provider, query).await
 }
 #[tauri::command]
-async fn set_local_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListState, String> {
+async fn set_local_image(
+    app: AppHandle,
+    list_id: i64,
+    item_id: i64,
+) -> Result<Option<ListState>, String> {
     let service = image_service(&app)?;
     let dialog_app = app.clone();
     let image = tauri::async_runtime::spawn_blocking(move || {
@@ -242,12 +246,15 @@ async fn set_local_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<L
     })
     .await
     .map_err(|error| error.to_string())??;
+    let Some(image) = image else {
+        return Ok(None);
+    };
     app.state::<Backend>()
-        .change_images(list_id, image, move |db, image| match image {
-            Some(image) => db.set_image(list_id, item_id, Some(image)),
-            None => db.get_list(list_id),
+        .change_images(list_id, Some(image), move |db, image| {
+            db.set_image(list_id, item_id, image)
         })
         .await
+        .map(Some)
 }
 #[tauri::command]
 async fn set_remote_image(
