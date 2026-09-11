@@ -3,6 +3,7 @@ mod database;
 mod images;
 mod models;
 mod rating;
+mod storage;
 
 use database::{Database, ImageChange};
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
@@ -278,12 +279,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let directory = app.path().app_data_dir().map_err(|error| error.to_string());
-            let database = directory.clone().and_then(|path| {
-                std::fs::create_dir_all(&path)
-                    .map_err(|error| format!("保存先を作成できません: {error}"))?;
-                Database::open(&path.join("pairrank.sqlite3"))
-            });
+            let directory = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())
+                .and_then(|path| {
+                    storage::create_private_directory(&path)
+                        .map_err(|error| format!("保存先を作成できません: {error}"))?;
+                    Ok(path)
+                });
+            let database = directory
+                .clone()
+                .and_then(|path| Database::open(&path.join("pairrank.sqlite3")));
             let images = directory.and_then(ImageService::new).map(Arc::new);
             app.manage(Backend {
                 database: Arc::new(Mutex::new(database)),

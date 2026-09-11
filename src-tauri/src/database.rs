@@ -32,6 +32,8 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
+        crate::storage::prepare_database_file(path)
+            .map_err(|error| format!("保存データの権限を設定できません: {error}"))?;
         let mut connection = Connection::open(path).map_err(db_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -204,7 +206,24 @@ impl Database {
     }
 
     pub fn resume_list(&mut self, list_id: i64) -> Result<ListState, String> {
-        self.mutate_list(list_id, |transaction| reset_snapshots(transaction, list_id))
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let mut state = read_list(&transaction, list_id)?;
+        // Another instance may already have resumed and made progress.
+        if state.convergence.converged {
+            reset_snapshots(&transaction, list_id)?;
+            transaction
+                .execute(
+                    "UPDATE lists SET revision = revision + 1 WHERE id = ?1",
+                    [list_id],
+                )
+                .map_err(db_error)?;
+            state = read_list(&transaction, list_id)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(state)
     }
 
     pub fn answer(
@@ -1005,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_changes_and_resume_reset_window_but_preserve_ratings_and_history() {
+    fn membership_changes_reset_window_but_preserve_ratings_and_history() {
         let mut database = memory_database();
         let state = populated_list(&mut database, "test");
         let answered = answer_once(&mut database, &state);
@@ -1049,15 +1068,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept_row, 1);
-        let answered = answer_once(&mut database, &deleted);
-        let resumed = database.resume_list(state.id).unwrap();
-        assert_eq!(resumed.convergence.observed_answers, 0);
-        assert_eq!(resumed.revision, answered.revision + 1);
-        assert_eq!(resumed.comparison_count, answered.comparison_count);
-        for (before, after) in answered.items.iter().zip(&resumed.items) {
-            assert_eq!(before.rating.mu, after.rating.mu);
-            assert_eq!(before.rating.sigma, after.rating.sigma);
+    }
+
+    #[test]
+    fn resume_uses_current_convergence_and_preserves_another_instances_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resume.sqlite3");
+        let mut first = Database::open(&path).unwrap();
+        let initial = populated_list(&mut first, "shared");
+        let mut second = Database::open(&path).unwrap();
+        let mut settled = second.get_list(initial.id).unwrap();
+        for _ in 0..20 {
+            settled = second
+                .answer(
+                    settled.id,
+                    settled.items[0].id,
+                    settled.items[1].id,
+                    Preference::Equal,
+                    settled.revision,
+                )
+                .unwrap();
         }
+        assert!(settled.convergence.converged);
+        let resumed = first.resume_list(initial.id).unwrap();
+        assert!(!resumed.convergence.converged);
+        assert_eq!(resumed.convergence.observed_answers, 0);
+        assert_eq!(resumed.revision, settled.revision + 1);
+        assert_eq!(resumed.comparison_count, settled.comparison_count);
+        assert_eq!(
+            serde_json::to_value(&resumed.items).unwrap(),
+            serde_json::to_value(&settled.items).unwrap()
+        );
+        let progress = answer_once(&mut second, &resumed);
+        let unchanged = first.resume_list(settled.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(unchanged).unwrap(),
+            serde_json::to_value(progress).unwrap()
+        );
+        assert_eq!(snapshot_count(&first, initial.id), 2);
     }
 
     #[test]

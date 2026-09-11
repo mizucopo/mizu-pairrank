@@ -49,6 +49,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const comparisonRetryMessage = "リストが更新されています。もう一度比較を開始してください。";
+
 export class AppController {
   readonly state: AppState = {
     lists: [],
@@ -269,11 +271,22 @@ export class AppController {
 
   async startComparison(): Promise<void> {
     const list = this.state.active;
-    if (!list || list.items.length < 2) return;
+    if (!list) return;
     await this.perform(async () => {
-      if (list.convergence.converged) await this.acceptList(await this.api.resumeList(list.id));
+      this.state.pair = null;
       this.state.view = "compare";
-      this.state.pair = await this.api.nextPair(list.id);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const current = await this.api.resumeList(list.id);
+        this.acceptCommittedList(current);
+        const pair = await this.api.nextPair(list.id);
+        if (pair && pair.revision !== current.revision) continue;
+        if (!pair && current.items.length >= 2) continue;
+        this.state.lists = await this.api.listSummaries();
+        this.state.pair = pair;
+        this.state.view = pair ? "compare" : "items";
+        return;
+      }
+      throw new Error(comparisonRetryMessage);
     });
   }
 
@@ -289,7 +302,11 @@ export class AppController {
         this.state.notice = "順位ほぼ確定。比較を続けることもできます。";
       }
       this.state.lists = await this.api.listSummaries();
-      if (!result.convergence.converged) this.state.pair = await this.api.nextPair(result.id);
+      if (!result.convergence.converged) {
+        const next = await this.api.nextPair(result.id);
+        if (!next || next.revision !== result.revision) throw new Error(comparisonRetryMessage);
+        this.state.pair = next;
+      }
     });
   }
 

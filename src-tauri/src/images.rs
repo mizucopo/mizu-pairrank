@@ -314,13 +314,16 @@ pub struct ImageService {
 impl ImageService {
     pub fn new(app_data: PathBuf) -> Result<Self, String> {
         let directory = app_data.join("images");
-        std::fs::create_dir_all(&directory)
+        crate::storage::create_private_directory(&directory)
             .map_err(|_| "画像の保存フォルダーを作成できませんでした。".to_owned())?;
         sync_directory(&app_data)
             .map_err(|_| "画像の保存フォルダーを同期できませんでした。".to_owned())?;
         let directory = directory
             .canonicalize()
             .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
+        #[cfg(unix)]
+        restrict_image_permissions(&directory)
+            .map_err(|_| "保存済み画像の権限を設定できませんでした。".to_owned())?;
         Ok(Self {
             directory,
             credentials: Arc::new(SystemCredentials),
@@ -332,14 +335,7 @@ impl ImageService {
 
     pub fn remove_managed_file(&self, path: &str) {
         let path = Path::new(path);
-        if path.parent() != Some(self.directory.as_path())
-            || path.extension().and_then(|value| value.to_str()) != Some("png")
-            || path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .is_none()
-        {
+        if path.parent() != Some(self.directory.as_path()) || !is_managed_image_name(path) {
             return;
         }
         if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
@@ -487,6 +483,35 @@ impl ImageService {
             .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
         save_image(&self.directory, &bytes, None)
     }
+}
+
+fn is_managed_image_name(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("png")
+        && path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_some()
+}
+
+#[cfg(unix)]
+fn restrict_image_permissions(directory: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if file_type.is_file() && is_managed_image_name(&entry.path()) {
+            match crate::storage::restrict_existing_file(&entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 struct CandidateSeed {
@@ -679,10 +704,7 @@ fn save_image(
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
     let path = directory.join(format!("{}.png", Uuid::new_v4()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    let mut file = crate::storage::create_private_file(&path)
         .map_err(|_| "画像の保存先を作成できませんでした。".to_owned())?;
     if file
         .write_all(&normalized)
@@ -706,6 +728,75 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_imported_images_are_private_and_source_permissions_are_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), png(4, 2)).unwrap();
+        std::fs::set_permissions(source.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let image = service.import_local(source.path().to_owned()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&service.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&image.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(source.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopening_image_storage_restricts_only_existing_managed_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let images = app_data.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let managed = images.join(format!("{}.png", Uuid::new_v4()));
+        let source = app_data.path().join("source.png");
+        let unrelated = images.join("unmanaged.png");
+        for path in [&managed, &source, &unrelated] {
+            std::fs::write(path, b"unchanged image").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::os::unix::fs::symlink(&source, images.join(format!("{}.png", Uuid::new_v4())))
+            .unwrap();
+        ImageService::new(app_data.path().to_owned()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&managed).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&images).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for path in [&source, &unrelated] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert_eq!(std::fs::read(managed).unwrap(), b"unchanged image");
+    }
 
     #[derive(Default)]
     struct MemoryCredentials(Mutex<HashMap<SearchProvider, String>>);

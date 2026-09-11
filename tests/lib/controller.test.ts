@@ -394,6 +394,7 @@ describe("comparison state and persistence boundaries", () => {
     expect(api.nextPair).toHaveBeenCalledTimes(1);
     expect(controller.state.error).toContain("保存に失敗");
     api.answer.mockResolvedValue(saved);
+    api.nextPair.mockResolvedValue(proposal(saved));
     await controller.answer("equal");
     expect(api.answer).toHaveBeenCalledTimes(2);
     expect(controller.state.active).toEqual(saved);
@@ -423,8 +424,39 @@ describe("comparison state and persistence boundaries", () => {
       await controller.answer("a_weak");
       expect(api.answer).toHaveBeenCalledTimes(1);
       api.nextPair.mockResolvedValue(proposal(saved));
+      api.resumeList.mockResolvedValue(saved);
       await controller.startComparison();
       expect(controller.state.pair?.revision).toBe(saved.revision);
+    },
+  );
+
+  it.each(["newer revision", "older revision", "missing pair"] as const)(
+    "requires explicit restart when automatic pair selection returns a %s after saving",
+    async (interference) => {
+      const { controller, api, saved } = await comparison();
+      const latest = { ...saved, revision: saved.revision + 2 };
+      api.answer.mockResolvedValue(saved);
+      let next: PairProposal | null = null;
+      if (interference === "newer revision") next = proposal(latest);
+      else if (interference === "older revision")
+        next = proposal({ ...saved, revision: saved.revision - 1 });
+      api.nextPair.mockResolvedValue(next);
+      await controller.answer("equal");
+      expect(controller.state.active).toEqual(saved);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.error).toBe(
+        "リストが更新されています。もう一度比較を開始してください。",
+      );
+      expect(controller.state.busy).toBe(false);
+      await controller.answer("equal");
+      expect(api.answer).toHaveBeenCalledOnce();
+
+      api.resumeList.mockResolvedValue(latest);
+      api.nextPair.mockResolvedValue(proposal(latest));
+      await controller.startComparison();
+      expect(controller.state.active).toEqual(latest);
+      expect(controller.state.pair).toEqual(proposal(latest));
+      expect(controller.state.error).toBe("");
     },
   );
 
@@ -452,6 +484,7 @@ describe("comparison state and persistence boundaries", () => {
       convergence: { ...settled.convergence, converged: false, observedAnswers: 0 },
     };
     api.resumeList.mockResolvedValue(resumed);
+    api.resumeList.mockClear();
     api.nextPair.mockResolvedValue(proposal(resumed));
     await controller.startComparison();
     expect(api.resumeList).toHaveBeenCalledExactlyOnceWith(settled.id);
@@ -459,6 +492,131 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.pair?.revision).toBe(resumed.revision);
     expect(controller.state.view).toBe("compare");
   });
+
+  it.each([false, true])(
+    "starts comparison from current backend state when cached convergence is %s",
+    async (cachedConverged) => {
+      const cached = list();
+      cached.convergence.converged = cachedConverged;
+      const current: ListState = {
+        ...cached,
+        revision: 9,
+        comparisonCount: 27,
+        convergence: {
+          ...cached.convergence,
+          converged: false,
+          observedAnswers: cachedConverged ? 7 : 0,
+        },
+      };
+      const api = backend(cached);
+      api.resumeList.mockResolvedValue(current);
+      api.nextPair.mockResolvedValue(proposal(current));
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.startComparison();
+      expect(controller.state.active).toEqual(current);
+      expect(controller.state.pair).toEqual(proposal(current));
+      expect(controller.state.view).toBe("compare");
+    },
+  );
+
+  it("retries comparison start when a proposal belongs to a newer revision", async () => {
+    const cached = list();
+    const current = { ...cached, revision: 6 };
+    const api = backend(cached);
+    api.resumeList.mockResolvedValueOnce(cached).mockResolvedValueOnce(current);
+    api.nextPair.mockResolvedValue(proposal(current));
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    api.listSummaries.mockClear();
+    await controller.startComparison();
+    expect(controller.state.active).toEqual(current);
+    expect(controller.state.pair).toEqual(proposal(current));
+    expect(api.listSummaries).toHaveBeenCalledOnce();
+    expect(controller.state.error).toBe("");
+  });
+
+  it("starts comparison if another instance added items to a cached empty list", async () => {
+    const current = list();
+    const cached = { ...current, items: [], revision: 1 };
+    const api = backend(current);
+    api.getList.mockResolvedValueOnce(cached);
+    api.resumeList.mockResolvedValue(current);
+    api.nextPair.mockResolvedValue(proposal(current));
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.startComparison();
+    expect(controller.state.active).toEqual(current);
+    expect(controller.state.pair).toEqual(proposal(current));
+    expect(controller.state.view).toBe("compare");
+  });
+
+  it.each(["newer revision", "missing pair"] as const)(
+    "bounds comparison start retries for a %s and leaves no actionable stale pair",
+    async (interference) => {
+      const { controller, api, initial, saved } = await comparison();
+      api.resumeList.mockClear();
+      api.nextPair.mockClear();
+      api.listSummaries.mockClear();
+      api.nextPair.mockResolvedValue(interference === "newer revision" ? proposal(saved) : null);
+      await controller.startComparison();
+      expect(api.resumeList).toHaveBeenCalledTimes(3);
+      expect(api.nextPair).toHaveBeenCalledTimes(3);
+      expect(api.listSummaries).not.toHaveBeenCalled();
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.busy).toBe(false);
+      expect(controller.state.error).toBe(
+        "リストが更新されています。もう一度比較を開始してください。",
+      );
+      await controller.answer("equal");
+      expect(api.answer).not.toHaveBeenCalled();
+
+      api.resumeList.mockResolvedValue(saved);
+      api.nextPair.mockResolvedValue(proposal(saved));
+      await controller.startComparison();
+      expect(controller.state.active).toEqual(saved);
+      expect(controller.state.pair).toEqual(proposal(saved));
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it.each(["before resume", "after resume"] as const)(
+    "returns to item management when another instance removes an item %s",
+    async (timing) => {
+      const { controller, api, initial } = await comparison();
+      const current = { ...initial, revision: 8, items: initial.items.slice(0, 1) };
+      if (timing === "after resume") api.resumeList.mockResolvedValueOnce(initial);
+      api.resumeList.mockResolvedValue(current);
+      api.nextPair.mockResolvedValue(null);
+      await controller.startComparison();
+      expect(controller.state.active).toEqual(current);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.view).toBe("items");
+      expect(controller.state.error).toBe("");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it.each(["resume", "next pair", "sidebar"] as const)(
+    "keeps the latest returned list but discards the previous pair when %s fails during start",
+    async (failure) => {
+      const { controller, api, initial, saved } = await comparison();
+      api.resumeList.mockResolvedValue(saved);
+      api.nextPair.mockResolvedValue(proposal(saved));
+      const error = new Error("比較の準備に失敗しました");
+      if (failure === "resume") api.resumeList.mockRejectedValueOnce(error);
+      else if (failure === "next pair") api.nextPair.mockRejectedValueOnce(error);
+      else api.listSummaries.mockRejectedValueOnce(error);
+      await controller.startComparison();
+      expect(controller.state.active).toEqual(failure === "resume" ? initial : saved);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.busy).toBe(false);
+      expect(controller.state.error).toBe("比較の準備に失敗しました");
+      await controller.answer("equal");
+      expect(api.answer).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not discard the current list if selecting a different list fails", async () => {
     const { controller, api, initial } = await comparison();

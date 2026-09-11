@@ -43,6 +43,8 @@ function setup() {
     ollamaConfigured: false,
     defaultProvider: "brave" as const,
   };
+  const nextPair = vi.fn<AppApi["nextPair"]>().mockResolvedValue(pair);
+  let comparisonCount = state.comparisonCount;
   const api = {
     listSummaries: vi
       .fn<AppApi["listSummaries"]>()
@@ -57,10 +59,13 @@ function setup() {
     renameItem: vi.fn<AppApi["renameItem"]>().mockResolvedValue(state),
     deleteItem: vi.fn<AppApi["deleteItem"]>().mockResolvedValue(state),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(state),
-    nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(pair),
-    answer: vi
-      .fn<AppApi["answer"]>()
-      .mockResolvedValue({ ...state, revision: 6, comparisonCount: 1 }),
+    nextPair,
+    answer: vi.fn<AppApi["answer"]>().mockImplementation(async () => {
+      comparisonCount += 1;
+      const revision = state.revision + comparisonCount;
+      nextPair.mockResolvedValue({ ...pair, revision });
+      return { ...state, revision, comparisonCount };
+    }),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(settings),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
@@ -187,8 +192,8 @@ describe("desktop app interaction", () => {
     expect(root.contains(document.activeElement)).toBe(true);
     pressKeyAtFocus("2");
     await settle(controller);
-    expect(api.answer).toHaveBeenNthCalledWith(2, pair, "equal");
-    expect(api.answer).toHaveBeenNthCalledWith(3, pair, "a_weak");
+    expect(api.answer).toHaveBeenNthCalledWith(2, { ...pair, revision: 6 }, "equal");
+    expect(api.answer).toHaveBeenNthCalledWith(3, { ...pair, revision: 7 }, "a_weak");
 
     await controller.openModal({ kind: "rename-list" });
     const input = root.querySelector("#name-input");
