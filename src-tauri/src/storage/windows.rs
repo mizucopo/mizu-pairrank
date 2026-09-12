@@ -20,10 +20,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
-    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
-    SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdBothDirectoryInfo,
+    FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -149,15 +150,23 @@ pub(super) fn create_private_directory_in(parent: &Dir, name: &OsStr) -> io::Res
 pub(super) fn directory_entries(directory: &Dir) -> io::Result<Vec<OsString>> {
     // A fresh file object has its own enumeration cursor. Duplicating the
     // original handle would share that cursor between concurrent scans.
-    let scan = open_entry(
-        directory,
-        &[u16::from(b'.')],
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        SHARING,
-        FILE_OPEN,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-    )?;
+    // Reopen the object itself: the NT relative name "." is not accepted as
+    // a Win32 current-directory path and fails with ERROR_INVALID_NAME.
+    // SAFETY: directory owns a live file-system handle. ReOpenFile returns a
+    // separately owned handle to that object without resolving its pathname.
+    let handle = unsafe {
+        ReOpenFile(
+            directory.as_raw_handle(),
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            SHARING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful ReOpenFile transfers ownership of a valid handle.
+    let scan = unsafe { File::from_raw_handle(handle) };
     // u64 storage provides the alignment required by FILE_ID_BOTH_DIR_INFO.
     let mut buffer = vec![0_u64; 8192];
     let buffer_bytes = size_of_val(buffer.as_slice());
