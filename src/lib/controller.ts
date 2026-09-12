@@ -224,9 +224,13 @@ export class AppController {
         result = await this.api.createList(name);
         this.state.drafts.items = "";
       } else if (modal.kind === "rename-list" && list)
-        result = await this.api.renameList(list.id, name);
+        result = await this.api
+          .renameList(list.id, name)
+          .catch((error: unknown) => this.handleListError(list.id, error));
       else if (modal.kind === "rename-item" && list)
-        result = await this.api.renameItem(list.id, modal.itemId, name);
+        result = await this.api
+          .renameItem(list.id, modal.itemId, name)
+          .catch((error: unknown) => this.handleItemError(list.id, modal.itemId, error));
       else return;
       this.state.modal = null;
       this.state.view = "items";
@@ -240,7 +244,9 @@ export class AppController {
     if (!list || !modal) return;
     await this.perform(async () => {
       if (modal.kind === "delete-list") {
-        await this.api.deleteList(list.id);
+        await this.api
+          .deleteList(list.id)
+          .catch((error: unknown) => this.handleListError(list.id, error));
         this.state.active = null;
         this.state.pair = null;
         this.state.modal = null;
@@ -248,7 +254,9 @@ export class AppController {
         this.state.lists = this.state.lists.filter((entry) => entry.id !== list.id);
         this.state.active = await this.loadFirstAvailableList();
       } else if (modal.kind === "delete-item") {
-        const result = await this.api.deleteItem(list.id, modal.itemId);
+        const result = await this.api
+          .deleteItem(list.id, modal.itemId)
+          .catch((error: unknown) => this.handleItemError(list.id, modal.itemId, error));
         this.state.modal = null;
         await this.acceptList(result);
       }
@@ -264,7 +272,9 @@ export class AppController {
       .filter(Boolean);
     if (!list || names.length === 0) return;
     await this.perform(async () => {
-      const result = await this.api.addItems(list.id, names);
+      const result = await this.api
+        .addItems(list.id, names)
+        .catch((error: unknown) => this.handleListError(list.id, error));
       this.state.drafts.items = "";
       await this.acceptList(result);
       this.state.notice = `${names.length}件の項目を追加しました。`;
@@ -306,10 +316,35 @@ export class AppController {
       this.state.pair = null;
       this.state.active = null;
       this.state.modal = null;
+      this.state.candidates = [];
+      this.state.searched = false;
       this.state.drafts.items = "";
       this.state.view = "items";
       this.state.active = await this.loadFirstAvailableList();
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
+    }
+    throw error;
+  }
+
+  private async handleItemError(listId: number, itemId: number, error: unknown): Promise<never> {
+    if (errorMessage(error) !== "項目が見つかりません。")
+      return this.handleListError(listId, error);
+    this.state.modal = null;
+    this.state.candidates = [];
+    this.state.searched = false;
+    this.state.pair = null;
+    this.state.view = "items";
+    const list = this.state.active;
+    if (list?.id === listId) {
+      this.acceptCommittedList({
+        ...list,
+        items: list.items.filter((item) => item.id !== itemId),
+        convergence: { ...list.convergence, converged: false },
+      });
+      const current = await this.api
+        .getList(listId)
+        .catch((reloadError: unknown) => this.handleListError(listId, reloadError));
+      await this.acceptList(current);
     }
     throw error;
   }
@@ -381,9 +416,13 @@ export class AppController {
     if (!list || modal?.kind !== "image") return;
     await this.perform(async () => {
       let result: ListState | null;
-      if (source === "local") result = await this.api.setLocalImage(list.id, modal.itemId);
-      else if (source === "none") result = await this.api.removeImage(list.id, modal.itemId);
-      else result = await this.api.setRemoteImage(list.id, modal.itemId, source);
+      try {
+        if (source === "local") result = await this.api.setLocalImage(list.id, modal.itemId);
+        else if (source === "none") result = await this.api.removeImage(list.id, modal.itemId);
+        else result = await this.api.setRemoteImage(list.id, modal.itemId, source);
+      } catch (error) {
+        return this.handleItemError(list.id, modal.itemId, error);
+      }
       if (!result) return;
       this.state.modal = null;
       await this.acceptList(result);

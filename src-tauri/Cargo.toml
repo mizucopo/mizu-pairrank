@@ -28,6 +28,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
 rand = "0.9"
 base64 = "0.22"
+cap-std = "4.0.3"
+same-file = "1.0.6"
 
 [dev-dependencies]
 rusqlite = { version = "0.39", features = ["trace"] }

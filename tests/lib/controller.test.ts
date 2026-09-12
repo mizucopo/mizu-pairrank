@@ -112,6 +112,146 @@ async function listSelection(context: "startup" | "after deletion") {
   return { api, controller, load };
 }
 
+const mutationMethods = [
+  "renameList",
+  "deleteList",
+  "addItems",
+  "renameItem",
+  "deleteItem",
+  "setLocalImage",
+  "setRemoteImage",
+  "removeImage",
+] as const;
+type MutationMethod = (typeof mutationMethods)[number];
+
+async function mutation(method: MutationMethod) {
+  const initial = list();
+  const api = backend(initial);
+  const controller = new AppController(api, vi.fn());
+  await controller.initialize();
+  const candidate: ImageCandidate = {
+    id: "https://example.org/image.png",
+    title: "Image",
+    previewUrl: "data:image/png;base64,AA==",
+    sourceUrl: "https://example.org/",
+  };
+  controller.state.drafts.items = "bulk draft";
+  switch (method) {
+    case "renameList":
+      await controller.openModal({ kind: "rename-list" });
+      break;
+    case "deleteList":
+      await controller.openModal({ kind: "delete-list" });
+      break;
+    case "renameItem":
+      await controller.openModal({ kind: "rename-item", itemId: 11 });
+      break;
+    case "deleteItem":
+      await controller.openModal({ kind: "delete-item", itemId: 11 });
+      break;
+    case "addItems":
+      break;
+    default:
+      await controller.openModal({ kind: "image", itemId: 11 });
+      controller.state.candidates = [candidate];
+      controller.state.searched = true;
+  }
+  const run = () => {
+    switch (method) {
+      case "renameList":
+      case "renameItem":
+        return controller.saveName();
+      case "deleteList":
+      case "deleteItem":
+        return controller.confirmDelete();
+      case "addItems":
+        return controller.addItems();
+      case "setLocalImage":
+        return controller.changeImage("local");
+      case "setRemoteImage":
+        return controller.changeImage(candidate);
+      case "removeImage":
+        return controller.changeImage("none");
+    }
+  };
+  return { initial, api, controller, run, candidate };
+}
+
+describe("mutations after concurrent deletion", () => {
+  it.each(mutationMethods)("reconciles a missing list during %s", async (method) => {
+    const { api, controller, run } = await mutation(method);
+    api[method].mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    await run();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.lists.map((entry) => entry.id)).toEqual([2]);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.error).toBe("リストが見つかりません。");
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it.each(["renameItem", "deleteItem", "setLocalImage", "setRemoteImage", "removeImage"] as const)(
+    "removes a stale item and reloads its still-valid list after %s",
+    async (method) => {
+      const { api, controller, initial, run } = await mutation(method);
+      const current = { ...initial, revision: 5, items: initial.items.slice(1) };
+      api[method].mockRejectedValueOnce("項目が見つかりません。");
+      api.getList.mockResolvedValue(current);
+      api.listSummaries.mockResolvedValue([summary(current)]);
+      await run();
+      expect(controller.state.active).toEqual(current);
+      expect(controller.state.modal).toBeNull();
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.candidates).toEqual([]);
+      expect(controller.state.searched).toBe(false);
+      expect(controller.state.drafts.items).toBe("bulk draft");
+      expect(controller.state.error).toBe("項目が見つかりません。");
+      await run();
+      expect(api[method]).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps a deleted item removed if reloading the list also fails", async () => {
+    const { api, controller, initial, run } = await mutation("setRemoteImage");
+    initial.convergence.converged = true;
+    api.setRemoteImage.mockRejectedValueOnce("項目が見つかりません。");
+    api.getList.mockRejectedValueOnce("データベースを読み込めません。");
+    await run();
+    expect(controller.state.active?.items.map((item) => item.id)).toEqual([12]);
+    expect(controller.state.active?.convergence.converged).toBe(false);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.candidates).toEqual([]);
+    expect(controller.state.error).toBe("データベースを読み込めません。");
+    await run();
+    expect(api.setRemoteImage).toHaveBeenCalledOnce();
+  });
+
+  it("recovers if the list disappears while reloading a deleted item's list", async () => {
+    const { api, controller, run } = await mutation("setRemoteImage");
+    api.setRemoteImage.mockRejectedValueOnce("項目が見つかりません。");
+    api.getList.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    await run();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.drafts.items).toBe("");
+  });
+
+  it.each(mutationMethods)("retains state for a transient %s failure", async (method) => {
+    const { api, controller, initial, run } = await mutation(method);
+    const modal = controller.state.modal;
+    const candidates = controller.state.candidates;
+    api[method].mockRejectedValueOnce("一時的に保存できません。");
+    await run();
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.modal).toEqual(modal);
+    expect(controller.state.candidates).toEqual(candidates);
+    expect(controller.state.drafts.items).toBe("bulk draft");
+    expect(controller.state.error).toBe("一時的に保存できません。");
+  });
+});
+
 describe("credential mutation acknowledgments", () => {
   it.each([
     ["brave", false, "brave"],

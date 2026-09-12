@@ -755,27 +755,86 @@ fn save_image(
     bytes: &[u8],
     source_url: Option<String>,
 ) -> Result<ImageAsset, String> {
+    save_image_with(directory, bytes, source_url, |_| {})
+}
+
+fn save_image_with(
+    directory: &Path,
+    bytes: &[u8],
+    source_url: Option<String>,
+    mut checkpoint: impl FnMut(bool),
+) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
-    if !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir())
-        || !directory
-            .canonicalize()
-            .is_ok_and(|resolved| resolved == directory)
-    {
+    // All creation, synchronization and rollback stay relative to this open directory.
+    let pinned = {
+        // Use a readable handle on Unix: cap-std's Linux O_PATH handle cannot be fsynced.
+        #[cfg(unix)]
+        let opened = std::fs::File::open(directory).map(cap_std::fs::Dir::from_std_file);
+        // cap-std holds Windows directories without delete sharing to prevent rename races.
+        #[cfg(not(unix))]
+        let opened = cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority());
+        opened
+    }
+    .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
+    let directory_handle = pinned
+        .try_clone()
+        .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?
+        .into_std_file();
+    let identity = same_file::Handle::from_file(
+        directory_handle
+            .try_clone()
+            .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?,
+    )
+    .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
+    let unchanged = || -> std::io::Result<bool> {
+        Ok(std::fs::symlink_metadata(directory)?.is_dir()
+            && directory.canonicalize()? == directory
+            && same_file::Handle::from_path(directory)? == identity)
+    };
+    if !unchanged().unwrap_or(false) {
         return Err("画像の保存先が変更されています。アプリを再起動してください。".to_owned());
     }
+    checkpoint(false);
     let filename = format!("{}.png", Uuid::new_v4());
     let path = directory.join(&filename);
-    let mut file = crate::storage::create_private_file(&path)
-        .map_err(|_| "画像の保存先を作成できませんでした。".to_owned())?;
-    if file
-        .write_all(&normalized)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| sync_directory(directory))
-        .is_err()
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = pinned
+        .open_with(&filename, &options)
+        .map(|file| file.into_std())
+        .map_err(|_| "画像の保存先を作成できませんでした。".to_owned())?;
+    checkpoint(true);
+    let sync = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        directory_handle.sync_all()?;
+        Ok(())
+    };
+    let mut write = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&normalized)?;
+        file.sync_all()?;
+        sync()?;
+        let saved = same_file::Handle::from_file(file.try_clone()?)?;
+        if !unchanged()? || same_file::Handle::from_path(&path)? != saved {
+            return Err(std::io::Error::other(
+                "image destination changed during save",
+            ));
+        }
+        Ok(())
+    };
+    if write().is_err() {
         drop(file);
-        let _ = std::fs::remove_file(&path);
-        let _ = sync_directory(directory);
+        let _ = pinned.remove_file(&filename);
+        let _ = sync();
         return Err("画像ファイルを保存できませんでした。空き容量を確認してください。".to_owned());
     }
     Ok(ImageAsset {
@@ -892,6 +951,35 @@ mod tests {
         service.remove_managed_file(legacy.to_str().unwrap());
         assert!(!legacy.exists());
         assert!(source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imports_reject_directory_replacement_between_validation_creation_and_write() {
+        for replace_after_creation in [false, true] {
+            let app_data = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let service = ImageService::new(app_data.path().to_owned()).unwrap();
+            let source = app_data.path().join("source.png");
+            let original = png(4, 2);
+            std::fs::write(&source, &original).unwrap();
+            let previous = service.import_local(source.clone()).unwrap();
+            let previous_directory = app_data.path().join("old-images");
+            let result = save_image_with(&service.directory, &original, None, |created| {
+                if created == replace_after_creation {
+                    std::fs::rename(&service.directory, &previous_directory).unwrap();
+                    std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+                }
+            });
+            assert!(
+                result.is_err(),
+                "a changed save directory must not produce a committed reference"
+            );
+            assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(&previous_directory).unwrap().count(), 1);
+            assert!(previous_directory.join(previous.path).is_file());
+            assert_eq!(std::fs::read(source).unwrap(), original);
+        }
     }
 
     #[cfg(unix)]
