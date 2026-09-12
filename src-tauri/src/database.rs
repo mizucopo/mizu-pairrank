@@ -28,6 +28,11 @@ pub struct ImageChange<T> {
     pub cleanup_paths: Vec<String>,
 }
 
+pub struct ComparisonState {
+    pub list: ListState,
+    pub pair_counts: HashMap<(i64, i64), u64>,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -153,6 +158,14 @@ impl Database {
     pub fn get_list(&self, id: i64) -> Result<ListState, String> {
         let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
         read_list(&transaction, id)
+    }
+
+    pub fn comparison_state(&self, list_id: i64) -> Result<ComparisonState, String> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        Ok(ComparisonState {
+            list: read_list(&transaction, list_id)?,
+            pair_counts: self.pair_counts(list_id)?,
+        })
     }
 
     pub fn add_items(&mut self, list_id: i64, names: Vec<String>) -> Result<ListState, String> {
@@ -1492,6 +1505,43 @@ mod tests {
             connection: &reader.connection,
             result,
         }
+    }
+
+    #[test]
+    fn comparison_state_keeps_list_and_pair_counts_in_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("comparison-snapshots.sqlite3");
+        let mut reader = Database::open(&path).unwrap();
+        let before = populated_list(&mut reader, "Before");
+        reader
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let mut writer = Database::open(&path).unwrap();
+        let (list_id, revision) = (before.id, before.revision);
+        let (a, b) = (before.items[0].id, before.items[1].id);
+        let concurrent = write_after_first_select(&reader, move || {
+            writer
+                .answer(list_id, a, b, Preference::AWeak, revision)
+                .map(|_| ())
+        });
+
+        let observed = reader.comparison_state(list_id).unwrap();
+        concurrent.assert_committed();
+        drop(concurrent);
+        assert_eq!(
+            serde_json::to_value(observed.list).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(
+            observed.pair_counts.is_empty(),
+            "pair counts must come from the same pre-answer snapshot as the list"
+        );
+
+        let next = reader.comparison_state(list_id).unwrap();
+        assert_eq!(next.list.revision, revision + 1);
+        assert_eq!(next.list.comparison_count, 1);
+        assert_eq!(next.pair_counts, HashMap::from([((a.min(b), a.max(b)), 1)]));
     }
 
     #[test]

@@ -348,8 +348,15 @@ impl ImageService {
         #[cfg(unix)]
         restrict_image_permissions(&directory)
             .map_err(|_| "保存済み画像の権限を設定できませんでした。".to_owned())?;
-        let storage_lease = image_storage_lock(&app_data)
-            .map_err(|_| "画像の保存先ロックを開けませんでした。".to_owned())?;
+        // Lock the image directory itself on Unix: replacing a separate lock file
+        // must not let two instances reconcile the same directory independently.
+        #[cfg(unix)]
+        let storage_lease = verified_image_directory(&directory, &directory_identity)
+            .map(cap_std::fs::Dir::into_std_file);
+        #[cfg(not(unix))]
+        let storage_lease = image_storage_lock(&app_data);
+        let storage_lease =
+            storage_lease.map_err(|_| "画像の保存先ロックを開けませんでした。".to_owned())?;
         match storage_lease.try_lock() {
             Ok(()) => {
                 if let Some(database) = database {
@@ -655,37 +662,24 @@ impl ImageService {
     }
 }
 
+#[cfg(not(unix))]
 fn image_storage_lock(app_data: &Path) -> std::io::Result<std::fs::File> {
-    image_storage_lock_with(app_data, || {})
-}
-
-fn image_storage_lock_with(
-    app_data: &Path,
-    checkpoint: impl FnOnce(),
-) -> std::io::Result<std::fs::File> {
     let directory = open_image_directory(app_data)?;
     let name = ".images.lock";
     let mut options = crate::storage::managed_open_options();
     options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // A live lease must prevent replacement of the lock file.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+        options.share_mode(FILE_SHARE_READ_WRITE);
     }
     let (file, created) = match directory.open_with(name, &options) {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             options.create_new(false);
-            let file = directory.open_with(name, &options);
-            #[cfg(unix)]
-            let file = file.or_else(|error| {
-                if error.kind() != std::io::ErrorKind::PermissionDenied {
-                    return Err(error);
-                }
-                crate::storage::restrict_existing_file(&app_data.join(name))?;
-                directory.open_with(name, &options)
-            });
-            (file?, false)
+            (directory.open_with(name, &options)?, false)
         }
         Err(error) => return Err(error),
     };
@@ -696,21 +690,9 @@ fn image_storage_lock_with(
             "image storage lock is not a regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o7777 != 0o600 {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.sync_all()?;
-        }
-    }
     if created {
         file.sync_all()?;
-        #[cfg(unix)]
-        directory.into_std_file().sync_all()?;
     }
-    // The validated handle must remain the lease even if its pathname changes.
-    checkpoint();
     Ok(file)
 }
 
@@ -1284,37 +1266,26 @@ mod tests {
         assert_eq!(std::fs::read(external_file).unwrap(), b"external image");
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
     #[test]
-    fn storage_lock_keeps_the_validated_inode_when_the_path_is_replaced() {
+    fn a_live_storage_lock_cannot_be_replaced() {
         for already_exists in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join(".images.lock");
-            let external = directory.path().join("external.lock");
-            std::fs::write(&external, b"external").unwrap();
             if already_exists {
                 std::fs::write(&path, b"existing lock").unwrap();
             }
-            let mut live_instance = None;
-            let lease = image_storage_lock_with(directory.path(), || {
-                let existing = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .unwrap();
-                existing.lock_shared().unwrap();
-                live_instance = Some(existing);
-                std::fs::rename(&path, directory.path().join("previous.lock")).unwrap();
-                std::os::unix::fs::symlink(&external, &path).unwrap();
-            })
-            .unwrap();
-            assert!(
-                matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-                "a live instance must prevent reconciliation, existing lock: {already_exists}"
-            );
-            drop(live_instance);
-            lease.try_lock().unwrap();
-            assert_eq!(std::fs::read(&external).unwrap(), b"external");
+            let lease = image_storage_lock(directory.path()).unwrap();
+            lease.lock_shared().unwrap();
+            assert!(std::fs::rename(&path, directory.path().join("previous.lock")).is_err());
+            assert!(std::fs::remove_file(&path).is_err());
+            let second = image_storage_lock(directory.path()).unwrap();
+            assert!(matches!(
+                second.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            drop(lease);
+            second.try_lock().unwrap();
         }
     }
 
@@ -1392,6 +1363,37 @@ mod tests {
         let _reopened = ImageService::open(directory.path().to_owned(), &database).unwrap();
         assert!(pending_path.exists());
         assert!(!orphan_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_lock_file_does_not_expose_another_instances_pending_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut database =
+            crate::database::Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let first = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        let pending = first.import_local(source).unwrap();
+        let pending_path = first.directory.join(&pending.path);
+        let replacement = directory.path().join("replacement.lock");
+        std::fs::write(&replacement, []).unwrap();
+        std::fs::rename(replacement, directory.path().join(".images.lock")).unwrap();
+
+        let second = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        assert!(
+            pending_path.exists(),
+            "another instance deleted an in-flight image"
+        );
+        let list = database.create_list("Images".into()).unwrap();
+        let list = database.add_items(list.id, vec!["Item".into()]).unwrap();
+        database
+            .set_image(list.id, list.items[0].id, Some(pending))
+            .unwrap();
+        drop(first);
+        drop(second);
+        let _reopened = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        assert!(pending_path.exists());
     }
 
     #[test]

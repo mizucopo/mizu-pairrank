@@ -461,6 +461,71 @@ describe("desktop app interaction", () => {
     expect(document.activeElement).toBe(root);
   });
 
+  it.each([
+    ['[data-action="delete-item"][data-id="10"]', '[data-action="confirm-delete"]', "deleteItem"],
+    ['[data-action="delete-list"]', '[data-action="confirm-delete"]', "deleteList"],
+    ['[data-action="image"][data-id="10"]', '[data-action="no-image"]', "removeImage"],
+    ['[data-action="image"][data-id="10"]', '[data-action="local-image"]', "setLocalImage"],
+    [
+      '[data-action="rename-item"][data-id="10"]',
+      '[data-form="save-name"] button[type="submit"]',
+      "renameItem",
+    ],
+    [
+      '[data-action="image"][data-id="10"]',
+      '[data-form="search-images"] button[type="submit"]',
+      "searchImages",
+    ],
+  ] as const)("keeps focus in %s on %s when %s fails", async (opener, retrySelector, method) => {
+    const { root, controller, api } = setup();
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.initialize();
+    await click(root, controller, opener);
+    const modal = controller.state.modal;
+    api[method].mockRejectedValueOnce(new Error("操作に失敗しました"));
+    const retry = button(root, retrySelector);
+    retry.focus();
+    retry.click();
+    await settle(controller);
+    expect(controller.state.modal).toEqual(modal);
+    expect(root.querySelector('[role="alert"]')?.textContent).toBe("操作に失敗しました");
+    expect(document.activeElement).toBe(button(root, retrySelector));
+  });
+
+  it("does not transfer an action's focus to a newly opened dialog for another item", async () => {
+    const { root, controller } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-action="delete-item"][data-id="10"]');
+    button(root, '[data-action="confirm-delete"]').focus();
+    await controller.openModal({ kind: "delete-item", itemId: 11 });
+    expect(root.querySelector("dialog")?.textContent).toContain("みかん");
+    expect(document.activeElement).not.toBe(button(root, '[data-action="confirm-delete"]'));
+  });
+
+  it("shows whitespace-only name validation in the dialog and keeps the focused submit button", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-action="create-list"]');
+    const input = root.querySelector("#name-input");
+    if (!(input instanceof HTMLInputElement)) throw new Error("Missing name input");
+    input.value = "   ";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const selector = '[data-form="save-name"] button[type="submit"]';
+    const submit = button(root, selector);
+    submit.focus();
+    submit.click();
+    await settle(controller);
+    expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe(
+      "名前を入力してください。",
+    );
+    expect(document.activeElement).toBe(button(root, selector));
+    expect(api.createList).not.toHaveBeenCalled();
+  });
+
   it("requires a confirmation before deletion and cancellation preserves the item", async () => {
     const { root, controller, api, state } = setup();
     await controller.initialize();
@@ -757,6 +822,14 @@ describe("desktop app interaction", () => {
     expect(root.querySelector('[role="alert"]')?.textContent).toContain("接続できません");
     expect(controller.state.active).toEqual(state);
     expect(api.setRemoteImage).not.toHaveBeenCalled();
+    const retryProvider = root.querySelector("#search-provider");
+    if (!(retryProvider instanceof HTMLSelectElement)) throw new Error("Missing provider");
+    retryProvider.value = "brave";
+    retryProvider.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(controller.state.error).toBe("");
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(controller.state.searched).toBe(false);
+    expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(false);
   });
 
   it.each([

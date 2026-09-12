@@ -670,6 +670,59 @@ describe("credential mutation acknowledgments", () => {
 });
 
 describe("comparison state and persistence boundaries", () => {
+  it.each(["create-list", "rename-list", "rename-item"] as const)(
+    "rejects whitespace-only names in %s and preserves the draft for correction",
+    async (kind) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      const modal = kind === "rename-item" ? { kind, itemId: 11 } : { kind };
+      await controller.openModal(modal);
+      controller.state.drafts.name = " \t　 ";
+      await controller.saveName();
+      expect(controller.state.error).toBe("名前を入力してください。");
+      expect(controller.state.modal).toEqual(modal);
+      expect(controller.state.drafts.name).toBe(" \t　 ");
+      expect(controller.state.busy).toBe(false);
+      expect(api.createList).not.toHaveBeenCalled();
+      expect(api.renameList).not.toHaveBeenCalled();
+      expect(api.renameItem).not.toHaveBeenCalled();
+      controller.state.drafts.name = " 修正した名前 ";
+      await controller.saveName();
+      expect(controller.state.error).toBe("");
+      expect(controller.state.modal).toBeNull();
+    },
+  );
+
+  it("updates the selected sidebar entry from the current list snapshot", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    const latest = {
+      ...list(2),
+      name: "別のウィンドウで変更したリスト",
+      items: list(2).items.slice(0, 1),
+      comparisonCount: 12,
+      convergence: { ...list(2).convergence, converged: true },
+    };
+    api.getList.mockResolvedValue(latest);
+    await controller.selectList(2);
+    expect(controller.state.active).toEqual(latest);
+    expect(controller.state.lists).toEqual([
+      summary(list()),
+      {
+        id: 2,
+        name: "別のウィンドウで変更したリスト",
+        itemCount: 1,
+        comparisonCount: 12,
+        converged: true,
+      },
+    ]);
+    expect(controller.state.view).toBe("ranking");
+    await controller.selectList(2);
+    expect(controller.state.lists).toHaveLength(2);
+  });
+
   it.each(["restart", "settled answer"] as const)(
     "recovers when a successful %s is followed by a sidebar refresh confirming list deletion",
     async (operation) => {
@@ -879,6 +932,8 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.active).toEqual(first);
     controller.state.drafts.items = " \n\t";
     await controller.addItems();
+    expect(controller.state.error).toBe("項目名を入力してください。");
+    expect(controller.state.drafts.items).toBe(" \n\t");
     expect(api.addItems).toHaveBeenCalledTimes(1);
   });
 

@@ -24,6 +24,7 @@ export function mountApp(
   type ButtonFocus = {
     key: string;
     listId: number | null;
+    modal: Modal;
     index: number;
   };
   let modalOpener: ButtonFocus | null = null;
@@ -35,6 +36,7 @@ export function mountApp(
     selection: readonly [number | null, number | null] | null;
   } | null = null;
   let renderedListId: number | null = null;
+  let renderedModal: Modal = null;
   let dialogWasOpen = false;
   let restoreModalFocus = false;
   function buttonKey(button: HTMLButtonElement): string {
@@ -63,16 +65,25 @@ export function mountApp(
     return {
       key,
       listId: isGlobal ? null : renderedListId,
+      modal: button.closest("dialog") ? renderedModal : null,
       index: matchingButtons(key).indexOf(button),
     };
   }
   function restoreButton(target: ButtonFocus | null): void {
     let button: HTMLButtonElement | undefined;
-    if (target && (target.listId === null || target.listId === controller.state.active?.id)) {
+    if (
+      target &&
+      target.modal === controller.state.modal &&
+      (target.listId === null || target.listId === controller.state.active?.id)
+    ) {
       button = matchingButtons(target.key)[target.index];
     }
     if (button && !button.disabled) button.focus({ preventScroll: true });
-    else root.focus({ preventScroll: true });
+    else {
+      const fallback =
+        root.querySelector<HTMLElement>('dialog [data-action="close-modal"]') ?? root;
+      fallback.focus({ preventScroll: true });
+    }
   }
   async function openModal(modal: Exclude<Modal, null>, button: HTMLButtonElement): Promise<void> {
     if (controller.state.busy && controller.state.readPending !== "settings") return;
@@ -82,12 +93,7 @@ export function mountApp(
   }
   function render(): void {
     const focus = document.activeElement;
-    if (
-      !pendingButtonFocus &&
-      focus instanceof HTMLButtonElement &&
-      root.contains(focus) &&
-      !focus.closest("dialog")
-    ) {
+    if (!pendingButtonFocus && focus instanceof HTMLButtonElement && root.contains(focus)) {
       pendingButtonFocus = rememberButton(focus);
       pendingFieldFocus = null;
     }
@@ -112,11 +118,12 @@ export function mountApp(
       ),
     );
     renderedListId = controller.state.active?.id ?? null;
+    renderedModal = controller.state.modal;
     const dialog = root.querySelector("dialog");
     if (dialogWasOpen && !dialog) restoreModalFocus = true;
     dialogWasOpen = Boolean(dialog);
     if (dialog instanceof HTMLDialogElement) {
-      pendingButtonFocus = null;
+      if (pendingButtonFocus?.modal !== renderedModal) pendingButtonFocus = null;
       dialog.showModal();
       dialog.addEventListener("cancel", (event) => {
         event.preventDefault();
@@ -142,8 +149,8 @@ export function mountApp(
       }
     }
     if (!controller.state.busy) pendingFieldFocus = null;
-    if (!dialog && !controller.state.busy) {
-      if (restoreModalFocus) {
+    if (!controller.state.busy) {
+      if (!dialog && restoreModalFocus) {
         restoreButton(modalOpener);
         modalOpener = null;
         restoreModalFocus = false;
@@ -169,6 +176,7 @@ export function mountApp(
       controller.state.provider = target.value === "ollama" ? "ollama" : "brave";
       controller.state.candidates = [];
       controller.state.searched = false;
+      controller.state.error = "";
       render();
     }
   });
@@ -202,7 +210,7 @@ export function mountApp(
     if (!(target instanceof Element)) return;
     const button = target.closest("button");
     if (!(button instanceof HTMLButtonElement) || button.disabled) return;
-    if (!button.closest("dialog") && !(button.form && button.type === "submit")) {
+    if (!(button.form && button.type === "submit")) {
       pendingButtonFocus = rememberButton(button);
       pendingFieldFocus = null;
     }

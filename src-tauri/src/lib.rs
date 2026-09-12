@@ -152,13 +152,14 @@ struct PairProposal {
 #[tauri::command]
 async fn next_pair(app: AppHandle, list_id: i64) -> Result<Option<PairProposal>, String> {
     database_job(app, move |db| {
-        let list = db.get_list(list_id)?;
+        let comparison = db.comparison_state(list_id)?;
+        let list = comparison.list;
         let ratings = list
             .items
             .iter()
             .map(|item| (item.id, item.rating))
             .collect::<Vec<_>>();
-        let Some((mut a_id, mut b_id)) = rating::select_pair(&ratings, &db.pair_counts(list_id)?)?
+        let Some((mut a_id, mut b_id)) = rating::select_pair(&ratings, &comparison.pair_counts)?
         else {
             return Ok(None);
         };

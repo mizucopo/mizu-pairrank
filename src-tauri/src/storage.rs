@@ -45,6 +45,15 @@ fn create_private_directory_with_sync(
     path: &Path,
     sync: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    create_private_directory_with(path, sync, |_| {})
+}
+
+#[cfg(unix)]
+fn create_private_directory_with(
+    path: &Path,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+    mut checkpoint: impl FnMut(bool),
+) -> io::Result<()> {
     create_directory_tree(path, sync)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -53,10 +62,47 @@ fn create_private_directory_with_sync(
             "managed directory is not a directory",
         ));
     }
+    checkpoint(false);
+    let identity = (metadata.dev(), metadata.ino());
     if metadata.permissions().mode() & 0o7777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        sync(path)?;
+        use rustix::fs::{CWD, Mode, OFlags, openat};
+        let opened = openat(
+            CWD,
+            path,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from);
+        let directory = match opened {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                checkpoint(true);
+                let parent = path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let parent = cap_std::fs::Dir::from_std_file(File::open(parent)?);
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("missing managed directory name"))?;
+                restore_unreadable_entry(&parent, name, identity, 0o700)?
+            }
+            Err(error) => return Err(error),
+        };
+        verify_identity(&directory.metadata()?, identity)?;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        directory.sync_all()?;
     }
+    let current = fs::symlink_metadata(path)?;
+    if !current.is_dir() {
+        return Err(io::Error::other("managed directory was replaced"));
+    }
+    verify_identity(&current, identity)?;
     Ok(())
 }
 
@@ -129,21 +175,29 @@ fn restrict_existing_file_with(
         ));
     }
     checkpoint(false);
+    let identity = (metadata.dev(), metadata.ino());
     if metadata.permissions().mode() & 0o7777 != 0o600 {
         let file = match open_managed_file(&directory, name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 checkpoint(true);
-                restore_unreadable_file(&directory, name)?
+                restore_unreadable_entry(&directory, name, identity, 0o600)?
             }
             Err(error) => return Err(error),
         };
+        verify_identity(&file.metadata()?, identity)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
-        let metadata = file.metadata()?;
-        return Ok((metadata.dev(), metadata.ino()));
     }
-    Ok((metadata.dev(), metadata.ino()))
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn verify_identity(metadata: &fs::Metadata, expected: (u64, u64)) -> io::Result<()> {
+    if (metadata.dev(), metadata.ino()) != expected {
+        return Err(io::Error::other("managed storage was replaced"));
+    }
+    Ok(())
 }
 
 pub fn managed_open_options() -> cap_std::fs::OpenOptions {
@@ -164,9 +218,11 @@ pub fn open_managed_file(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -
 }
 
 #[cfg(target_os = "linux")]
-fn restore_unreadable_file(
+fn restore_unreadable_entry(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
+    expected: (u64, u64),
+    mode: u32,
 ) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, openat};
     use std::os::fd::AsRawFd;
@@ -177,29 +233,38 @@ fn restore_unreadable_file(
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
-    if !pinned.metadata()?.is_file() {
-        return Err(io::Error::other("managed file is not a regular file"));
-    }
+    verify_identity(&pinned.metadata()?, expected)?;
     // chmod through this live descriptor targets the pinned inode, even after rename.
     let descriptor = format!("/proc/self/fd/{}", pinned.as_raw_fd());
-    fs::set_permissions(&descriptor, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&descriptor, fs::Permissions::from_mode(mode))?;
     File::open(descriptor)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn restore_unreadable_file(
+fn restore_unreadable_entry(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
+    expected: (u64, u64),
+    mode: u32,
 ) -> io::Result<File> {
+    use cap_std::fs::MetadataExt as _;
     use rustix::fs::{AtFlags, Mode, chmodat};
+    let metadata = directory.symlink_metadata(name)?;
+    if (metadata.dev(), metadata.ino()) != expected {
+        return Err(io::Error::other("managed storage was replaced"));
+    }
     // Unlike pathname chmod, this never changes a substituted symlink's target.
     chmodat(
         directory,
         name,
-        Mode::RUSR | Mode::WUSR,
+        Mode::from_bits_truncate(mode as _),
         AtFlags::SYMLINK_NOFOLLOW,
     )?;
-    open_managed_file(directory, name)
+    let file = directory
+        .open_with(name, &managed_open_options())?
+        .into_std();
+    verify_identity(&file.metadata()?, expected)?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -246,6 +311,87 @@ pub fn prepare_database_file(_path: &Path) -> io::Result<PreparedDatabaseFile> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_permission_repair_preserves_replacements_after_metadata_validation() {
+        for symlink in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let managed = root.path().join("app-data");
+            let previous = root.path().join("previous");
+            let replacement = root.path().join("replacement");
+            fs::create_dir(&managed).unwrap();
+            fs::create_dir(&replacement).unwrap();
+            fs::write(managed.join("original"), b"original").unwrap();
+            fs::write(replacement.join("replacement"), b"replacement").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o750)).unwrap();
+            let result = create_private_directory_with(
+                &managed,
+                &mut |directory| File::open(directory)?.sync_all(),
+                |_| {
+                    fs::rename(&managed, &previous).unwrap();
+                    if symlink {
+                        std::os::unix::fs::symlink(&replacement, &managed).unwrap();
+                    } else {
+                        fs::rename(&replacement, &managed).unwrap();
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(mode(&managed), 0o750);
+            assert_eq!(mode(&previous), 0o755);
+            assert_eq!(
+                fs::read(managed.join("replacement")).unwrap(),
+                b"replacement"
+            );
+            assert_eq!(fs::read(previous.join("original")).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn directory_permission_repair_restores_owned_unreadable_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("app-data");
+        fs::create_dir(&managed).unwrap();
+        fs::write(managed.join("saved"), b"saved").unwrap();
+        for original_mode in [0o755, 0o300, 0o000] {
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            let result = create_private_directory(&managed);
+            let repaired_mode = mode(&managed);
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                result.is_ok(),
+                "could not repair {original_mode:o}: {result:?}"
+            );
+            assert_eq!(repaired_mode, 0o700);
+            assert_eq!(fs::read(managed.join("saved")).unwrap(), b"saved");
+        }
+    }
+
+    #[test]
+    fn permission_repair_rejects_an_ordinary_replacement_before_chmod() {
+        for (original_mode, replace_in_repair) in [(0o644, false), (0o000, false), (0o000, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let managed = directory.path().join("pairrank.sqlite3");
+            let previous = directory.path().join("previous.sqlite3");
+            fs::write(&managed, b"original").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            let result = restrict_existing_file_with(&managed, |repairing| {
+                if repairing != replace_in_repair {
+                    return;
+                }
+                fs::rename(&managed, &previous).unwrap();
+                fs::write(&managed, b"replacement").unwrap();
+                fs::set_permissions(&managed, fs::Permissions::from_mode(0o640)).unwrap();
+            });
+            assert!(result.is_err());
+            assert_eq!(mode(&managed), 0o640);
+            assert_eq!(mode(&previous), original_mode);
+            assert_eq!(fs::read(managed).unwrap(), b"replacement");
+            fs::set_permissions(&previous, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read(previous).unwrap(), b"original");
+        }
+    }
 
     #[test]
     fn permission_repair_rejects_symlink_replacement_without_changing_the_target() {

@@ -134,8 +134,7 @@ export class AppController {
         .getList(id)
         .catch((error: unknown) => this.handleListError(id, error));
       if (list.id !== this.state.active?.id) this.state.drafts.items = "";
-      this.state.active = list;
-      this.state.pair = null;
+      this.acceptCommittedList(list);
       this.state.modal = null;
       this.state.view = list.convergence.converged ? "ranking" : "items";
     });
@@ -247,8 +246,13 @@ export class AppController {
     const modal = this.state.modal;
     const list = this.state.active;
     const name = this.state.drafts.name.trim();
-    if (!modal || !name) return;
+    if (
+      !modal ||
+      (modal.kind !== "create-list" && modal.kind !== "rename-list" && modal.kind !== "rename-item")
+    )
+      return;
     await this.perform(async () => {
+      if (!name) throw new Error("名前を入力してください。");
       let result: ListState;
       if (modal.kind === "create-list") {
         result = await this.api.createList(name);
@@ -300,8 +304,9 @@ export class AppController {
       .split(/\r?\n/)
       .map((name) => name.trim())
       .filter(Boolean);
-    if (!list || names.length === 0) return;
+    if (!list) return;
     await this.perform(async () => {
+      if (names.length === 0) throw new Error("項目名を入力してください。");
       const result = await this.api
         .addItems(list.id, names)
         .catch((error: unknown) => this.handleListError(list.id, error));
