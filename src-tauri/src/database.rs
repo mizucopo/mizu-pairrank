@@ -86,7 +86,7 @@ impl Database {
     }
 
     pub fn list_summaries(&self) -> Result<Vec<ListSummary>, String> {
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let transaction = self.read_transaction()?;
         let mut statement = transaction
             .prepare("SELECT id FROM lists ORDER BY id")
             .map_err(db_error)?;
@@ -111,7 +111,7 @@ impl Database {
 
     pub fn create_list(&mut self, name: String) -> Result<ListState, String> {
         let name = validated_name(name)?;
-        let transaction = self.connection.transaction().map_err(db_error)?;
+        let transaction = self.write_transaction()?;
         transaction
             .execute(
                 "INSERT INTO lists (name, model_version, model_parameters) VALUES (?1, ?2, ?3)",
@@ -139,10 +139,7 @@ impl Database {
     }
 
     pub fn delete_list(&mut self, id: i64) -> Result<ImageChange<()>, String> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
+        let transaction = self.write_transaction()?;
         ensure_supported_model(&transaction, id)?;
         let cleanup_paths = read_image_paths(&transaction, id, None)?;
         transaction
@@ -156,15 +153,15 @@ impl Database {
     }
 
     pub fn get_list(&self, id: i64) -> Result<ListState, String> {
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let transaction = self.read_transaction()?;
         read_list(&transaction, id)
     }
 
     pub fn comparison_state(&self, list_id: i64) -> Result<ComparisonState, String> {
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let transaction = self.read_transaction()?;
         Ok(ComparisonState {
             list: read_list(&transaction, list_id)?,
-            pair_counts: self.pair_counts(list_id)?,
+            pair_counts: read_pair_counts(&transaction, list_id)?,
         })
     }
 
@@ -241,7 +238,8 @@ impl Database {
     }
 
     pub fn image_in_use(&self, path: &str) -> Result<bool, String> {
-        self.connection
+        let transaction = self.read_transaction()?;
+        transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM items WHERE image_path = ?1 AND deleted = 0)",
                 [path],
@@ -251,7 +249,8 @@ impl Database {
     }
 
     pub fn image_paths(&self) -> Result<HashSet<String>, String> {
-        self.connection
+        let transaction = self.read_transaction()?;
+        transaction
             .prepare("SELECT image_path FROM items WHERE image_path IS NOT NULL AND deleted = 0")
             .map_err(db_error)?
             .query_map([], |row| row.get(0))
@@ -261,10 +260,7 @@ impl Database {
     }
 
     pub fn resume_list(&mut self, list_id: i64) -> Result<ListState, String> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
+        let transaction = self.write_transaction()?;
         let mut state = read_list(&transaction, list_id)?;
         // Another instance may already have resumed and made progress.
         if state.convergence.converged {
@@ -336,22 +332,20 @@ impl Database {
         })
     }
 
-    pub fn pair_counts(&self, list_id: i64) -> Result<HashMap<(i64, i64), u64>, String> {
-        ensure_supported_model(&self.connection, list_id)?;
-        let mut statement = self
+    fn read_transaction(&self) -> Result<Transaction<'_>, String> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        ensure_supported_schema(&transaction)?;
+        Ok(transaction)
+    }
+
+    fn write_transaction(&mut self) -> Result<Transaction<'_>, String> {
+        let transaction = self
             .connection
-            .prepare(
-                "SELECT min(a_id, b_id), max(a_id, b_id), count(*) FROM comparisons
-                 WHERE list_id = ?1 GROUP BY min(a_id, b_id), max(a_id, b_id)",
-            )
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        statement
-            .query_map([list_id], |row| {
-                Ok(((row.get(0)?, row.get(1)?), nonnegative_integer(row, 2)?))
-            })
-            .map_err(db_error)?
-            .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(db_error)
+        // Keep the writer lock from version validation through the caller's commit.
+        ensure_supported_schema(&transaction)?;
+        Ok(transaction)
     }
 
     fn mutate_images(
@@ -385,10 +379,7 @@ impl Database {
         list_id: i64,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T, String>,
     ) -> Result<(ListState, T), String> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
+        let transaction = self.write_transaction()?;
         ensure_supported_model(&transaction, list_id)?;
         let result = operation(&transaction)?;
         transaction
@@ -401,6 +392,25 @@ impl Database {
         transaction.commit().map_err(db_error)?;
         Ok((state, result))
     }
+}
+
+fn read_pair_counts(
+    transaction: &Transaction<'_>,
+    list_id: i64,
+) -> Result<HashMap<(i64, i64), u64>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT min(a_id, b_id), max(a_id, b_id), count(*) FROM comparisons
+             WHERE list_id = ?1 GROUP BY min(a_id, b_id), max(a_id, b_id)",
+        )
+        .map_err(db_error)?;
+    statement
+        .query_map([list_id], |row| {
+            Ok(((row.get(0)?, row.get(1)?), nonnegative_integer(row, 2)?))
+        })
+        .map_err(db_error)?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(db_error)
 }
 
 fn read_image_paths(
@@ -600,6 +610,11 @@ fn schema_version(connection: &Connection) -> Result<u32, String> {
         .map_err(db_error)
 }
 
+fn ensure_supported_schema(transaction: &Transaction<'_>) -> Result<(), String> {
+    let latest = MIGRATIONS.last().map_or(0, |migration| migration.version);
+    validate_schema_version(transaction, schema_version(transaction)?, latest)
+}
+
 fn validate_schema_version(
     connection: &Connection,
     current: u32,
@@ -677,6 +692,416 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FUTURE_SCHEMA_SQL: &str = "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('saved by future app');";
+
+    fn upgrade_to_future_schema(connection: &mut Connection) -> Result<(), String> {
+        let mut migrations: Vec<_> = MIGRATIONS
+            .iter()
+            .map(|migration| Migration {
+                version: migration.version,
+                sql: migration.sql,
+            })
+            .collect();
+        migrations.push(Migration {
+            version: migrations.last().unwrap().version + 1,
+            sql: FUTURE_SCHEMA_SQL,
+        });
+        migrate(connection, &migrations)
+    }
+
+    fn assert_future_schema_error(result: Result<(), String>) {
+        let latest = MIGRATIONS.last().unwrap().version;
+        assert_eq!(
+            result.unwrap_err(),
+            format!(
+                "データベースのバージョン {} はこのアプリの対応版 {latest} より新しいため開けません。アプリを更新してください。",
+                latest + 1
+            )
+        );
+    }
+
+    type StoredRows = Vec<Vec<rusqlite::types::Value>>;
+
+    fn stored_contents(
+        connection: &Connection,
+    ) -> std::collections::BTreeMap<&'static str, StoredRows> {
+        [
+            "PRAGMA user_version",
+            "SELECT * FROM sqlite_schema ORDER BY name",
+            "SELECT * FROM sqlite_sequence ORDER BY name",
+            "SELECT * FROM lists ORDER BY id",
+            "SELECT * FROM items ORDER BY id",
+            "SELECT * FROM comparisons ORDER BY id",
+            "SELECT * FROM rank_snapshots ORDER BY id",
+            "SELECT * FROM future_data ORDER BY rowid",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let mut statement = connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<StoredRows>>()
+                .unwrap();
+            (sql, rows)
+        })
+        .collect()
+    }
+
+    fn settled_list_with_image(database: &mut Database) -> ListState {
+        let mut state = populated_list(database, "Saved list");
+        state = database
+            .set_image(
+                state.id,
+                state.items[0].id,
+                Some(ImageAsset {
+                    path: "saved.png".into(),
+                    source_url: Some("https://example.org/saved".into()),
+                }),
+            )
+            .unwrap()
+            .value;
+        for _ in 0..20 {
+            state = database
+                .answer(
+                    state.id,
+                    state.items[0].id,
+                    state.items[1].id,
+                    Preference::Equal,
+                    state.revision,
+                )
+                .unwrap();
+        }
+        assert!(state.convergence.converged);
+        state
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteOperation {
+        CreateList,
+        DeleteList,
+        ResumeList,
+        RenameList,
+        AddItems,
+        RenameItem,
+        DeleteItem,
+        SetImage,
+        RemoveImage,
+        Answer,
+    }
+
+    impl WriteOperation {
+        const ENTRY_POINTS: [Self; 4] = [
+            Self::CreateList,
+            Self::DeleteList,
+            Self::ResumeList,
+            Self::RenameList,
+        ];
+        const ALL: [Self; 10] = [
+            Self::CreateList,
+            Self::DeleteList,
+            Self::ResumeList,
+            Self::RenameList,
+            Self::AddItems,
+            Self::RenameItem,
+            Self::DeleteItem,
+            Self::SetImage,
+            Self::RemoveImage,
+            Self::Answer,
+        ];
+
+        fn apply(self, database: &mut Database, state: &ListState) -> Result<(), String> {
+            let item_id = state.items[0].id;
+            match self {
+                Self::CreateList => database.create_list("New list".into()).map(|_| ()),
+                Self::DeleteList => database.delete_list(state.id).map(|_| ()),
+                Self::ResumeList => database.resume_list(state.id).map(|_| ()),
+                Self::RenameList => database.rename_list(state.id, "Changed".into()).map(|_| ()),
+                Self::AddItems => database.add_items(state.id, vec!["New".into()]).map(|_| ()),
+                Self::RenameItem => database
+                    .rename_item(state.id, item_id, "Changed".into())
+                    .map(|_| ()),
+                Self::DeleteItem => database.delete_item(state.id, item_id).map(|_| ()),
+                Self::SetImage | Self::RemoveImage => database
+                    .set_image(
+                        state.id,
+                        item_id,
+                        matches!(self, Self::SetImage).then(|| ImageAsset {
+                            path: "replacement.png".into(),
+                            source_url: None,
+                        }),
+                    )
+                    .map(|_| ()),
+                Self::Answer => database
+                    .answer(
+                        state.id,
+                        item_id,
+                        state.items[1].id,
+                        Preference::AWeak,
+                        state.revision,
+                    )
+                    .map(|_| ()),
+            }
+        }
+    }
+
+    fn read_operations(database: &Database, id: i64) -> [Result<(), String>; 5] {
+        [
+            database.list_summaries().map(|_| ()),
+            database.get_list(id).map(|_| ()),
+            database.comparison_state(id).map(|_| ()),
+            database.image_paths().map(|_| ()),
+            database.image_in_use("saved.png").map(|_| ()),
+        ]
+    }
+
+    #[test]
+    fn future_schema_rejects_every_write_without_changing_stored_data() {
+        for mode in ["DELETE", "WAL"] {
+            for operation in WriteOperation::ALL {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("future.sqlite3");
+                let mut database = Database::open(&path).unwrap();
+                database
+                    .connection
+                    .pragma_update(None, "journal_mode", mode)
+                    .unwrap();
+                let state = settled_list_with_image(&mut database);
+                let mut other = Connection::open(&path).unwrap();
+                upgrade_to_future_schema(&mut other).unwrap();
+                let before = stored_contents(&other);
+
+                assert_future_schema_error(operation.apply(&mut database, &state));
+
+                assert_eq!(stored_contents(&other), before, "{mode} {operation:?}");
+                assert!(database.connection.is_autocommit());
+                other.execute_batch("BEGIN IMMEDIATE; COMMIT").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn future_schema_rejects_every_read_on_an_existing_connection() {
+        for mode in ["DELETE", "WAL"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("future.sqlite3");
+            let mut database = Database::open(&path).unwrap();
+            database
+                .connection
+                .pragma_update(None, "journal_mode", mode)
+                .unwrap();
+            let state = settled_list_with_image(&mut database);
+            let mut other = Connection::open(&path).unwrap();
+            upgrade_to_future_schema(&mut other).unwrap();
+            let before = stored_contents(&other);
+
+            for result in read_operations(&database, state.id) {
+                assert_future_schema_error(result);
+            }
+            assert_eq!(stored_contents(&other), before);
+            assert!(database.connection.is_autocommit());
+            other.execute_batch("BEGIN EXCLUSIVE; COMMIT").unwrap();
+        }
+    }
+
+    #[test]
+    fn future_schema_is_rechecked_after_waiting_for_a_writer() {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+
+        struct BusySignal {
+            waiting: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        thread_local! {
+            static BUSY_SIGNAL: RefCell<Option<BusySignal>> = const { RefCell::new(None) };
+        }
+        for mode in ["DELETE", "WAL"] {
+            for operation in WriteOperation::ENTRY_POINTS {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("waiting.sqlite3");
+                let mut database = Database::open(&path).unwrap();
+                database
+                    .connection
+                    .pragma_update(None, "journal_mode", mode)
+                    .unwrap();
+                let state = settled_list_with_image(&mut database);
+                let mut other = Connection::open(&path).unwrap();
+                let upgrade = other
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                upgrade.execute_batch(FUTURE_SCHEMA_SQL).unwrap();
+                upgrade
+                    .pragma_update(None, "user_version", MIGRATIONS.last().unwrap().version + 1)
+                    .unwrap();
+                let before = stored_contents(&upgrade);
+                let (waiting, notified) = mpsc::channel();
+                let (release, released) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    BUSY_SIGNAL.with(|signal| {
+                        *signal.borrow_mut() = Some(BusySignal {
+                            waiting,
+                            release: released,
+                        })
+                    });
+                    database
+                        .connection
+                        .busy_handler(Some(|_| {
+                            BUSY_SIGNAL.with(|signal| {
+                                let Some(signal) = signal.borrow_mut().take() else {
+                                    return false;
+                                };
+                                signal.waiting.send(()).is_ok()
+                                    && signal.release.recv_timeout(Duration::from_secs(5)).is_ok()
+                            })
+                        }))
+                        .unwrap();
+                    let result = operation.apply(&mut database, &state);
+                    (database, result)
+                });
+
+                let did_wait = notified.recv_timeout(Duration::from_secs(5));
+                let committed = upgrade.commit();
+                let _ = release.send(());
+                let (database, result) = worker.join().unwrap();
+                did_wait.unwrap();
+                committed.unwrap();
+                assert_future_schema_error(result);
+                assert_eq!(stored_contents(&other), before, "{mode} {operation:?}");
+                assert!(database.connection.is_autocommit());
+                other.execute_batch("BEGIN EXCLUSIVE; COMMIT").unwrap();
+            }
+        }
+    }
+
+    thread_local! {
+        static AFTER_SCHEMA_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn after_schema_read<T>(
+        database: &mut Database,
+        action: impl FnOnce() + 'static,
+        operation: impl FnOnce(&mut Database) -> T,
+    ) -> T {
+        fn after_version(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Profile(statement, _) = event
+                && statement.sql().contains("user_version")
+            {
+                let action = AFTER_SCHEMA_READ.with(|pending| pending.borrow_mut().take());
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        }
+        AFTER_SCHEMA_READ.with(|pending| {
+            assert!(pending.borrow().is_none());
+            *pending.borrow_mut() = Some(Box::new(action));
+        });
+        database.connection.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(after_version),
+        );
+        let result = operation(database);
+        database
+            .connection
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        AFTER_SCHEMA_READ.with(|pending| pending.borrow_mut().take());
+        result
+    }
+
+    #[test]
+    fn future_schema_upgrade_cannot_start_between_version_check_and_write() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        for mode in ["DELETE", "WAL"] {
+            for operation in WriteOperation::ENTRY_POINTS {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("locked-version.sqlite3");
+                let mut database = Database::open(&path).unwrap();
+                database
+                    .connection
+                    .pragma_update(None, "journal_mode", mode)
+                    .unwrap();
+                let state = settled_list_with_image(&mut database);
+                let other = Rc::new(RefCell::new(Connection::open(&path).unwrap()));
+                other.borrow().busy_timeout(Duration::ZERO).unwrap();
+                let writer = other.clone();
+                let attempted = Rc::new(RefCell::new(None));
+                let observed = attempted.clone();
+
+                after_schema_read(
+                    &mut database,
+                    move || {
+                        let result = writer.borrow().execute_batch("BEGIN IMMEDIATE");
+                        if result.is_ok() {
+                            let _ = writer.borrow().execute_batch("ROLLBACK");
+                        }
+                        *observed.borrow_mut() = Some(result);
+                    },
+                    |database| operation.apply(database, &state),
+                )
+                .unwrap();
+
+                let attempt = attempted
+                    .borrow_mut()
+                    .take()
+                    .expect("must attempt the upgrade immediately after reading the version");
+                assert_eq!(
+                    attempt.unwrap_err().sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy),
+                    "{mode} {operation:?}"
+                );
+                assert!(database.connection.is_autocommit());
+                upgrade_to_future_schema(&mut other.borrow_mut()).unwrap();
+                let before = stored_contents(&other.borrow());
+                assert_future_schema_error(
+                    database.create_list("After upgrade".into()).map(|_| ()),
+                );
+                assert_eq!(stored_contents(&other.borrow()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn future_schema_committed_during_a_read_is_rejected_on_the_next_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("read-version.sqlite3");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let state = settled_list_with_image(&mut database);
+        let before = serde_json::to_value(database.list_summaries().unwrap()).unwrap();
+        let mut other = Connection::open(&path).unwrap();
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = completed.clone();
+
+        let summaries = after_schema_read(
+            &mut database,
+            move || {
+                *observed.borrow_mut() =
+                    Some(upgrade_to_future_schema(&mut other).and_then(|()| {
+                        other
+                            .execute("UPDATE lists SET name = 'Changed by future app'", [])
+                            .map(|_| ())
+                            .map_err(db_error)
+                    }));
+            },
+            |database| database.list_summaries(),
+        )
+        .unwrap();
+
+        assert_eq!(*completed.borrow(), Some(Ok(())));
+        assert_eq!(serde_json::to_value(summaries).unwrap(), before);
+        for result in read_operations(&database, state.id) {
+            assert_future_schema_error(result);
+        }
+        assert!(database.connection.is_autocommit());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1367,7 +1792,7 @@ mod tests {
             .answer(first.id, b, a, Preference::BWeak, answered.revision)
             .unwrap();
         assert_eq!(
-            database.pair_counts(first.id).unwrap()[&(a.min(b), a.max(b))],
+            database.comparison_state(first.id).unwrap().pair_counts[&(a.min(b), a.max(b))],
             2
         );
         assert_eq!(answered.comparison_count, 2);
@@ -1398,7 +1823,13 @@ mod tests {
             before
         );
         assert_eq!(snapshot_count(&database, state.id), 1);
-        assert!(database.pair_counts(state.id).unwrap().is_empty());
+        assert!(
+            database
+                .comparison_state(state.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1436,7 +1867,13 @@ mod tests {
         assert_eq!(deleted.items.len(), 2);
         assert_eq!(deleted.comparison_count, answered.comparison_count);
         assert_eq!(deleted.convergence.observed_answers, 0);
-        assert!(!database.pair_counts(state.id).unwrap().is_empty());
+        assert!(
+            !database
+                .comparison_state(state.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
         let kept_row: i64 = database
             .connection
             .query_row(

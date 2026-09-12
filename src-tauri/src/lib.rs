@@ -574,6 +574,128 @@ mod tests {
             .unwrap()
     }
 
+    fn upgrade_to_future_schema(path: &Path) -> (rusqlite::Connection, String) {
+        let mut connection = rusqlite::Connection::open(path).unwrap();
+        let supported: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let future = supported + 1;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute_batch("CREATE TABLE future_metadata (value TEXT)")
+            .unwrap();
+        transaction
+            .pragma_update(None, "user_version", future)
+            .unwrap();
+        transaction.commit().unwrap();
+        (
+            connection,
+            format!(
+                "データベースのバージョン {future} はこのアプリの対応版 {supported} より新しいため開けません。アプリを更新してください。"
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_images_when_schema_is_upgraded_after_database_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Backend::open_with(Ok(directory.path().to_owned()), |_| {});
+        let (_, _, image) = list_with_image(&first).await;
+        let orphan = first
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let paths =
+            [image.path, orphan.path].map(|name| directory.path().join("images").join(name));
+        let contents = paths.each_ref().map(|path| std::fs::read(path).unwrap());
+        drop(first);
+
+        let mut expected_error = String::new();
+        let backend = Backend::open_with(Ok(directory.path().to_owned()), |stage| {
+            if stage == 1 {
+                (_, expected_error) =
+                    upgrade_to_future_schema(&directory.path().join("pairrank.sqlite3"));
+            }
+        });
+
+        assert_eq!(backend.images.as_ref().err(), Some(&expected_error));
+        assert_eq!(
+            backend
+                .database_job(|db| db.list_summaries())
+                .await
+                .unwrap_err(),
+            expected_error
+        );
+        for (path, contents) in paths.iter().zip(contents) {
+            assert_eq!(std::fs::read(path).unwrap(), contents);
+        }
+    }
+
+    #[tokio::test]
+    async fn future_schema_rejects_image_changes_and_deletions_without_changing_references() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, previous) = list_with_image(&backend).await;
+        let imported = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let previous_path = directory.path().join("images").join(&previous.path);
+        let previous_contents = std::fs::read(&previous_path).unwrap();
+        let (connection, expected_error) =
+            upgrade_to_future_schema(&directory.path().join("test.sqlite3"));
+        let image_reference = || {
+            connection
+                .query_row(
+                    "SELECT image_path, image_source_url, deleted FROM items
+                     WHERE list_id = ?1 AND id = ?2",
+                    rusqlite::params![list_id, item_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let previous_reference = image_reference();
+
+        for operation in ["associate", "remove", "delete item", "delete list"] {
+            let result = match operation {
+                "associate" => backend
+                    .change_images(Some(imported.clone()), move |db, image| {
+                        db.set_image(list_id, item_id, image)
+                    })
+                    .await
+                    .map(|_| ()),
+                "remove" => backend
+                    .change_images(None, move |db, image| db.set_image(list_id, item_id, image))
+                    .await
+                    .map(|_| ()),
+                "delete item" => backend
+                    .change_images(None, move |db, _| db.delete_item(list_id, item_id))
+                    .await
+                    .map(|_| ()),
+                "delete list" => {
+                    backend
+                        .change_images(None, move |db, _| db.delete_list(list_id))
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(result.unwrap_err(), expected_error, "{operation}");
+            assert_eq!(image_reference(), previous_reference, "{operation}");
+            assert_eq!(std::fs::read(&previous_path).unwrap(), previous_contents);
+        }
+    }
+
     #[tokio::test]
     async fn removing_an_image_removes_its_managed_file_after_saving_the_item() {
         let (directory, backend) = backend();
