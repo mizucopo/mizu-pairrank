@@ -128,7 +128,9 @@ export class AppController {
 
   async selectList(id: number): Promise<void> {
     await this.perform(async () => {
-      const list = await this.api.getList(id);
+      const list = await this.api
+        .getList(id)
+        .catch((error: unknown) => this.handleListError(id, error));
       if (list.id !== this.state.active?.id) this.state.drafts.items = "";
       this.state.active = list;
       this.state.pair = null;
@@ -278,11 +280,11 @@ export class AppController {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const current = await this.api
           .resumeList(list.id)
-          .catch((error: unknown) => this.handleComparisonError(list.id, error));
+          .catch((error: unknown) => this.handleListError(list.id, error));
         this.acceptCommittedList(current);
         const pair = await this.api
           .nextPair(list.id)
-          .catch((error: unknown) => this.handleComparisonError(list.id, error));
+          .catch((error: unknown) => this.handleListError(list.id, error));
         if (pair && pair.revision !== current.revision) continue;
         if (!pair && current.items.length >= 2) continue;
         this.state.lists = await this.api.listSummaries();
@@ -294,13 +296,17 @@ export class AppController {
     });
   }
 
-  private async handleComparisonError(listId: number, error: unknown): Promise<never> {
+  private async handleListError(listId: number, error: unknown): Promise<never> {
     if (errorMessage(error) === "リストが見つかりません。") {
+      this.state.lists = this.state.lists.filter((entry) => entry.id !== listId);
+      if (this.state.active && this.state.active.id !== listId) {
+        this.state.lists = await this.api.listSummaries();
+        if (this.state.lists.some((entry) => entry.id === this.state.active?.id)) throw error;
+      }
       this.state.pair = null;
       this.state.active = null;
       this.state.modal = null;
       this.state.drafts.items = "";
-      this.state.lists = this.state.lists.filter((entry) => entry.id !== listId);
       this.state.view = "items";
       this.state.active = await this.loadFirstAvailableList();
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
@@ -320,7 +326,7 @@ export class AppController {
           this.state.pair = null;
           throw new Error(comparisonRetryMessage, { cause: error });
         }
-        return this.handleComparisonError(pair.listId, error);
+        return this.handleListError(pair.listId, error);
       }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
       this.acceptCommittedList(result);
@@ -332,7 +338,7 @@ export class AppController {
       if (!result.convergence.converged) {
         const next = await this.api
           .nextPair(result.id)
-          .catch((error: unknown) => this.handleComparisonError(result.id, error));
+          .catch((error: unknown) => this.handleListError(result.id, error));
         if (!next || next.revision !== result.revision) throw new Error(comparisonRetryMessage);
         this.state.pair = next;
       }

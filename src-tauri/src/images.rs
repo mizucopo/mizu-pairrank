@@ -756,6 +756,13 @@ fn save_image(
     source_url: Option<String>,
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
+    if !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir())
+        || !directory
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == directory)
+    {
+        return Err("画像の保存先が変更されています。アプリを再起動してください。".to_owned());
+    }
     let filename = format!("{}.png", Uuid::new_v4());
     let path = directory.join(&filename);
     let mut file = crate::storage::create_private_file(&path)
@@ -885,6 +892,26 @@ mod tests {
         service.remove_managed_file(legacy.to_str().unwrap());
         assert!(!legacy.exists());
         assert!(source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_a_replaced_storage_directory_without_writing_outside_it() {
+        let app_data = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let source = app_data.path().join("source.png");
+        let original = png(4, 2);
+        std::fs::write(&source, &original).unwrap();
+        let previous = service.import_local(source.clone()).unwrap();
+        let previous_directory = app_data.path().join("old-images");
+        std::fs::rename(&service.directory, &previous_directory).unwrap();
+        std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+
+        assert!(service.import_local(source.clone()).is_err());
+        assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
+        assert!(previous_directory.join(previous.path).is_file());
+        assert_eq!(std::fs::read(source).unwrap(), original);
     }
 
     #[cfg(unix)]

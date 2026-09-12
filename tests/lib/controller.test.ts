@@ -186,6 +186,91 @@ describe("credential mutation acknowledgments", () => {
 });
 
 describe("comparison state and persistence boundaries", () => {
+  it.each(["remaining", "empty"] as const)(
+    "recovers a deleted active sidebar selection to the %s state",
+    async (destination) => {
+      const { controller, api } = await comparison();
+      controller.state.drafts.items = "deleted draft";
+      const remaining = list(2);
+      api.getList.mockRejectedValueOnce("リストが見つかりません。");
+      api.listSummaries.mockResolvedValue(destination === "remaining" ? [summary(remaining)] : []);
+      await controller.selectList(1);
+      expect(controller.state.active).toEqual(destination === "remaining" ? remaining : null);
+      expect(controller.state.lists).toEqual(
+        destination === "remaining" ? [summary(remaining)] : [],
+      );
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.drafts.items).toBe("");
+      expect(controller.state.view).toBe("items");
+      expect(controller.state.error).toBe("リストが見つかりません。");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    "preserves the current list when another sidebar entry is missing (refresh failure=%s)",
+    async (refreshFailure) => {
+      const { controller, api, initial } = await comparison();
+      const pair = controller.state.pair;
+      controller.state.drafts.items = "current draft";
+      api.getList.mockRejectedValueOnce(new Error("リストが見つかりません。"));
+      if (refreshFailure) api.listSummaries.mockRejectedValueOnce("一覧を読み込めません。");
+      else api.listSummaries.mockResolvedValue([summary(initial)]);
+      await controller.selectList(2);
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.lists).toEqual([summary(initial)]);
+      expect(controller.state.pair).toEqual(pair);
+      expect(controller.state.drafts.items).toBe("current draft");
+      expect(controller.state.view).toBe("compare");
+      expect(controller.state.error).toBe(
+        refreshFailure ? "一覧を読み込めません。" : "リストが見つかりません。",
+      );
+    },
+  );
+
+  it("clears a deleted active sidebar selection even when refreshing fails", async () => {
+    const { controller, api } = await comparison();
+    controller.state.drafts.items = "deleted draft";
+    api.getList.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockRejectedValueOnce("一覧を読み込めません。");
+    await controller.selectList(1);
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.lists.map((entry) => entry.id)).toEqual([2]);
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.error).toBe("一覧を読み込めません。");
+  });
+
+  it("reconciles both the requested and active sidebar entries if both were deleted", async () => {
+    const { controller, api } = await comparison();
+    const remaining = list(3);
+    controller.state.drafts.items = "deleted draft";
+    api.getList.mockRejectedValueOnce("リストが見つかりません。").mockResolvedValueOnce(remaining);
+    api.listSummaries.mockResolvedValue([summary(remaining)]);
+    await controller.selectList(2);
+    expect(controller.state.active).toEqual(remaining);
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.lists).toEqual([summary(remaining)]);
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.view).toBe("items");
+  });
+
+  it("preserves sidebar state for a transient selection failure", async () => {
+    const { controller, api, initial } = await comparison();
+    const pair = controller.state.pair;
+    const summaries = controller.state.lists;
+    const summaryReads = api.listSummaries.mock.calls.length;
+    controller.state.drafts.items = "current draft";
+    api.getList.mockRejectedValueOnce("データベースを読み込めません。");
+    await controller.selectList(2);
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.pair).toEqual(pair);
+    expect(controller.state.lists).toEqual(summaries);
+    expect(controller.state.drafts.items).toBe("current draft");
+    expect(api.listSummaries).toHaveBeenCalledTimes(summaryReads);
+    expect(controller.state.error).toBe("データベースを読み込めません。");
+  });
+
   it("opens a remaining list when the initial list is deleted before loading", async () => {
     const first = list();
     const second = list(2);
