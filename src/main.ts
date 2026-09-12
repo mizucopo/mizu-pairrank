@@ -92,6 +92,8 @@ export function mountApp(
     await controller.openModal(modal);
   }
   function render(): void {
+    const lists = root.querySelector<HTMLElement>(".lists");
+    const listScroll = { top: lists?.scrollTop ?? 0, left: lists?.scrollLeft ?? 0 };
     const focus = document.activeElement;
     if (!pendingButtonFocus && focus instanceof HTMLButtonElement && root.contains(focus)) {
       pendingButtonFocus = rememberButton(focus);
@@ -162,6 +164,11 @@ export function mountApp(
     // Rendering replaces the clicked button. Keep shortcut events inside the app.
     if (!dialog && !root.contains(document.activeElement)) {
       root.focus({ preventScroll: true });
+    }
+    const renderedLists = root.querySelector<HTMLElement>(".lists");
+    if (renderedLists) {
+      renderedLists.scrollTop = listScroll.top;
+      renderedLists.scrollLeft = listScroll.left;
     }
   }
   root.addEventListener("input", (event) => {

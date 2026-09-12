@@ -635,16 +635,17 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<(), 
         }
     }
     let latest = migrations.last().map_or(0, |migration| migration.version);
-    let current = schema_version(connection)?;
-    if current != 0 && current == latest {
-        return Ok(());
-    }
+    // Check readability before waiting for the writer lock; decide only from the locked reread.
+    schema_version(connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    // Validate version and schema together: another process may have just initialized the DB.
+    // Validate version and schema together: another process may have initialized or upgraded the DB.
     let current = schema_version(&transaction)?;
     validate_schema_version(&transaction, current, latest)?;
+    if current != 0 && current == latest {
+        return transaction.commit().map_err(db_error);
+    }
     for migration in migrations
         .iter()
         .filter(|migration| migration.version > current)
@@ -1043,6 +1044,62 @@ mod tests {
             .query_row("SELECT name FROM lists", [], |row| row.get(0))
             .unwrap();
         assert_eq!(name, "Created by another instance");
+    }
+
+    #[test]
+    fn concurrent_upgrade_is_rechecked_after_an_initial_same_version_read() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        thread_local! {
+            static UPGRADE_AFTER_VERSION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+        fn after_version(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Profile(statement, _) = event
+                && statement.sql().contains("user_version")
+            {
+                let upgrade = UPGRADE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
+                if let Some(upgrade) = upgrade {
+                    upgrade();
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent-upgrade.sqlite3");
+        let mut first = Connection::open(&path).unwrap();
+        first.pragma_update(None, "journal_mode", "WAL").unwrap();
+        migrate(&mut first, MIGRATIONS).unwrap();
+        let mut second = Connection::open(&path).unwrap();
+        let result = Rc::new(RefCell::new(None));
+        let completed = result.clone();
+        UPGRADE_AFTER_VERSION.with(|pending| {
+            *pending.borrow_mut() = Some(Box::new(move || {
+                let migrations = [
+                    Migration { version: 1, sql: MIGRATIONS[0].sql },
+                    Migration {
+                        version: 2,
+                        sql: "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('saved by v2');",
+                    },
+                ];
+                *completed.borrow_mut() = Some(migrate(&mut second, &migrations));
+            }));
+        });
+        first.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(after_version),
+        );
+        let migrated = migrate(&mut first, MIGRATIONS);
+        first.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        UPGRADE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
+        assert_eq!(*result.borrow(), Some(Ok(())));
+        assert!(migrated.unwrap_err().contains("バージョン 2"));
+        assert_eq!(schema_version(&first).unwrap(), 2);
+        let saved: String = first
+            .query_row("SELECT value FROM future_data", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saved, "saved by v2");
+        assert!(first.is_autocommit());
     }
 
     #[test]

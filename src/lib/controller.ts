@@ -73,6 +73,7 @@ export class AppController {
   };
 
   private readRequest: symbol | null = null;
+  private settingsRead: Promise<SearchSettings> | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -153,13 +154,34 @@ export class AppController {
     this.state.view = view;
     this.state.modal = null;
     this.state.error = "";
-    if (view === "settings") {
-      await this.performRead(
-        "settings",
-        () => this.api.searchSettings(),
-        (settings) => this.acceptSettings(settings),
-      );
-    } else this.changed();
+    if (view === "settings") await this.loadSettings("settings");
+    else this.changed();
+  }
+
+  private async loadSettings(
+    kind: ReadKind,
+    messages: { notice?: string; errorPrefix?: string } = {},
+  ): Promise<void> {
+    await this.performRead(
+      kind,
+      async () => {
+        const request = this.readRequest;
+        // UI cancellation leaves the native worker holding the single settings-read slot.
+        if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+        if (this.readRequest !== request) return null;
+        const reading = this.api.searchSettings();
+        this.settingsRead = reading;
+        try {
+          return await reading;
+        } finally {
+          if (this.settingsRead === reading) this.settingsRead = null;
+        }
+      },
+      (settings) => {
+        if (settings) this.acceptSettings(settings);
+      },
+      messages,
+    );
   }
 
   private acceptSettings(current: SearchSettings): void {
@@ -199,13 +221,8 @@ export class AppController {
     this.state.drafts.query = item?.name ?? "";
     this.state.candidates = [];
     this.state.searched = false;
-    if (modal.kind === "image") {
-      await this.performRead(
-        "image",
-        () => this.api.searchSettings(),
-        (settings) => this.acceptSettings(settings),
-      );
-    } else this.changed();
+    if (modal.kind === "image") await this.loadSettings("image");
+    else this.changed();
   }
 
   closeModal(): void {
@@ -260,6 +277,14 @@ export class AppController {
       (modal.kind !== "create-list" && modal.kind !== "rename-list" && modal.kind !== "rename-item")
     )
       return;
+    if (
+      (modal.kind === "rename-list" && name === list?.name) ||
+      (modal.kind === "rename-item" &&
+        name === list?.items.find((item) => item.id === modal.itemId)?.name)
+    ) {
+      this.closeModal();
+      return;
+    }
     await this.perform(async () => {
       if (!name) throw new Error("名前を入力してください。");
       let result: ListState;
@@ -528,15 +553,10 @@ export class AppController {
       committed = true;
     });
     if (committed && this.state.view === "settings" && !this.state.modal) {
-      await this.performRead(
-        "settings",
-        () => this.api.searchSettings(),
-        (settings) => this.acceptSettings(settings),
-        {
-          notice: this.state.notice,
-          errorPrefix: "設定状態を再取得できませんでした: ",
-        },
-      );
+      await this.loadSettings("settings", {
+        notice: this.state.notice,
+        errorPrefix: "設定状態を再取得できませんでした: ",
+      });
     }
   }
 }

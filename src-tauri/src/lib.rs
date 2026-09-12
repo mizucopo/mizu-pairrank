@@ -15,6 +15,7 @@ use tauri_plugin_dialog::DialogExt;
 
 struct Backend {
     database: Arc<Mutex<Result<Database, String>>>,
+    database_slots: Arc<tokio::sync::Semaphore>,
     images: Result<Arc<ImageService>, String>,
 }
 
@@ -63,6 +64,7 @@ impl Backend {
         }
         Self {
             database: Arc::new(Mutex::new(database)),
+            database_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             images,
         }
     }
@@ -71,8 +73,15 @@ impl Backend {
         &self,
         operation: impl FnOnce(&mut Database) -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
+        let permit = self
+            .database_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "データ処理を続けられません。アプリを再起動してください。".to_owned())?;
         let database = self.database.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut guard = database.lock().map_err(|_| {
                 "データ操作を続けられません。アプリを再起動してください。".to_string()
             })?;
@@ -108,10 +117,14 @@ impl Backend {
             })
             .await;
         if let (Err(_), Some(image), Ok(images)) = (&result, imported, &self.images) {
+            let Ok(permit) = self.database_slots.clone().acquire_owned().await else {
+                return result;
+            };
             let database = self.database.clone();
             let images = images.clone();
             // Inspect even a poisoned lock for cleanup, without allowing another mutation.
-            let _ = tauri::async_runtime::spawn_blocking(move || {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let guard = database
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -373,6 +386,70 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[test]
+    fn cancelled_database_requests_do_not_occupy_workers_waiting_for_the_mutex() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_directory, backend) = backend();
+            let backend = Arc::new(backend);
+            let (started, starts) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let first = tokio::spawn({
+                let backend = backend.clone();
+                async move {
+                    backend
+                        .database_job(move |_| {
+                            started.send(()).unwrap();
+                            let _ = wait.recv();
+                            Ok(())
+                        })
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), starts)
+                .await
+                .unwrap()
+                .unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let ran = Arc::new(AtomicBool::new(false));
+            let mut second = Box::pin(backend.database_job({
+                let ran = ran.clone();
+                move |_| {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(second.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(second);
+            let unrelated = tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::task::spawn_blocking(|| 42),
+            )
+            .await;
+            drop(release);
+            assert_eq!(unrelated.unwrap().unwrap(), 42);
+            backend
+                .database_job(|db| db.create_list("Still usable".into()))
+                .await
+                .unwrap();
+            assert!(!ran.load(Ordering::SeqCst));
+        });
+    }
+
     #[tokio::test]
     async fn cancelled_local_picker_keeps_capacity_until_its_worker_exits() {
         use std::time::Duration;
@@ -471,6 +548,7 @@ mod tests {
             directory,
             Backend {
                 database: Arc::new(Mutex::new(Ok(database))),
+                database_slots: Arc::new(tokio::sync::Semaphore::new(1)),
                 images: Ok(Arc::new(images)),
             },
         )

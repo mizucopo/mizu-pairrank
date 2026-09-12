@@ -139,12 +139,14 @@ async function mutation(method: MutationMethod) {
   switch (method) {
     case "renameList":
       await controller.openModal({ kind: "rename-list" });
+      controller.state.drafts.name = "new list name";
       break;
     case "deleteList":
       await controller.openModal({ kind: "delete-list" });
       break;
     case "renameItem":
       await controller.openModal({ kind: "rename-item", itemId: 11 });
+      controller.state.drafts.name = "new item name";
       break;
     case "deleteItem":
       await controller.openModal({ kind: "delete-item", itemId: 11 });
@@ -354,11 +356,12 @@ describe("settings navigation", () => {
           }),
       );
       controller.closeModal();
-      expect(api.searchSettings).toHaveBeenCalledTimes(2);
+      expect(api.searchSettings).toHaveBeenCalledOnce();
       expect(controller.state.modal).toBeNull();
       expect(controller.state.view).toBe("settings");
       finishOld();
       await abandoned;
+      await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
       expect(controller.state.busy).toBe(true);
       expect(controller.state.readPending).toBe("settings");
       expect(controller.state.settings).toBeNull();
@@ -566,40 +569,119 @@ describe("settings navigation", () => {
     },
   );
 
-  it("avoids duplicate settings reads and keeps backend capacity rejections recoverable after reentry", async () => {
+  it("waits for a cancelled native settings worker before retrying through its single available slot", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
+    let occupied = false;
     let finish: () => void = () => {};
-    api.searchSettings.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finish = () =>
-            resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
-        }),
-    );
+    api.searchSettings.mockImplementation(() => {
+      if (occupied)
+        return Promise.reject("検索設定の読み込みが実行中です。少し待ってから再試行してください。");
+      occupied = true;
+      return new Promise((resolve) => {
+        finish = () => {
+          occupied = false;
+          resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
+        };
+      });
+    });
     const reading = controller.navigate("settings");
     await controller.navigate("settings");
     await controller.navigate("settings");
     expect(api.searchSettings).toHaveBeenCalledOnce();
-    await controller.navigate("items");
-    const capacityError = "検索設定の読み込みが実行中です。少し待ってから再試行してください。";
-    api.searchSettings.mockRejectedValueOnce(capacityError);
-    await controller.navigate("settings");
-    expect(api.searchSettings).toHaveBeenCalledTimes(2);
-    expect(controller.state.error).toBe(capacityError);
-    expect(controller.state.busy).toBe(false);
-    await controller.selectList(2);
+    await controller.openModal({ kind: "create-list" });
+    controller.closeModal();
+    await controller.openModal({ kind: "create-list" });
+    controller.closeModal();
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(controller.state.readPending).toBe("settings");
     finish();
     await reading;
-    expect(controller.state.active?.id).toBe(2);
-    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
     expect(controller.state.settings).toBeNull();
+    expect(controller.state.busy).toBe(true);
     expect(controller.state.error).toBe("");
-    await controller.navigate("settings");
-    expect(controller.state.settings?.braveConfigured).toBe(false);
+    finish();
+    await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+    expect(controller.state.settings?.braveConfigured).toBe(true);
     expect(controller.state.error).toBe("");
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
   });
+
+  it("discards a queued settings retry after starting a list write without releasing its busy state", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    let finishRead: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = () =>
+            resolve({
+              braveConfigured: true,
+              ollamaConfigured: false,
+              defaultProvider: "brave",
+            });
+        }),
+    );
+    const reading = controller.navigate("settings");
+    await controller.openModal({ kind: "create-list" });
+    controller.closeModal();
+    await controller.openModal({ kind: "create-list" });
+    controller.state.drafts.name = "new list";
+    let finishWrite: () => void = () => {};
+    api.createList.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishWrite = () => resolve(list());
+        }),
+    );
+    const writing = controller.saveName();
+    finishRead();
+    await reading;
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.busy).toBe(true);
+    expect(controller.state.modal).toEqual({ kind: "create-list" });
+    expect(controller.state.error).toBe("");
+    finishWrite();
+    await writing;
+    expect(controller.state.busy).toBe(false);
+    expect(controller.state.modal).toBeNull();
+  });
+});
+
+describe("unchanged names", () => {
+  it.each([
+    ["rename-list", false],
+    ["rename-list", true],
+    ["rename-item", false],
+    ["rename-item", true],
+  ] as const)(
+    "closes %s without a mutation when its trimmed name is unchanged (padding=%s)",
+    async (kind, padding) => {
+      const { api, controller, initial } = await comparison();
+      const pair = controller.state.pair;
+      const summaries = controller.state.lists;
+      const summaryReads = api.listSummaries.mock.calls.length;
+      controller.state.drafts.items = "unsaved items";
+      await controller.openModal(kind === "rename-list" ? { kind } : { kind, itemId: 11 });
+      if (padding) controller.state.drafts.name = `　 ${controller.state.drafts.name} \t`;
+      await controller.saveName();
+      expect(api.renameList).not.toHaveBeenCalled();
+      expect(api.renameItem).not.toHaveBeenCalled();
+      expect(api.listSummaries).toHaveBeenCalledTimes(summaryReads);
+      expect(controller.state.modal).toBeNull();
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.pair).toEqual(pair);
+      expect(controller.state.view).toBe("compare");
+      expect(controller.state.lists).toEqual(summaries);
+      expect(controller.state.drafts.items).toBe("unsaved items");
+      expect(controller.state.busy).toBe(false);
+      expect(controller.state.error).toBe("");
+    },
+  );
 });
 
 describe("credential mutation acknowledgments", () => {
@@ -1621,8 +1703,8 @@ describe("comparison state and persistence boundaries", () => {
   });
 
   it.each([
-    ["success", "search"],
-    ["failure", "search"],
+    ["success", "read"],
+    ["failure", "read"],
     ["success", "write"],
     ["failure", "write"],
   ] as const)(
@@ -1654,42 +1736,50 @@ describe("comparison state and persistence boundaries", () => {
         ollamaConfigured: true,
         defaultProvider: "ollama" as const,
       };
-      api.searchSettings.mockResolvedValue(currentSettings);
-      await controller.openModal({ kind: "image", itemId: 12 });
       let finishCurrent: (() => void) | undefined;
       let pending: Promise<void>;
-      if (operation === "search") {
-        api.searchImages.mockImplementationOnce(
+      if (operation === "read") {
+        api.searchSettings.mockImplementationOnce(
           () =>
             new Promise((resolve) => {
-              finishCurrent = () => resolve([]);
+              finishCurrent = () => resolve(currentSettings);
             }),
         );
-        pending = controller.searchImages();
+        pending = controller.openModal({ kind: "image", itemId: 12 });
       } else {
-        api.setLocalImage.mockImplementationOnce(
+        await controller.openModal({ kind: "create-list" });
+        controller.state.drafts.name = "new list";
+        api.createList.mockImplementationOnce(
           () =>
             new Promise((resolve) => {
               finishCurrent = () => resolve(initial);
             }),
         );
-        pending = controller.changeImage("local");
+        pending = controller.saveName();
       }
-      if (!finishOld || !finishCurrent) throw new Error("Both operations must have started");
+      if (!finishOld) throw new Error("The first read must have started");
       finishOld();
       await oldOpen;
-      expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
-      expect(controller.state.settings).toEqual(currentSettings);
-      expect(controller.state.provider).toBe("ollama");
+      if (operation === "read") {
+        await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
+        expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
+      }
+      expect(controller.state.settings).toBeNull();
+      expect(controller.state.provider).toBe("brave");
       expect(controller.state.busy).toBe(true);
       expect(controller.state.error).toBe("");
       if (operation === "write") {
         controller.closeModal();
-        expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
+        expect(controller.state.modal).toEqual({ kind: "create-list" });
       }
+      if (!finishCurrent) throw new Error("The current operation must have started");
       finishCurrent();
       await pending;
       expect(controller.state.busy).toBe(false);
+      if (operation === "read") {
+        expect(controller.state.settings).toEqual(currentSettings);
+        expect(controller.state.provider).toBe("ollama");
+      }
     },
   );
 

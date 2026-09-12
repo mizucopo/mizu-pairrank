@@ -287,10 +287,14 @@ describe("desktop app interaction", () => {
       expect(root.querySelector("dialog")).toBeNull();
       expect(controller.state.readPending).toBe("settings");
       expect(button(root, '[data-action="select-list"][data-id="1"]').disabled).toBe(false);
+      if (initial === "pending") {
+        expect(api.searchSettings).toHaveBeenCalledTimes(1);
+        finishOld();
+        await firstRead;
+      }
+      await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
       finishCurrent();
       await settle(controller);
-      finishOld();
-      await firstRead;
       expect(root.querySelector(".settings-card .badge")?.textContent).toBe("設定済み");
       expect(document.activeElement).toBe(button(root, opener));
       const key = root.querySelector("#braveKey");
@@ -416,6 +420,50 @@ describe("desktop app interaction", () => {
     await click(root, controller, '.tabs [data-view="ranking"]');
     expect(document.activeElement).toBe(button(root, '.tabs [data-view="ranking"]'));
   });
+
+  it.each(["scrollTop", "scrollLeft"] as const)(
+    "preserves list %s through busy and completed renders",
+    async (axis) => {
+      const { root, controller, api, state } = setup();
+      api.listSummaries.mockResolvedValue(
+        Array.from({ length: 40 }, (_, index) => ({
+          id: index + 1,
+          name: `リスト ${index + 1}`,
+          itemCount: 2,
+          comparisonCount: 0,
+          converged: false,
+        })),
+      );
+      await controller.initialize();
+      let finish: () => void = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      api.getList.mockImplementationOnce(async () => {
+        await pending;
+        return { ...state, id: 30, name: "リスト 30" };
+      });
+      const lists = root.querySelector<HTMLElement>(".lists");
+      if (!lists) throw new Error("Missing list navigation");
+      lists[axis] = 600;
+      const selector = '[data-action="select-list"][data-id="30"]';
+      button(root, selector).focus({ preventScroll: true });
+      button(root, selector).click();
+      expect(controller.state.busy).toBe(true);
+      const busyLists = root.querySelector<HTMLElement>(".lists");
+      if (!busyLists) throw new Error("Missing busy list navigation");
+      expect(busyLists).not.toBe(lists);
+      expect(busyLists[axis]).toBe(600);
+      busyLists[axis] = 720;
+      finish();
+      await settle(controller);
+      const completedLists = root.querySelector<HTMLElement>(".lists");
+      expect(completedLists).not.toBe(busyLists);
+      expect(completedLists?.[axis]).toBe(720);
+      expect(document.activeElement).toBe(button(root, selector));
+      expect(button(root, selector).getAttribute("aria-current")).toBe("true");
+    },
+  );
 
   it.each(["items", "credentials"] as const)(
     "preserves %s input focus and selection through a retry after an invalid form submission",
@@ -587,6 +635,12 @@ describe("desktop app interaction", () => {
     await controller.initialize();
     await click(root, controller, opener);
     const modal = controller.state.modal;
+    if (method === "renameItem") {
+      const input = root.querySelector("#name-input");
+      if (!(input instanceof HTMLInputElement)) throw new Error("Missing name input");
+      input.value = "変更する名前";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
     api[method].mockRejectedValueOnce(new Error("操作に失敗しました"));
     const retry = button(root, retrySelector);
     retry.focus();
@@ -626,6 +680,26 @@ describe("desktop app interaction", () => {
     expect(document.activeElement).toBe(button(root, selector));
     expect(api.createList).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["list", '[data-action="rename-list"]', "renameList", "好きな果物"],
+    ["item", '[data-action="rename-item"][data-id="10"]', "renameItem", "りんご"],
+  ] as const)(
+    "closes an unchanged %s rename and restores its opener focus",
+    async (_kind, opener, method, name) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, opener);
+      const input = root.querySelector("#name-input");
+      if (!(input instanceof HTMLInputElement)) throw new Error("Missing name input");
+      input.value = `  ${name}  `;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      await click(root, controller, '[data-form="save-name"] button[type="submit"]');
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button(root, opener));
+      expect(api[method]).not.toHaveBeenCalled();
+    },
+  );
 
   it("requires a confirmation before deletion and cancellation preserves the item", async () => {
     const { root, controller, api, state } = setup();
@@ -1196,6 +1270,8 @@ describe("desktop app interaction", () => {
     const input = root.querySelector("#name-input");
     if (!(input instanceof HTMLInputElement)) throw new Error("Missing name field");
     expect(input.value).toBe(text);
+    input.value = `${text}変更`;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
     api.renameList.mockRejectedValue(new Error(text));
     const form = root.querySelector('[data-form="save-name"]');
     if (!form) throw new Error("Missing name form");
