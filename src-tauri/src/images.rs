@@ -412,7 +412,7 @@ impl ImageService {
                 .managed_path(&image.path)
                 .ok_or_else(|| std::io::Error::other("invalid managed image reference"))?;
             let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
-            crate::storage::open_managed_file(&pinned, path.file_name().unwrap())?;
+            crate::storage::open_managed_image_file(&pinned, path.file_name().unwrap())?;
             Ok(())
         };
         validate()
@@ -473,8 +473,9 @@ impl ImageService {
             let pinned = verified_image_directory(&self.directory, &self.directory_identity)
                 .map_err(|_| StatusCode::FORBIDDEN)?;
             checkpoint();
-            let file = crate::storage::open_managed_file(&pinned, std::ffi::OsStr::new(reference))
-                .map_err(|error| match error.kind() {
+            let file =
+                crate::storage::open_managed_image_file(&pinned, std::ffi::OsStr::new(reference))
+                    .map_err(|error| match error.kind() {
                     std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
                     _ => StatusCode::FORBIDDEN,
                 })?;
@@ -1687,6 +1688,53 @@ mod tests {
             service.image_response(&missing).status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_image_protocol_rejects_runtime_hardlink_replacements() {
+        use tauri::http::{Request, StatusCode};
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let external = directory.path().join("external.png");
+        let original = png(4, 2);
+        std::fs::write(&external, &original).unwrap();
+        let image = service.import_local(external.clone()).unwrap();
+        let managed = service.directory.join(&image.path);
+        std::fs::remove_file(&managed).unwrap();
+        std::fs::hard_link(&external, &managed).unwrap();
+
+        for method in ["GET", "HEAD"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("pairrank-image://localhost/{}", image.path))
+                .body(Vec::new())
+                .unwrap();
+            let response = service.image_response(&request);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(response.body().is_empty());
+        }
+        assert_eq!(std::fs::read(&external).unwrap(), original);
+        assert_eq!(std::fs::read(&managed).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_validation_rejects_runtime_hardlink_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let external = directory.path().join("external.png");
+        let original = png(4, 2);
+        std::fs::write(&external, &original).unwrap();
+        let image = service.import_local(external.clone()).unwrap();
+        assert!(service.validate_import(&image).is_ok());
+        let managed = service.directory.join(&image.path);
+        std::fs::remove_file(&managed).unwrap();
+        std::fs::hard_link(&external, &managed).unwrap();
+
+        assert!(service.validate_import(&image).is_err());
+        assert_eq!(std::fs::read(&external).unwrap(), original);
+        assert_eq!(std::fs::read(&managed).unwrap(), original);
     }
 
     #[test]

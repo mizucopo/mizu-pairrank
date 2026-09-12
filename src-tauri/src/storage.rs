@@ -46,8 +46,7 @@ impl PreparedAppData {
         )?;
         #[cfg(not(unix))]
         create_private_directory(&path)?;
-        let directory = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?
-            .into_std_file();
+        let directory = open_app_data_directory(&path)?.into_std_file();
         #[cfg(unix)]
         verify_identity(&directory.metadata()?, expected)?;
         let prepared = Self {
@@ -72,6 +71,21 @@ impl PreparedAppData {
         }
         Ok(())
     }
+}
+
+fn open_app_data_directory(path: &Path) -> io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing app-data directory name"))?;
+    // Parent aliases are valid; the configured app-data leaf must not be a link.
+    cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?
+        .open_dir_nofollow(name)
 }
 
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
@@ -291,6 +305,16 @@ pub fn open_managed_file(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -
     Ok(file)
 }
 
+pub fn open_managed_image_file(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    let file = open_managed_file(directory, name)?;
+    #[cfg(unix)]
+    verify_single_link(file.metadata()?.nlink(), true)?;
+    Ok(file)
+}
+
 #[cfg(target_os = "linux")]
 fn restore_unreadable_entry(
     directory: &cap_std::fs::Dir,
@@ -373,6 +397,76 @@ pub fn prepare_database_file(path: &Path) -> io::Result<PreparedDatabaseFile> {
 #[cfg(not(unix))]
 pub fn prepare_database_file(_path: &Path) -> io::Result<PreparedDatabaseFile> {
     Ok(PreparedDatabaseFile::default())
+}
+
+#[cfg(test)]
+mod app_data_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn app_data_directory_open_rejects_a_link_at_the_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let path = root.path().join("app-data");
+        let saved = external.path().join("pairrank.sqlite3");
+        fs::write(&saved, b"external database").unwrap();
+        std::os::unix::fs::symlink(external.path(), &path).unwrap();
+
+        assert!(open_app_data_directory(&path).is_err());
+        assert!(PreparedAppData::open(path).is_err());
+        assert_eq!(fs::read(saved).unwrap(), b"external database");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_data_preparation_preserves_a_parent_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("real-parent");
+        let alias = root.path().join("parent-alias");
+        let path = parent.join("app-data");
+        fs::create_dir_all(&path).unwrap();
+        let saved = path.join("pairrank.sqlite3");
+        fs::write(&saved, b"saved database").unwrap();
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+
+        let prepared = PreparedAppData::open(alias.join("app-data")).unwrap();
+        prepared.verify().unwrap();
+        assert_eq!(fs::read(saved).unwrap(), b"saved database");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn app_data_preparation_rejects_a_junction_or_symlink_at_the_leaf() {
+        for junction in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let path = root.path().join("app-data");
+            let saved = external.path().join("pairrank.sqlite3");
+            fs::write(&saved, b"external database").unwrap();
+            if junction {
+                assert!(
+                    std::process::Command::new("cmd")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(&path)
+                        .arg(external.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            } else if let Err(error) = std::os::windows::fs::symlink_dir(external.path(), &path) {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    eprintln!("skipping symlink case: symbolic-link privilege is unavailable");
+                    continue;
+                }
+                panic!("cannot create directory symlink: {error}");
+            }
+
+            assert!(PreparedAppData::open(path).is_err());
+            assert_eq!(fs::read(saved).unwrap(), b"external database");
+            assert!(!external.path().join("images").exists());
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
