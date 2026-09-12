@@ -627,7 +627,15 @@ impl ImageService {
 
     /// The path comes only from the native file chooser, not a webview capability.
     pub fn import_local(&self, path: PathBuf) -> Result<ImageAsset, String> {
-        let file = std::fs::File::open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+        }
+        let file = options
+            .open(path)
             .map_err(|_| "選択した画像ファイルを開けませんでした。".to_owned())?;
         let metadata = file
             .metadata()
@@ -2159,6 +2167,74 @@ mod tests {
             "https://cdn.example.com/a.png?x=1&y=2"
         );
         assert!(representative_image(b"<p>none</p>", "https://example.com/item").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_import_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(ImageService::new(directory.path().to_owned()).unwrap());
+        let source = directory.path().join("photo.png");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_service = service.clone();
+        let worker_source = source.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(worker_service.import_local(worker_source))
+                .unwrap();
+        });
+        let response = receiver.recv_timeout(Duration::from_secs(2));
+        let finished_without_writer = response.is_ok();
+        // Release a regressed blocking open before reporting the failed assertion.
+        let writer = (!finished_without_writer).then(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                .open(&source)
+                .unwrap()
+        });
+        let result = response
+            .or_else(|_| receiver.recv_timeout(Duration::from_secs(2)))
+            .unwrap();
+        worker.join().unwrap();
+        drop(writer);
+        assert!(
+            finished_without_writer,
+            "local import waited for a FIFO writer"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "20MiB以下の画像ファイルを選択してください。"
+        );
+        assert_eq!(std::fs::read_dir(&service.directory).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_import_follows_a_user_selected_symlink_without_changing_its_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let original = png(4, 2);
+        std::fs::write(source.path(), &original).unwrap();
+        let selected = directory.path().join("photo.png");
+        std::os::unix::fs::symlink(source.path(), &selected).unwrap();
+
+        let asset = service.import_local(selected.clone()).unwrap();
+        let imported = image::open(service.directory.join(asset.path)).unwrap();
+        assert_eq!((imported.width(), imported.height()), (4, 2));
+        assert_eq!(std::fs::read(source.path()).unwrap(), original);
+        assert!(std::fs::symlink_metadata(selected).unwrap().is_symlink());
     }
 
     #[test]

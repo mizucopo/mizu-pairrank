@@ -34,10 +34,10 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
-        Self::open_with(path, || {})
+        Self::open_with(path, |_| {})
     }
 
-    fn open_with(path: &Path, checkpoint: impl FnOnce()) -> Result<Self, String> {
+    fn open_with(path: &Path, mut checkpoint: impl FnMut(bool)) -> Result<Self, String> {
         // Resolve legitimate parent aliases (for example macOS /var), never the DB leaf.
         #[cfg(unix)]
         let resolved = if path == Path::new(":memory:") {
@@ -57,14 +57,16 @@ impl Database {
         };
         #[cfg(unix)]
         let path = resolved.as_path();
-        crate::storage::prepare_database_file(path)
+        let prepared = crate::storage::prepare_database_file(path)
             .map_err(|error| format!("保存データの権限を設定できません: {error}"))?;
-        checkpoint();
-        let mut connection = Connection::open_with_flags(
-            path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .map_err(db_error)?;
+        checkpoint(false);
+        let mut flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        if prepared.has_identity() {
+            flags.remove(OpenFlags::SQLITE_OPEN_CREATE);
+        }
+        let mut connection = Connection::open_with_flags(path, flags).map_err(db_error)?;
+        checkpoint(true);
+        verify_prepared_database(&connection, &prepared, path)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(db_error)?;
@@ -407,6 +409,34 @@ fn read_image_paths(
         .map_err(db_error)
 }
 
+fn verify_prepared_database(
+    connection: &Connection,
+    prepared: &crate::storage::PreparedDatabaseFile,
+    path: &Path,
+) -> Result<(), String> {
+    if !prepared.has_identity() {
+        return Ok(());
+    }
+    let changed =
+        || "保存データが起動中に差し替えられました。アプリを再起動してください。".to_owned();
+    prepared.verify_path(path).map_err(|_| changed())?;
+    let mut moved: std::os::raw::c_int = 0;
+    // SAFETY: the connection is live, "main" is NUL-terminated, and the opcode
+    // writes one C int synchronously to the valid, exclusively borrowed pointer.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::os::raw::c_int).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || moved != 0 {
+        return Err(changed());
+    }
+    Ok(())
+}
+
 fn db_error(error: rusqlite::Error) -> String {
     format!("データベース処理に失敗しました: {error}")
 }
@@ -635,6 +665,100 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn check_ordinary_database_replacement(restore_before_validation: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pairrank.sqlite3");
+        let previous = directory.path().join("previous.sqlite3");
+        let replacement = directory.path().join("replacement.sqlite3");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.create_list("Saved rankings".to_owned()).unwrap();
+        }
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&replacement, []).unwrap();
+        let result = Database::open_with(&path, |opened| {
+            if !opened {
+                std::fs::rename(&path, &previous).unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+            } else if restore_before_validation {
+                std::fs::rename(&path, &replacement).unwrap();
+                std::fs::rename(&previous, &path).unwrap();
+            }
+        });
+        assert!(result.is_err());
+        let (original_path, replacement_path) = if restore_before_validation {
+            (&path, &replacement)
+        } else {
+            (&previous, &path)
+        };
+        assert_eq!(std::fs::read(original_path).unwrap(), original);
+        assert!(std::fs::read(replacement_path).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_database_replacement_after_preparation_is_rejected_before_migration() {
+        check_ordinary_database_replacement(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_database_replacement_restored_after_sqlite_open_is_still_rejected() {
+        check_ordinary_database_replacement(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prepared_database_removed_before_sqlite_open_is_not_recreated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pairrank.sqlite3");
+        let result = Database::open_with(&path, |opened| {
+            if !opened {
+                std::fs::remove_file(&path).unwrap();
+            }
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_preparation_preserves_an_existing_connections_process_lock() {
+        const PROBE_PATH: &str = "PAIRRANK_DATABASE_LOCK_PROBE_PATH";
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let connection = Connection::open(std::path::PathBuf::from(path)).unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            let error = connection.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                if error.code == rusqlite::ErrorCode::DatabaseBusy));
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pairrank.sqlite3");
+        let database = Database::open(&path).unwrap();
+        database
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        {
+            let prepared = crate::storage::prepare_database_file(&path).unwrap();
+            verify_prepared_database(&database.connection, &prepared, &path).unwrap();
+        }
+        // A different process observes the OS lock, independent of SQLite's
+        // in-process bookkeeping for its own connections.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "database::tests::database_preparation_preserves_an_existing_connections_process_lock", "--nocapture"])
+            .env(PROBE_PATH, &path)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn sqlite_open_rejects_symlink_replacement_after_file_preparation() {
         use std::os::unix::fs::PermissionsExt;
@@ -643,9 +767,11 @@ mod tests {
         let external = directory.path().join("external.sqlite3");
         std::fs::write(&external, []).unwrap();
         std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let result = Database::open_with(&path, || {
-            std::fs::rename(&path, directory.path().join("previous.sqlite3")).unwrap();
-            std::os::unix::fs::symlink(&external, &path).unwrap();
+        let result = Database::open_with(&path, |opened| {
+            if !opened {
+                std::fs::rename(&path, directory.path().join("previous.sqlite3")).unwrap();
+                std::os::unix::fs::symlink(&external, &path).unwrap();
+            }
         });
         assert!(result.is_err());
         assert!(std::fs::read(&external).unwrap().is_empty());

@@ -3,7 +3,33 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[derive(Default)]
+pub struct PreparedDatabaseFile {
+    // Extra open/close calls for this inode can release another SQLite connection's
+    // process-wide POSIX locks, so keep identity values instead of another descriptor.
+    identity: Option<(u64, u64)>,
+}
+
+impl PreparedDatabaseFile {
+    pub fn has_identity(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    pub fn verify_path(&self, path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(expected) = self.identity {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected {
+                return Err(io::Error::other("prepared database file was replaced"));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    }
+}
 
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -77,11 +103,15 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
 
 #[cfg(unix)]
 pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
-    restrict_existing_file_with(path, |_| {})
+    restrict_existing_file_with(path, |_| {}).map(|_| ())
 }
 
 #[cfg(unix)]
-fn restrict_existing_file_with(path: &Path, mut checkpoint: impl FnMut(bool)) -> io::Result<()> {
+fn restrict_existing_file_with(
+    path: &Path,
+    mut checkpoint: impl FnMut(bool),
+) -> io::Result<(u64, u64)> {
+    use cap_std::fs::MetadataExt as _;
     use cap_std::fs::PermissionsExt as _;
     let parent = path
         .parent()
@@ -110,8 +140,10 @@ fn restrict_existing_file_with(path: &Path, mut checkpoint: impl FnMut(bool)) ->
         };
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
+        let metadata = file.metadata()?;
+        return Ok((metadata.dev(), metadata.ino()));
     }
-    Ok(())
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 pub fn managed_open_options() -> cap_std::fs::OpenOptions {
@@ -171,11 +203,11 @@ fn restore_unreadable_file(
 }
 
 #[cfg(unix)]
-pub fn prepare_database_file(path: &Path) -> io::Result<()> {
+pub fn prepare_database_file(path: &Path) -> io::Result<PreparedDatabaseFile> {
     if path == Path::new(":memory:") {
-        return Ok(());
+        return Ok(PreparedDatabaseFile::default());
     }
-    match create_private_file(path) {
+    let identity = match create_private_file(path) {
         Ok(file) => {
             file.sync_all()?;
             if let Some(parent) = path
@@ -184,10 +216,14 @@ pub fn prepare_database_file(path: &Path) -> io::Result<()> {
             {
                 File::open(parent)?.sync_all()?;
             }
+            let metadata = file.metadata()?;
+            (metadata.dev(), metadata.ino())
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => restrict_existing_file(path)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            restrict_existing_file_with(path, |_| {})?
+        }
         Err(error) => return Err(error),
-    }
+    };
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
@@ -197,12 +233,14 @@ pub fn prepare_database_file(path: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(PreparedDatabaseFile {
+        identity: Some(identity),
+    })
 }
 
 #[cfg(not(unix))]
-pub fn prepare_database_file(_path: &Path) -> io::Result<()> {
-    Ok(())
+pub fn prepare_database_file(_path: &Path) -> io::Result<PreparedDatabaseFile> {
+    Ok(PreparedDatabaseFile::default())
 }
 
 #[cfg(all(test, unix))]
