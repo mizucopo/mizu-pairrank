@@ -1142,6 +1142,7 @@ fn save_image_with(
     // All creation, synchronization and rollback stay relative to this open directory.
     let pinned = verified_image_directory(directory, expected_identity)
         .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())?;
+    #[cfg(unix)]
     let directory_handle = pinned
         .try_clone()
         .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?
