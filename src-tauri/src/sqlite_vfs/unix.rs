@@ -453,6 +453,11 @@ unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_i
             && let Some(expected) = expected
         {
             if let Err(error) = restore_unreadable(&resolved, expected) {
+                if let Some(capture) = &capture {
+                    // SQLite may retry readonly after chmod succeeded. Keep
+                    // the failed synchronization visible to final verification.
+                    capture.borrow_mut().rejected = true;
+                }
                 return fail(error);
             }
             libc::openat(
@@ -589,7 +594,20 @@ fn restore_unreadable(path: &ResolvedPath, expected: Identity) -> io::Result<()>
     std::fs::set_permissions(
         format!("/proc/self/fd/{}", pinned.as_raw_fd()),
         std::fs::Permissions::from_mode(0o600),
-    )
+    )?;
+    #[cfg(test)]
+    if PERMISSION_FAILURE.with(|failure| failure.get() == Some(PermissionFailure::Sync)) {
+        return Err(io::Error::other("injected permission sync failure"));
+    }
+    // O_PATH cannot be fsynced. Sync the filesystem through the retained
+    // readable directory instead of opening and closing another I/O descriptor
+    // for this inode, which could cancel SQLite's POSIX locks. This broader
+    // writeback is needed only while repairing non-private permissions.
+    // SAFETY: the pinned storage keeps this readable directory descriptor live.
+    if unsafe { libc::syncfs(path.storage.directory().as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn close(fd: c_int) -> c_int {
@@ -965,6 +983,36 @@ mod native_tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permission_restoration_sync_failure_rejects_open_without_releasing_writer_locks() {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = Arc::new(
+                crate::storage::PreparedAppData::open(root.path().join("app-data")).unwrap(),
+            );
+            let path = storage.path().join("pairrank.sqlite3");
+            let first =
+                super::super::open(storage.clone(), OsStr::new("pairrank.sqlite3")).unwrap();
+            if matches!(suffix, "-wal" | "-shm") {
+                first.pragma_update(None, "journal_mode", "WAL").unwrap();
+            }
+            first
+                .execute_batch(
+                    "CREATE TABLE saved(value); BEGIN IMMEDIATE; INSERT INTO saved VALUES (1)",
+                )
+                .unwrap();
+            let repaired = storage.path().join(format!("pairrank.sqlite3{suffix}"));
+            std::fs::set_permissions(&repaired, std::fs::Permissions::from_mode(0o000)).unwrap();
+            PERMISSION_FAILURE.with(|slot| slot.set(Some(PermissionFailure::Sync)));
+            let result = super::super::open(storage, OsStr::new("pairrank.sqlite3"));
+            PERMISSION_FAILURE.with(|slot| slot.set(None));
+            assert!(result.is_err(), "sync failure accepted for {suffix:?}");
+            super::tests::assert_locked(&path);
+            first.execute_batch("ROLLBACK").unwrap();
+        }
+    }
 
     #[test]
     fn a_raced_sidecar_hardlink_does_not_cancel_another_databases_lock() {
