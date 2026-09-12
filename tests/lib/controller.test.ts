@@ -1046,6 +1046,79 @@ describe("comparison state and persistence boundaries", () => {
   });
 
   it.each([
+    ["success", "search"],
+    ["failure", "search"],
+    ["success", "write"],
+    ["failure", "write"],
+  ] as const)(
+    "ignores a dismissed modal settings %s while a newer %s remains pending",
+    async (outcome, operation) => {
+      const initial = list();
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      let finishOld: (() => void) | undefined;
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishOld = () => {
+              if (outcome === "success")
+                resolve({
+                  braveConfigured: false,
+                  ollamaConfigured: false,
+                  defaultProvider: "brave",
+                });
+              else reject(new Error("古い設定の読み込みに失敗しました"));
+            };
+          }),
+      );
+      await controller.initialize();
+      const oldOpen = controller.openModal({ kind: "image", itemId: 11 });
+      controller.closeModal();
+      const currentSettings = {
+        braveConfigured: false,
+        ollamaConfigured: true,
+        defaultProvider: "ollama" as const,
+      };
+      api.searchSettings.mockResolvedValue(currentSettings);
+      await controller.openModal({ kind: "image", itemId: 12 });
+      let finishCurrent: (() => void) | undefined;
+      let pending: Promise<void>;
+      if (operation === "search") {
+        api.searchImages.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishCurrent = () => resolve([]);
+            }),
+        );
+        pending = controller.searchImages();
+      } else {
+        api.setLocalImage.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishCurrent = () => resolve(initial);
+            }),
+        );
+        pending = controller.changeImage("local");
+      }
+      if (!finishOld || !finishCurrent) throw new Error("Both operations must have started");
+      finishOld();
+      await oldOpen;
+      expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
+      expect(controller.state.settings).toEqual(currentSettings);
+      expect(controller.state.provider).toBe("ollama");
+      expect(controller.state.busy).toBe(true);
+      expect(controller.state.error).toBe("");
+      if (operation === "write") {
+        controller.closeModal();
+        expect(controller.state.modal).toEqual({ kind: "image", itemId: 12 });
+      }
+      finishCurrent();
+      await pending;
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it.each([
     ["result", "before"],
     ["error", "before"],
     ["result", "after"],

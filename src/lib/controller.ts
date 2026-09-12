@@ -32,7 +32,7 @@ export type AppState = {
   settings: SearchSettings | null;
   candidates: ImageCandidate[];
   searched: boolean;
-  searching: boolean;
+  imageReadPending: boolean;
   provider: SearchProvider;
   drafts: { name: string; items: string; query: string; braveKey: string; ollamaKey: string };
 };
@@ -66,12 +66,12 @@ export class AppController {
     settings: null,
     candidates: [],
     searched: false,
-    searching: false,
+    imageReadPending: false,
     provider: "brave",
     drafts: { name: "", items: "", query: "", braveKey: "", ollamaKey: "" },
   };
 
-  private imageSearch: symbol | null = null;
+  private imageRead: symbol | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -174,17 +174,21 @@ export class AppController {
     this.state.candidates = [];
     this.state.searched = false;
     if (modal.kind === "image") {
-      await this.perform(async () => {
-        await this.loadSettings();
-      });
+      await this.performImageRead(
+        () => this.api.searchSettings(),
+        (settings) => {
+          this.state.settings = settings;
+          this.state.provider = settings.defaultProvider;
+        },
+      );
     } else this.changed();
   }
 
   closeModal(): void {
-    if (this.state.busy && !this.state.searching) return;
-    if (this.state.searching) {
-      this.imageSearch = null;
-      this.state.searching = false;
+    if (this.state.busy && !this.state.imageReadPending) return;
+    if (this.state.imageReadPending) {
+      this.imageRead = null;
+      this.state.imageReadPending = false;
       this.state.busy = false;
     }
     this.state.modal = null;
@@ -383,27 +387,39 @@ export class AppController {
   async searchImages(): Promise<void> {
     const query = this.state.drafts.query.trim();
     if (this.state.busy || !query || this.state.modal?.kind !== "image") return;
-    const search = Symbol();
-    this.imageSearch = search;
-    this.state.busy = true;
-    this.state.searching = true;
-    this.state.error = "";
-    this.state.notice = "";
     this.state.candidates = [];
     this.state.searched = false;
+    await this.performImageRead(
+      () => this.api.searchImages(this.state.provider, query),
+      (candidates) => {
+        this.state.candidates = candidates;
+        this.state.searched = true;
+      },
+    );
+  }
+
+  private async performImageRead<T>(
+    load: () => Promise<T>,
+    accept: (result: T) => void,
+  ): Promise<void> {
+    if (this.state.busy) return;
+    const request = Symbol();
+    this.imageRead = request;
+    this.state.busy = true;
+    this.state.imageReadPending = true;
+    this.state.error = "";
+    this.state.notice = "";
     this.changed();
     try {
-      const candidates = await this.api.searchImages(this.state.provider, query);
-      if (this.imageSearch !== search) return;
-      this.state.candidates = candidates;
-      this.state.searched = true;
+      const result = await load();
+      if (this.imageRead === request) accept(result);
     } catch (error) {
-      if (this.imageSearch === search) this.state.error = errorMessage(error);
+      if (this.imageRead === request) this.state.error = errorMessage(error);
     } finally {
       // A dismissed read must not update a reopened dialog or release a later operation.
-      if (this.imageSearch === search) {
-        this.imageSearch = null;
-        this.state.searching = false;
+      if (this.imageRead === request) {
+        this.imageRead = null;
+        this.state.imageReadPending = false;
         this.state.busy = false;
         this.changed();
       }

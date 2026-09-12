@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -202,6 +202,16 @@ impl Database {
                 [path],
                 |row| row.get(0),
             )
+            .map_err(db_error)
+    }
+
+    pub fn image_paths(&self) -> Result<HashSet<String>, String> {
+        self.connection
+            .prepare("SELECT image_path FROM items WHERE image_path IS NOT NULL AND deleted = 0")
+            .map_err(db_error)?
+            .query_map([], |row| row.get(0))
+            .map_err(db_error)?
+            .collect::<Result<_, _>>()
             .map_err(db_error)
     }
 

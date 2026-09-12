@@ -303,7 +303,12 @@ pub fn run() {
             let database = directory
                 .clone()
                 .and_then(|path| Database::open(&path.join("pairrank.sqlite3")));
-            let images = directory.and_then(ImageService::new).map(Arc::new);
+            let images = directory
+                .and_then(|path| {
+                    let database = database.as_ref().map_err(Clone::clone)?;
+                    ImageService::open(path, database)
+                })
+                .map(Arc::new);
             app.manage(Backend {
                 database: Arc::new(Mutex::new(database)),
                 images,

@@ -249,6 +249,81 @@ describe("desktop app interaction", () => {
     expect(root.querySelectorAll(".item-row")).toHaveLength(1);
   });
 
+  it.each([
+    ["create list", '[data-action="create-list"]', "save"],
+    ["rename list", '[data-action="rename-list"]', "save"],
+    ["rename item", '[data-action="rename-item"][data-id="10"]', "save"],
+    ["image", '[data-action="image"][data-id="10"]', "image"],
+    ["delete list", '[data-action="delete-list"]', "Escape"],
+    ["delete item", '[data-action="delete-item"][data-id="10"]', "cancel"],
+  ] as const)(
+    "returns focus to the %s dialog's opener after it closes",
+    async (_name, opener, completion) => {
+      const { root, controller } = setup();
+      await controller.initialize();
+      await click(root, controller, opener);
+      if (completion === "save") {
+        controller.state.drafts.name = "保存する名前";
+        await controller.saveName();
+      } else if (completion === "image") {
+        await click(root, controller, '[data-action="no-image"]');
+      } else if (completion === "Escape") {
+        const dialog = root.querySelector("dialog");
+        if (!dialog) throw new Error("Missing deletion dialog");
+        dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+      } else {
+        await click(root, controller, '[data-action="close-modal"]');
+      }
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button(root, opener));
+    },
+  );
+
+  it.each(["item", "list"] as const)(
+    "uses a safe focus fallback when the originating %s is deleted",
+    async (deleted) => {
+      const { root, controller, api, state } = setup();
+      await controller.initialize();
+      if (deleted === "item") {
+        await click(root, controller, '[data-action="delete-item"][data-id="10"]');
+        api.deleteItem.mockResolvedValueOnce({
+          ...state,
+          items: state.items.filter((item) => item.id !== 10),
+        });
+      } else {
+        await click(root, controller, '[data-action="delete-list"]');
+        const remaining = { ...state, id: 2, name: "残りのリスト", items: [] };
+        api.listSummaries.mockResolvedValueOnce([
+          { id: 2, name: remaining.name, itemCount: 0, comparisonCount: 0, converged: false },
+        ]);
+        api.getList.mockResolvedValueOnce(remaining);
+      }
+      await click(root, controller, '[data-action="confirm-delete"]');
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(root);
+    },
+  );
+
+  it.each(["cancel", "save"] as const)(
+    "tracks the welcome create button separately from the sidebar when closing with %s",
+    async (completion) => {
+      const { root, controller, api } = setup();
+      api.listSummaries.mockResolvedValueOnce([]);
+      await controller.initialize();
+      const selector = '.welcome [data-action="create-list"]';
+      await click(root, controller, selector);
+      if (completion === "save") {
+        controller.state.drafts.name = "新しいリスト";
+        await controller.saveName();
+        expect(root.querySelector(selector)).toBeNull();
+        expect(document.activeElement).toBe(root);
+      } else {
+        await click(root, controller, '[data-action="close-modal"]');
+        expect(document.activeElement).toBe(button(root, selector));
+      }
+    },
+  );
+
   it("keeps a created list selectable when refreshing the sidebar fails", async () => {
     const { root, controller, api, state } = setup();
     const created: ListState = { ...state, id: 2, name: "新しいリスト", items: [] };
@@ -371,9 +446,14 @@ describe("desktop app interaction", () => {
     expect(api.setRemoteImage).not.toHaveBeenCalled();
   });
 
-  it.each(["close button", "Escape"] as const)(
-    "dismisses a pending image search with %s and ignores its late failure",
-    async (dismissal) => {
+  it.each([
+    ["image search", "close button"],
+    ["image search", "Escape"],
+    ["settings lookup", "close button"],
+    ["settings lookup", "Escape"],
+  ] as const)(
+    "dismisses a pending %s with %s and ignores its late failure",
+    async (request, dismissal) => {
       const { root, controller, api, state } = setup();
       api.searchSettings.mockResolvedValue({
         braveConfigured: true,
@@ -381,15 +461,19 @@ describe("desktop app interaction", () => {
         defaultProvider: "brave",
       });
       await controller.initialize();
-      await click(root, controller, '[data-action="image"][data-id="10"]');
-      let rejectSearch: ((error: Error) => void) | undefined;
-      api.searchImages.mockImplementationOnce(
-        () =>
-          new Promise((_, reject) => {
-            rejectSearch = reject;
-          }),
-      );
-      const pending = controller.searchImages();
+      let rejectRead: ((error: Error) => void) | undefined;
+      const read = new Promise<never>((_, reject) => {
+        rejectRead = reject;
+      });
+      let pending: Promise<void>;
+      if (request === "settings lookup") {
+        api.searchSettings.mockReturnValueOnce(read);
+        pending = controller.openModal({ kind: "image", itemId: 10 });
+      } else {
+        await click(root, controller, '[data-action="image"][data-id="10"]');
+        api.searchImages.mockReturnValueOnce(read);
+        pending = controller.searchImages();
+      }
       expect(controller.state.busy).toBe(true);
       expect(button(root, '[data-action="local-image"]').disabled).toBe(true);
       if (dismissal === "close button") button(root, '[data-action="close-modal"]').click();
@@ -401,8 +485,8 @@ describe("desktop app interaction", () => {
       expect(root.querySelector("dialog")).toBeNull();
       expect(controller.state.busy).toBe(false);
       await controller.navigate("ranking");
-      if (!rejectSearch) throw new Error("The search was not started");
-      rejectSearch(new Error("古い検索に失敗しました"));
+      if (!rejectRead) throw new Error("The read was not started");
+      rejectRead(new Error("古い読み込みに失敗しました"));
       await pending;
       expect(controller.state.view).toBe("ranking");
       expect(controller.state.active).toEqual(state);

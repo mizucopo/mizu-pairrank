@@ -1,7 +1,7 @@
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { api } from "./lib/api.js";
 import { AppController, answers } from "./lib/controller.js";
-import type { AppState } from "./lib/controller.js";
+import type { AppState, Modal } from "./lib/controller.js";
 import type { AppApi, SearchProvider } from "./lib/types.js";
 import { renderApp } from "./lib/view.js";
 
@@ -21,6 +21,32 @@ export function mountApp(
 ): AppController {
   root.tabIndex = -1;
   const controller = new AppController(backend, render);
+  let modalOpener: {
+    action: string;
+    itemId: string | undefined;
+    listId: number | null;
+    index: number;
+  } | null = null;
+  let dialogWasOpen = false;
+  let restoreModalFocus = false;
+  function matchingButtons(action: string, itemId: string | undefined): HTMLButtonElement[] {
+    return Array.from(root.querySelectorAll<HTMLButtonElement>("button[data-action]")).filter(
+      (button) => button.dataset.action === action && button.dataset.id === itemId,
+    );
+  }
+  async function openModal(modal: Exclude<Modal, null>, button: HTMLButtonElement): Promise<void> {
+    const action = button.dataset.action;
+    if (controller.state.busy || !action) return;
+    const itemId = button.dataset.id;
+    modalOpener = {
+      action,
+      itemId,
+      listId: action === "create-list" ? null : (controller.state.active?.id ?? null),
+      index: matchingButtons(action, itemId).indexOf(button),
+    };
+    restoreModalFocus = false;
+    await controller.openModal(modal);
+  }
   function render(): void {
     const focus = document.activeElement;
     const focusKey = focus instanceof HTMLElement ? focus.dataset.focus : undefined;
@@ -37,6 +63,8 @@ export function mountApp(
       ),
     );
     const dialog = root.querySelector("dialog");
+    if (dialogWasOpen && !dialog) restoreModalFocus = true;
+    dialogWasOpen = Boolean(dialog);
     if (dialog instanceof HTMLDialogElement) {
       dialog.showModal();
       dialog.addEventListener("cancel", (event) => {
@@ -53,6 +81,17 @@ export function mountApp(
       ) {
         element.setSelectionRange(selection[0], selection[1]);
       }
+    }
+    if (!dialog && restoreModalFocus && !controller.state.busy) {
+      const opener = modalOpener;
+      modalOpener = null;
+      restoreModalFocus = false;
+      let button: HTMLButtonElement | undefined;
+      if (opener && (opener.listId === null || opener.listId === controller.state.active?.id)) {
+        button = matchingButtons(opener.action, opener.itemId)[opener.index];
+      }
+      if (button && !button.disabled) button.focus({ preventScroll: true });
+      else root.focus({ preventScroll: true });
     }
     // Rendering replaces the clicked button. Keep shortcut events inside the app.
     if (!dialog && !root.contains(document.activeElement)) {
@@ -115,22 +154,22 @@ export function mountApp(
         void controller.selectList(id);
         break;
       case "create-list":
-        void controller.openModal({ kind: "create-list" });
+        void openModal({ kind: "create-list" }, button);
         break;
       case "rename-list":
-        void controller.openModal({ kind: "rename-list" });
+        void openModal({ kind: "rename-list" }, button);
         break;
       case "delete-list":
-        void controller.openModal({ kind: "delete-list" });
+        void openModal({ kind: "delete-list" }, button);
         break;
       case "rename-item":
-        void controller.openModal({ kind: "rename-item", itemId: id });
+        void openModal({ kind: "rename-item", itemId: id }, button);
         break;
       case "delete-item":
-        void controller.openModal({ kind: "delete-item", itemId: id });
+        void openModal({ kind: "delete-item", itemId: id }, button);
         break;
       case "image":
-        void controller.openModal({ kind: "image", itemId: id });
+        void openModal({ kind: "image", itemId: id }, button);
         break;
       case "close-modal":
         controller.closeModal();

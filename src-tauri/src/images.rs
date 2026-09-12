@@ -305,6 +305,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 
 pub struct ImageService {
     directory: PathBuf,
+    storage_lease: Arc<std::fs::File>,
     credentials: Arc<dyn CredentialStore>,
     transport: Arc<dyn ImageTransport>,
     decode_gate: Arc<Mutex<()>>,
@@ -312,7 +313,19 @@ pub struct ImageService {
 }
 
 impl ImageService {
+    pub fn open(app_data: PathBuf, database: &crate::database::Database) -> Result<Self, String> {
+        Self::open_storage(app_data, Some(database))
+    }
+
+    #[cfg(test)]
     pub fn new(app_data: PathBuf) -> Result<Self, String> {
+        Self::open_storage(app_data, None)
+    }
+
+    fn open_storage(
+        app_data: PathBuf,
+        database: Option<&crate::database::Database>,
+    ) -> Result<Self, String> {
         let directory = app_data.join("images");
         crate::storage::create_private_directory(&directory)
             .map_err(|_| "画像の保存フォルダーを作成できませんでした。".to_owned())?;
@@ -324,8 +337,32 @@ impl ImageService {
         #[cfg(unix)]
         restrict_image_permissions(&directory)
             .map_err(|_| "保存済み画像の権限を設定できませんでした。".to_owned())?;
+        let storage_lease = image_storage_lock(&app_data)
+            .map_err(|_| "画像の保存先ロックを開けませんでした。".to_owned())?;
+        match storage_lease.try_lock() {
+            Ok(()) => {
+                if let Some(database) = database {
+                    // Read the complete reference set before deleting anything. No other
+                    // ImageService can import or associate files while this lock is exclusive.
+                    let references = database.image_paths()?;
+                    reconcile_images(&directory, &references)
+                        .map_err(|_| "未使用画像を確認できませんでした。".to_owned())?;
+                }
+                storage_lease
+                    .unlock()
+                    .map_err(|_| "画像の保存先ロックを解除できませんでした。".to_owned())?;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(_) => return Err("画像の保存先をロックできませんでした。".to_owned()),
+        }
+        // Keep every live instance protected, including the interval between saving a
+        // PNG and committing its reference. Reconcile on the next standalone startup.
+        storage_lease
+            .lock_shared()
+            .map_err(|_| "画像の保存先をロックできませんでした。".to_owned())?;
         Ok(Self {
             directory,
+            storage_lease: Arc::new(storage_lease),
             credentials: Arc::new(SystemCredentials),
             transport: Arc::new(HttpTransport),
             decode_gate: Arc::new(Mutex::new(())),
@@ -503,9 +540,11 @@ impl ImageService {
         let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
         let directory = self.directory.clone();
         let decode_gate = self.decode_gate.clone();
+        let storage_lease = self.storage_lease.clone();
         tokio::task::spawn_blocking(move || {
             // Keep the encoded buffer charged even if the invoking future is cancelled.
             let _buffer_permit = buffer_permit;
+            let _storage_lease = storage_lease;
             let bytes = resource.bytes;
             let _permit = decode_gate
                 .lock()
@@ -536,6 +575,75 @@ impl ImageService {
             .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
         save_image(&self.directory, &bytes, None)
     }
+}
+
+fn image_storage_lock(app_data: &Path) -> std::io::Result<std::fs::File> {
+    let path = app_data.join(".images.lock");
+    match crate::storage::create_private_file(&path) {
+        Ok(file) => {
+            file.sync_all()?;
+            sync_directory(app_data)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::symlink_metadata(&path)?.is_file() {
+                return Err(std::io::Error::other(
+                    "image storage lock is not a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            crate::storage::restrict_existing_file(&path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn reconcile_images(directory: &Path, references: &HashSet<String>) -> std::io::Result<()> {
+    let pinned = open_image_directory(directory)?;
+    let identity = same_file::Handle::from_file(pinned.try_clone()?.into_std_file())?;
+    if !std::fs::symlink_metadata(directory)?.is_dir()
+        || directory.canonicalize()? != directory
+        || same_file::Handle::from_path(directory)? != identity
+    {
+        return Err(std::io::Error::other(
+            "image storage directory was replaced",
+        ));
+    }
+    let mut removed = false;
+    for entry in pinned.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = directory.join(&name);
+        if !entry.file_type()?.is_file() || !is_managed_image_name(&path) {
+            continue;
+        }
+        if name.to_str().is_some_and(|name| references.contains(name))
+            || path.to_str().is_some_and(|path| references.contains(path))
+        {
+            continue;
+        }
+        match pinned.remove_file(name) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed {
+        #[cfg(unix)]
+        pinned.into_std_file().sync_all()?;
+    }
+    Ok(())
+}
+
+fn open_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    // A readable Unix handle supports fsync; Windows denies delete sharing.
+    #[cfg(unix)]
+    return std::fs::File::open(directory).map(cap_std::fs::Dir::from_std_file);
+    #[cfg(not(unix))]
+    cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
 }
 
 fn is_managed_image_name(path: &Path) -> bool {
@@ -766,16 +874,8 @@ fn save_image_with(
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
     // All creation, synchronization and rollback stay relative to this open directory.
-    let pinned = {
-        // Use a readable handle on Unix: cap-std's Linux O_PATH handle cannot be fsynced.
-        #[cfg(unix)]
-        let opened = std::fs::File::open(directory).map(cap_std::fs::Dir::from_std_file);
-        // cap-std holds Windows directories without delete sharing to prevent rename races.
-        #[cfg(not(unix))]
-        let opened = cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority());
-        opened
-    }
-    .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
+    let pinned = open_image_directory(directory)
+        .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
     let directory_handle = pinned
         .try_clone()
         .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?
@@ -848,6 +948,116 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_reconciliation_rejects_a_directory_replaced_before_opening_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let canonical = service.directory.clone();
+        let external_file = external.path().join(format!("{}.png", Uuid::new_v4()));
+        std::fs::write(&external_file, b"external image").unwrap();
+        std::fs::rename(&canonical, directory.path().join("previous-images")).unwrap();
+        std::os::unix::fs::symlink(external.path(), &canonical).unwrap();
+        assert!(reconcile_images(&canonical, &HashSet::new()).is_err());
+        assert_eq!(std::fs::read(external_file).unwrap(), b"external image");
+    }
+
+    #[test]
+    fn startup_reconciles_interrupted_imports_and_preserves_referenced_and_unmanaged_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut database =
+            crate::database::Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let service = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        let current = service.import_local(source.clone()).unwrap();
+        let mut legacy = service.import_local(source.clone()).unwrap();
+        let orphan = service.import_local(source.clone()).unwrap();
+        let current_path = service.directory.join(&current.path);
+        let legacy_path = service.directory.join(&legacy.path);
+        let orphan_path = service.directory.join(&orphan.path);
+        legacy.path = legacy_path.to_str().unwrap().to_owned();
+        let unrelated = service.directory.join("user-picture.png");
+        std::fs::write(&unrelated, b"unmanaged").unwrap();
+        let subdirectory = service.directory.join(format!("{}.png", Uuid::new_v4()));
+        std::fs::create_dir(&subdirectory).unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = service.directory.join(format!("{}.png", Uuid::new_v4()));
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            link
+        };
+        let list = database.create_list("Images".into()).unwrap();
+        let list = database
+            .add_items(list.id, vec!["Current".into(), "Legacy".into()])
+            .unwrap();
+        database
+            .set_image(list.id, list.items[0].id, Some(current))
+            .unwrap();
+        database
+            .set_image(list.id, list.items[1].id, Some(legacy))
+            .unwrap();
+        drop(service); // The PNG was flushed but its association never committed.
+
+        let _reopened = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        assert!(!orphan_path.exists());
+        assert!(current_path.exists());
+        assert!(legacy_path.exists());
+        assert!(subdirectory.is_dir());
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unmanaged");
+        assert_eq!(std::fs::read(source).unwrap(), png(2, 2));
+    }
+
+    #[test]
+    fn startup_defers_reconciliation_while_another_instance_can_associate_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut database =
+            crate::database::Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let first = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        let pending = first.import_local(source.clone()).unwrap();
+        let orphan = first.import_local(source).unwrap();
+        let pending_path = first.directory.join(&pending.path);
+        let orphan_path = first.directory.join(&orphan.path);
+        let second = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        assert!(pending_path.exists());
+        assert!(orphan_path.exists());
+        let list = database.create_list("Images".into()).unwrap();
+        let list = database.add_items(list.id, vec!["Item".into()]).unwrap();
+        database
+            .set_image(list.id, list.items[0].id, Some(pending))
+            .unwrap();
+        drop(first);
+        drop(second);
+
+        let _reopened = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        assert!(pending_path.exists());
+        assert!(!orphan_path.exists());
+    }
+
+    #[test]
+    fn startup_preserves_all_images_when_database_references_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("test.sqlite3");
+        let database = crate::database::Database::open(&database_path).unwrap();
+        let service = ImageService::open(directory.path().to_owned(), &database).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let orphan = service.import_local(source).unwrap();
+        let orphan_path = service.directory.join(orphan.path);
+        drop(service);
+        rusqlite::Connection::open(database_path)
+            .unwrap()
+            .execute_batch("DROP TABLE items")
+            .unwrap();
+        assert!(ImageService::open(directory.path().to_owned(), &database).is_err());
+        assert!(orphan_path.exists());
+    }
 
     #[test]
     fn saved_image_reference_is_independent_of_the_storage_directory() {
@@ -1218,6 +1428,7 @@ mod tests {
         });
         let service = ImageService {
             directory: directory.path().canonicalize().unwrap(),
+            storage_lease: Arc::new(tempfile::tempfile().unwrap()),
             credentials: Arc::new(MemoryCredentials::default()),
             transport: transport.clone(),
             decode_gate: Arc::new(Mutex::new(())),

@@ -124,7 +124,7 @@ function modalView(s: AppState): string {
     title = modal.kind === "create-list" ? "新しいリスト" : "名前を変更";
     body = `<form data-form="save-name"><label for="name-input">${modal.kind === "rename-item" ? "項目名" : "リスト名"}</label><input id="name-input" data-draft="name" data-focus="name" value="${e(s.drafts.name)}" placeholder="例：好きなゲーム" required autofocus${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>${modal.kind === "create-list" ? "作成" : "保存"}</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div></form>`;
   }
-  return `<dialog id="app-dialog" class="${modal.kind === "image" ? "wide" : ""}" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title">${e(title)}</h2><button class="close-button" data-action="close-modal" aria-label="閉じる"${s.searching ? "" : disabled(s)}>×</button></div>${s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${body}</dialog>`;
+  return `<dialog id="app-dialog" class="${modal.kind === "image" ? "wide" : ""}" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title">${e(title)}</h2><button class="close-button" data-action="close-modal" aria-label="閉じる"${s.imageReadPending ? "" : disabled(s)}>×</button></div>${s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${body}</dialog>`;
 }
 export function renderApp(s: AppState, assetUrl: (path: string) => string): string {
   if (s.fatal)
