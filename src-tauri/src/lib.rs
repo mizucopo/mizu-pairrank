@@ -13,10 +13,13 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
+const MAX_IMAGE_RESPONSES: usize = 4;
+
 struct Backend {
     database: Arc<Mutex<Result<Database, String>>>,
     database_slots: Arc<tokio::sync::Semaphore>,
     images: Result<Arc<ImageService>, String>,
+    image_response_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Backend {
@@ -66,6 +69,7 @@ impl Backend {
             database: Arc::new(Mutex::new(database)),
             database_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             images,
+            image_response_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IMAGE_RESPONSES)),
         }
     }
 
@@ -333,6 +337,36 @@ async fn remove_image(app: AppHandle, list_id: i64, item_id: i64) -> Result<List
         .await
 }
 
+async fn respond_to_image_request(
+    images: Result<Arc<ImageService>, String>,
+    slots: Arc<tokio::sync::Semaphore>,
+    request: tauri::http::Request<Vec<u8>>,
+    respond: impl FnOnce(tauri::http::Response<Vec<u8>>) + Send + 'static,
+) -> Result<(), tokio::task::JoinError> {
+    let Ok(permit) = slots.acquire_owned().await else {
+        respond(
+            tauri::http::Response::builder()
+                .status(503)
+                .body(Vec::new())
+                .unwrap(),
+        );
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || {
+        // Cancellation cannot release capacity while this worker still owns the response.
+        let _permit = permit;
+        let response = match images {
+            Ok(service) => service.image_response(&request),
+            Err(_) => tauri::http::Response::builder()
+                .status(503)
+                .body(Vec::new())
+                .unwrap(),
+        };
+        respond(response);
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -340,17 +374,13 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol(
             "pairrank-image",
             |context, request, responder| {
-                let images = context.app_handle().state::<Backend>().images.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let response = match images {
-                        Ok(service) => service.image_response(&request),
-                        Err(_) => tauri::http::Response::builder()
-                            .status(503)
-                            .body(Vec::new())
-                            .unwrap(),
-                    };
-                    responder.respond(response);
-                });
+                let backend = context.app_handle().state::<Backend>();
+                tauri::async_runtime::spawn(respond_to_image_request(
+                    backend.images.clone(),
+                    backend.image_response_slots.clone(),
+                    request,
+                    move |response| responder.respond(response),
+                ));
             },
         )
         .setup(|app| {
@@ -385,6 +415,243 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn image_request(path: &str, method: &str) -> tauri::http::Request<Vec<u8>> {
+        tauri::http::Request::builder()
+            .method(method)
+            .uri(format!("pairrank-image://localhost/{path}"))
+            .body(Vec::new())
+            .unwrap()
+    }
+
+    #[test]
+    fn image_requests_wait_before_spawning_workers() {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(MAX_IMAGE_RESPONSES + 1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_directory, backend) = backend();
+            let (_, _, image) = list_with_image(&backend).await;
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let mut releases = Vec::new();
+            let mut active = Vec::new();
+            let mut waiting = Vec::new();
+            for index in 0..MAX_IMAGE_RESPONSES * 3 {
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                releases.push(release);
+                let started = started.clone();
+                let job = respond_to_image_request(
+                    backend.images.clone(),
+                    backend.image_response_slots.clone(),
+                    image_request(&image.path, "GET"),
+                    move |response| {
+                        let _ = started.send(());
+                        let _ = wait.recv();
+                        assert_eq!(response.status(), tauri::http::StatusCode::OK);
+                        assert!(!response.body().is_empty());
+                    },
+                );
+                if index < MAX_IMAGE_RESPONSES {
+                    active.push(tokio::spawn(job));
+                } else {
+                    waiting.push(Box::pin(job));
+                }
+            }
+            for _ in 0..MAX_IMAGE_RESPONSES {
+                tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            for job in &mut waiting {
+                std::future::poll_fn(|cx| {
+                    assert!(job.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            let (database, unrelated) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    backend.database_job(|db| db.create_list("Still usable".into())),
+                ),
+                tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(|| 42),),
+            );
+            let extra_started = starts.try_recv().is_ok();
+            // Unblock every response before asserting, including when admission is broken.
+            drop(releases);
+            for job in active {
+                job.await.unwrap().unwrap();
+            }
+            for job in waiting {
+                job.await.unwrap();
+            }
+            assert!(database.is_ok_and(|result| result.is_ok()));
+            assert_eq!(unrelated.unwrap().unwrap(), 42);
+            assert!(!extra_started);
+        });
+    }
+
+    #[tokio::test]
+    async fn cancelled_image_requests_keep_capacity_until_the_response_finishes() {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let (_directory, mut backend) = backend();
+        backend.image_response_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, _, image) = list_with_image(&backend).await;
+        let (started, starts) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn(respond_to_image_request(
+            backend.images.clone(),
+            backend.image_response_slots.clone(),
+            image_request(&image.path, "GET"),
+            move |response| {
+                let _ = started.send(());
+                let _ = wait.recv();
+                assert_eq!(response.status(), tauri::http::StatusCode::OK);
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), starts)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let (responded, response) = tokio::sync::oneshot::channel();
+        let mut cancelled = Box::pin(respond_to_image_request(
+            backend.images.clone(),
+            backend.image_response_slots.clone(),
+            image_request(&image.path, "GET"),
+            move |_| {
+                let _ = responded.send(());
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
+        let cancelled_response = tokio::time::timeout(Duration::from_secs(2), response).await;
+
+        let next = respond_to_image_request(
+            backend.images.clone(),
+            backend.image_response_slots.clone(),
+            image_request(&image.path, "HEAD"),
+            |response| {
+                assert_eq!(response.status(), tauri::http::StatusCode::OK);
+                assert!(response.body().is_empty());
+            },
+        );
+        tokio::pin!(next);
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut next).await;
+        drop(release);
+        assert!(cancelled_response.is_ok_and(|result| result.is_err()));
+        assert!(early.is_err());
+        tokio::time::timeout(Duration::from_secs(2), next)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_request_capacity_is_reusable_after_errors_and_panics() {
+        use tauri::http::StatusCode;
+        use tokio::time::{Duration, timeout};
+
+        let (_directory, mut backend) = backend();
+        backend.image_response_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, _, image) = list_with_image(&backend).await;
+        let missing = format!("{}.png", uuid::Uuid::new_v4());
+        for (images, path, status) in [
+            (
+                backend.images.clone(),
+                missing.as_str(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                backend.images.clone(),
+                "external.png",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Err("unavailable".into()),
+                &image.path,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            timeout(
+                Duration::from_secs(2),
+                respond_to_image_request(
+                    images,
+                    backend.image_response_slots.clone(),
+                    image_request(path, "GET"),
+                    move |response| {
+                        assert_eq!(response.status(), status);
+                        assert!(response.body().is_empty());
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let panic = timeout(
+            Duration::from_secs(2),
+            respond_to_image_request(
+                backend.images.clone(),
+                backend.image_response_slots.clone(),
+                image_request(&image.path, "GET"),
+                |_| panic!("injected response failure"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(panic.unwrap_err().is_panic());
+        for method in ["GET", "HEAD"] {
+            timeout(
+                Duration::from_secs(2),
+                respond_to_image_request(
+                    backend.images.clone(),
+                    backend.image_response_slots.clone(),
+                    image_request(&image.path, method),
+                    move |response| {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.headers()["content-type"], "image/png");
+                        assert_eq!(response.body().is_empty(), method == "HEAD");
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        backend.image_response_slots.close();
+        timeout(
+            Duration::from_secs(2),
+            respond_to_image_request(
+                backend.images.clone(),
+                backend.image_response_slots.clone(),
+                image_request(&image.path, "GET"),
+                |response| {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert!(response.body().is_empty());
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     #[test]
     fn cancelled_database_requests_do_not_occupy_workers_waiting_for_the_mutex() {
@@ -550,6 +817,7 @@ mod tests {
                 database: Arc::new(Mutex::new(Ok(database))),
                 database_slots: Arc::new(tokio::sync::Semaphore::new(1)),
                 images: Ok(Arc::new(images)),
+                image_response_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IMAGE_RESPONSES)),
             },
         )
     }
