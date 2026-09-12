@@ -1,22 +1,52 @@
 # mizu-pairrank
 
-## Development
+ふたつの項目を比べて、自分の好みのランキングを作るデスクトップアプリです。
 
-Install dependencies and start the Tauri development app:
+## 使い方
+
+1. リストを作成し、項目名を追加します。改行区切りで一括登録できます。
+2. 必要に応じて、項目の「画像」からファイル登録・ネット検索・画像なしを選びます。
+3. 「比較する」で、Aが大好き / Aが好き / 同じ / Bが好き / Bが大好きのいずれかを回答します。キーボードの1〜5でも回答できます。
+4. 「ランキング」で現在の順位を確認します。条件を満たすと「順位ほぼ確定」に切り替わり、「比較を続ける」で再開できます。
+
+「大好き」は相手との好みの差が大きいことを意味します。5段階へ拡張したTrueSkillで評価と不確実性σを更新し、期待情報量の大きいペアを自動選択します。順位は推定評価μの順です。
+
+終了条件は、全項目のσが2.5以下、かつ直近max(20,項目数)回答の間に各項目の順位幅が1位以内になることです。新しい項目の追加・削除・比較再開で終了判定の履歴窓をリセットし、既存の評価は保持します。項目数に固定上限はありません。通常500項目未満を想定しています。
+
+## 画像検索
+
+「検索設定」にBrave Search APIまたはOllama Web SearchのAPIキーを登録します。両方登録して検索時に切り替えることもできます。
+
+- Brave: [APIダッシュボード](https://api-dashboard.search.brave.com/)でキーを取得します。画像検索の候補を表示します。
+- Ollama: [APIキー設定](https://ollama.com/settings/keys)でキーを取得します。検索結果のWebページから代表画像を取得します。
+
+APIキーはOSの資格情報ストアに保存します。検索には各サービスの料金・利用制限が適用されます。画像候補が取れないページは除外します。APIキーがなくても、手動登録・画像なしで利用できます。
+
+手動登録はPNG・JPEG・WebPに対応します。最大20MiB・32メガピクセルまで受け入れ、長辺1600px以下のPNGとしてアプリ内へ保存します。元ファイルは変更しません。取得済み画像はオフラインで表示できます。
+
+## 保存とアップデート
+
+Tauriのアプリデータ領域にpairrank.sqlite3とimagesディレクトリを保存します。macOSの通常の保存先は `~/Library/Application Support/dev.mizu.pairrank/` です。複数リストの項目・比較履歴・評価・終了判定の履歴は自動保存されます。
+
+macOSでは、復元した保存先に読み取り権限がなく安全に開けない場合、自動で権限を変更せず保存データの読み込みを停止します。保存先の所有者・読み取り権限を確認してから再起動してください。
+
+DBのスキーマバージョンを保持し、起動時に必要なマイグレーションを順番に自動適用します。変更はまとめて確定し、失敗した場合は更新前のスキーマ・データ・バージョンを維持します。新しいDBを古いアプリで開いた場合は、アプリの更新を案内して操作を停止します。
+
+開発時のスキーマ変更手順は[SQLiteと起動時マイグレーション](docs/adr/0002-sqlite-migrations.md)、評価の仕様は[5段階TrueSkill](docs/adr/0001-ordinal-trueskill.md)を参照してください。
+
+## Development
 
 ```bash
 npm ci
 npm run tauri dev
 ```
 
-Run the full quality check before handing off changes:
+`npm run dev` 単体ではViteのみが起動するため、保存・比較にはTauriから起動してください。
+
+全品質チェック:
 
 ```bash
 npm run check
 ```
 
-## TypeScript toolchain
-
-The project uses TypeScript 7 and type-aware Oxlint, following the repo-template
-toolchain. Run `npm run lint` for lint checks or `npm run check` for the full
-frontend and Rust quality gate.
+TypeScript 7・type-aware Oxlint・Prettier・Vitest・Viteビルドと、Rustのfmt・Clippy・テストを実行します。画像検索のテストはモックを利用し、実APIキーやOSの資格情報ストアにはアクセスしません。

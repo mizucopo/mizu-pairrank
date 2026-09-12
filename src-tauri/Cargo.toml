@@ -1,6 +1,6 @@
 [package]
 name = "mizu-pairrank"
-version = "0.2.2"
+version = "0.3.0"
 description = "mizu-pairrank"
 authors = ["\u307f\u305a"]
 edition = "2024"
@@ -13,6 +13,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-tauri = { version = "2.11.3", features = [] }
+tauri = { version = "2.11.3", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tauri-plugin-dialog = "2"
+rusqlite = { version = "0.39", features = ["bundled"] }
+puruspe = "0.4.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+scraper = "0.24"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
+rand = "0.9"
+base64 = "0.22"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+same-file = "1.0.6"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.39", features = ["trace"] }
+tempfile = "3"
