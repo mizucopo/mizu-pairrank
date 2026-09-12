@@ -98,44 +98,43 @@ fn create_private_directory_in_with(
     name: &std::ffi::OsStr,
     sync: &mut impl FnMut(&File) -> io::Result<()>,
 ) -> io::Result<cap_std::fs::Dir> {
+    use cap_std::fs::MetadataExt as _;
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
     validate_child_name(name)?;
-    {
-        use cap_std::fs::MetadataExt as _;
-        use rustix::fs::{Mode, OFlags, mkdirat, openat};
-        match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let expected = parent.symlink_metadata(name)?;
-        if !expected.is_dir() {
-            return Err(io::Error::other("managed directory is not a directory"));
-        }
-        let identity = (expected.dev(), expected.ino());
-        let opened = openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(io::Error::from);
-        let directory = match opened {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                restore_unreadable_entry(parent, name, identity, 0o700, false)?
-            }
-            Err(error) => return Err(error),
-        };
-        let metadata = directory.metadata()?;
-        verify_identity(&metadata, identity)?;
-        if metadata.permissions().mode() & 0o7777 != 0o700 {
-            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-        }
-        sync(&directory)?;
-        sync(&parent.try_clone()?.into_std_file())?;
-        Ok(cap_std::fs::Dir::from_std_file(directory))
+    match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
     }
+    let expected = parent.symlink_metadata(name)?;
+    if !expected.is_dir() {
+        return Err(io::Error::other("managed directory is not a directory"));
+    }
+    let identity = (expected.dev(), expected.ino());
+    let opened = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from);
+    let directory = match opened {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            restore_unreadable_entry(parent, name, identity, 0o700, false)?
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = directory.metadata()?;
+    verify_identity(&metadata, identity)?;
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    sync(&directory)?;
+    sync(&parent.try_clone()?.into_std_file())?;
+    Ok(cap_std::fs::Dir::from_std_file(directory))
 }
 
 pub(crate) fn directory_entries(

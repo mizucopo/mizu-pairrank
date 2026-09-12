@@ -296,11 +296,11 @@ unsafe fn open_file_inner(
             request.path.name == path.name
                 && std::sync::Arc::ptr_eq(&request.path._namespace, &path._namespace)
         });
-    let prepared = match requested
-        .map(PreparedOpen)
-        .map(Ok)
-        .unwrap_or_else(|| PreparedOpen::new(path.clone()))
-    {
+    let preparation = match requested {
+        Some(capture) => Ok(PreparedOpen(capture)),
+        None => PreparedOpen::new(path.clone()),
+    };
+    let prepared = match preparation {
         Ok(prepared) => prepared,
         Err(_) => return ffi::SQLITE_CANTOPEN,
     };

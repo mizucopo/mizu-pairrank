@@ -187,15 +187,15 @@ unsafe fn resolve_wide(path: *const u16) -> io::Result<Option<ResolvedPath>> {
 }
 
 fn set_error(error: io::Error) {
-    let code = error.raw_os_error().map_or_else(
-        || match error.kind() {
+    let code = match error.raw_os_error() {
+        Some(code) => code as u32,
+        None => match error.kind() {
             io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ERROR_INVALID_NAME,
             io::ErrorKind::NotFound => windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
             io::ErrorKind::Unsupported => ERROR_NOT_SUPPORTED,
             _ => ERROR_ACCESS_DENIED,
         },
-        |code| code as u32,
-    );
+    };
     // SAFETY: SetLastError accepts every DWORD error value.
     unsafe { SetLastError(code) };
 }
