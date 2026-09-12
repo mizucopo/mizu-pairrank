@@ -501,9 +501,9 @@ export class AppController {
   async saveKey(provider: SearchProvider, remove = false): Promise<void> {
     const field = provider === "brave" ? "braveKey" : "ollamaKey";
     const key = remove ? "" : this.state.drafts[field].trim();
-    if (!remove && !key) return;
     let committed = false;
     await this.perform(async () => {
+      if (!remove && !key) throw new Error("APIキーの形式が正しくありません。");
       await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
       this.state.notice = remove ? "APIキーを削除しました。" : "APIキーを保存しました。";

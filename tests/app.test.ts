@@ -87,6 +87,15 @@ function button(root: HTMLElement, selector: string): HTMLButtonElement {
   return element;
 }
 
+function withLocalImage(state: ListState): ListState {
+  return {
+    ...state,
+    items: state.items.map((item, index) =>
+      index === 0 ? { ...item, image: { path: "/images/picked.png", sourceUrl: null } } : item,
+    ),
+  };
+}
+
 async function settle(controller: AppController): Promise<void> {
   await vi.waitFor(() => expect(controller.state.busy).toBe(false));
 }
@@ -477,7 +486,8 @@ describe("desktop app interaction", () => {
       "searchImages",
     ],
   ] as const)("keeps focus in %s on %s when %s fails", async (opener, retrySelector, method) => {
-    const { root, controller, api } = setup();
+    const { root, controller, api, state } = setup();
+    if (method === "removeImage") api.getList.mockResolvedValueOnce(withLocalImage(state));
     api.searchSettings.mockResolvedValue({
       braveConfigured: true,
       ollamaConfigured: false,
@@ -556,7 +566,11 @@ describe("desktop app interaction", () => {
   ] as const)(
     "returns focus to the %s dialog's opener after it closes",
     async (_name, opener, completion) => {
-      const { root, controller } = setup();
+      const { root, controller, api, state } = setup();
+      if (completion === "image") {
+        api.getList.mockResolvedValueOnce(withLocalImage(state));
+        api.removeImage.mockResolvedValueOnce({ ...state, revision: state.revision + 1 });
+      }
       await controller.initialize();
       await click(root, controller, opener);
       if (completion === "save") {
@@ -723,17 +737,96 @@ describe("desktop app interaction", () => {
     },
   );
 
-  it("allows local images and no image while search API keys are unconfigured", async () => {
+  it("shows whitespace API-key validation, retains the form, and permits a corrected save", async () => {
     const { root, controller, api } = setup();
+    await controller.initialize();
+    await controller.navigate("settings");
+    const input = root.querySelector("#braveKey");
+    if (!(input instanceof HTMLInputElement)) throw new Error("Missing API key input");
+    input.value = "   ";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const selector = '[data-form="save-key"][data-provider="brave"] button[type="submit"]';
+    const submit = button(root, selector);
+    submit.focus();
+    submit.click();
+    await settle(controller);
+    expect(root.querySelector('[role="alert"]')?.textContent).toBe(
+      "APIキーの形式が正しくありません。",
+    );
+    expect(document.activeElement).toBe(button(root, selector));
+    const restored = root.querySelector("#braveKey");
+    if (!(restored instanceof HTMLInputElement)) throw new Error("Missing restored API key input");
+    expect(restored.value).toBe("   ");
+    expect(api.setApiKey).not.toHaveBeenCalled();
+    restored.value = "saved-key";
+    restored.dispatchEvent(new Event("input", { bubbles: true }));
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await click(root, controller, selector);
+    expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith("brave", "saved-key");
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(controller.state.settings?.braveConfigured).toBe(true);
+  });
+
+  it("disables the settings button until the image dialog's credential read finishes", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    let finish: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () =>
+            resolve({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
+        }),
+    );
+    const reading = controller.openModal({ kind: "image", itemId: 10 });
+    const selector = 'dialog [data-view="settings"]';
+    expect(button(root, selector).disabled).toBe(true);
+    button(root, selector).click();
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 10 });
+    finish();
+    await reading;
+    expect(button(root, selector).disabled).toBe(false);
+    await click(root, controller, selector);
+    expect(controller.state.view).toBe("settings");
+    expect(root.querySelector("dialog")).toBeNull();
+  });
+
+  it("does not offer an image removal mutation when the item already has no image", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    const remove = button(root, '[data-action="no-image"]');
+    expect(remove.disabled).toBe(true);
+    remove.click();
+    expect(api.removeImage).not.toHaveBeenCalled();
+    expect(controller.state.active).toEqual(state);
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 10 });
+  });
+
+  it("allows local images and no image while search API keys are unconfigured", async () => {
+    const { root, controller, api, state } = setup();
+    api.setLocalImage.mockResolvedValueOnce(
+      withLocalImage({ ...state, revision: state.revision + 1 }),
+    );
+    api.removeImage.mockResolvedValueOnce({ ...state, revision: state.revision + 2 });
     await controller.initialize();
     await click(root, controller, '[data-action="image"][data-id="10"]');
     expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
     expect(button(root, '[data-action="local-image"]').disabled).toBe(false);
+    expect(button(root, '[data-action="no-image"]').disabled).toBe(true);
     await click(root, controller, '[data-action="local-image"]');
     expect(api.setLocalImage).toHaveBeenCalledExactlyOnceWith(1, 10);
     await click(root, controller, '[data-action="image"][data-id="10"]');
+    expect(button(root, '[data-action="no-image"]').disabled).toBe(false);
     await click(root, controller, '[data-action="no-image"]');
     expect(api.removeImage).toHaveBeenCalledExactlyOnceWith(1, 10);
+    expect(controller.state.active?.items[0]?.image).toBeNull();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    expect(button(root, '[data-action="no-image"]').disabled).toBe(true);
     expect(api.searchImages).not.toHaveBeenCalled();
     expect(api.setApiKey).not.toHaveBeenCalled();
   });

@@ -315,7 +315,7 @@ pub struct ImageService {
     transport: Arc<dyn ImageTransport>,
     decode_gate: Arc<Mutex<()>>,
     buffer_slots: Arc<Semaphore>,
-    search_slots: Semaphore,
+    search_slots: Arc<Semaphore>,
     settings_slots: Arc<Semaphore>,
 }
 
@@ -397,7 +397,7 @@ impl ImageService {
             transport: Arc::new(HttpTransport),
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
-            search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
+            search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
         })
     }
@@ -566,15 +566,17 @@ impl ImageService {
         }
         // Keep completed previews bounded too: a dismissed invoke still runs natively.
         // Reject excess searches instead of retaining an unbounded queue of commands.
-        let _search = self
-            .search_slots
-            .try_acquire()
-            .map_err(|_| "画像検索が実行中です。少し待ってから再試行してください。".to_owned())?;
+        let search =
+            self.search_slots.clone().try_acquire_owned().map_err(|_| {
+                "画像検索が実行中です。少し待ってから再試行してください。".to_owned()
+            })?;
         let credentials = self.credentials.clone();
-        let key = tokio::task::spawn_blocking(move || credentials.get(provider))
-            .await
-            .map_err(|_| "APIキーを取得できませんでした。".to_owned())??
-            .ok_or_else(|| "選択した検索サービスのAPIキーを設定してください。".to_owned())?;
+        let (key, _search) =
+            tokio::task::spawn_blocking(move || (credentials.get(provider), search))
+                .await
+                .map_err(|_| "APIキーを取得できませんでした。".to_owned())?;
+        let key =
+            key?.ok_or_else(|| "選択した検索サービスのAPIキーを設定してください。".to_owned())?;
         let payload = self.transport.search(provider, &key, query).await?;
         let seeds = parse_search_response(provider, &payload)?;
         tokio::time::timeout(Duration::from_secs(90), self.prepare_candidates(seeds))
@@ -1853,6 +1855,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn startup_rejects_hardlinked_images_without_changing_external_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let directory = app_data.path().join("images");
+        std::fs::create_dir(&directory).unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(external.path(), b"external image").unwrap();
+        std::fs::set_permissions(external.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = directory.join(format!("{}.png", Uuid::new_v4()));
+        std::fs::hard_link(external.path(), &linked).unwrap();
+        let normal = directory.join(format!("{}.png", Uuid::new_v4()));
+        std::fs::write(&normal, png(2, 2)).unwrap();
+        std::fs::set_permissions(&normal, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = ImageService::new(app_data.path().to_owned());
+        assert_eq!(
+            std::fs::metadata(external.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert!(
+            result.is_err(),
+            "hardlinked images must not be permission-repaired"
+        );
+        std::fs::remove_file(linked).unwrap();
+        let _service = ImageService::new(app_data.path().to_owned()).unwrap();
+        assert_eq!(
+            std::fs::metadata(normal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(external.path()).unwrap(), b"external image");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn newly_imported_images_are_private_and_source_permissions_are_unchanged() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2019,10 +2060,75 @@ mod tests {
             transport: transport.clone(),
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
-            search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
+            search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
+    }
+
+    #[tokio::test]
+    async fn cancelled_searches_keep_capacity_until_the_keyring_workers_finish() {
+        struct BlockingCredentials {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            waits: Mutex<Vec<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl CredentialStore for BlockingCredentials {
+            fn get(&self, _: SearchProvider) -> Result<Option<String>, String> {
+                let wait = self.waits.lock().unwrap().pop();
+                if let Some(wait) = wait {
+                    self.started.send(()).unwrap();
+                    let _ = wait.recv();
+                }
+                Ok(Some("test-key".into()))
+            }
+            fn set(&self, _: SearchProvider, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let (_directory, mut service, _) = service(Ok(br#"{"results":[]}"#.to_vec()), vec![]);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (releases, waits): (Vec<_>, Vec<_>) =
+            (0..2).map(|_| std::sync::mpsc::channel()).unzip();
+        service.credentials = Arc::new(BlockingCredentials {
+            started,
+            waits: Mutex::new(waits),
+        });
+        let service = Arc::new(service);
+        for _ in 0..2 {
+            let search = tokio::spawn({
+                let service = service.clone();
+                async move { service.search(SearchProvider::Brave, "image".into()).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            search.abort();
+            assert!(search.await.unwrap_err().is_cancelled());
+        }
+        let extra = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.search(SearchProvider::Brave, "another".into()),
+        )
+        .await;
+        drop(releases); // Release workers even if the capacity assertion fails.
+        assert!(
+            extra.is_ok_and(
+                |result| result.is_err_and(|message| message.contains("画像検索が実行中"))
+            )
+        );
+        let candidates = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(candidates) = service.search(SearchProvider::Brave, "later".into()).await
+                {
+                    break candidates;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]

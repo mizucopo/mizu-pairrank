@@ -19,6 +19,54 @@ struct Backend {
 }
 
 impl Backend {
+    fn open_with(
+        directory: Result<std::path::PathBuf, String>,
+        mut checkpoint: impl FnMut(u8),
+    ) -> Self {
+        let directory = directory.and_then(|path| {
+            storage::PreparedAppData::open(path)
+                .map_err(|error| format!("保存先を作成できません: {error}"))
+        });
+        let verify = |directory: &storage::PreparedAppData| {
+            directory.verify().map_err(|_| {
+                "保存先が起動中に変更されました。アプリを再起動してください。".to_owned()
+            })
+        };
+        checkpoint(0);
+        let mut database = directory
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|directory| {
+                verify(directory)?;
+                let database = Database::open(&directory.path().join("pairrank.sqlite3"))?;
+                verify(directory)?;
+                Ok(database)
+            });
+        checkpoint(1);
+        let mut images = directory
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|directory| {
+                verify(directory)?;
+                let database = database.as_ref().map_err(Clone::clone)?;
+                let images = ImageService::open(directory.path().to_owned(), database)?;
+                verify(directory)?;
+                Ok(images)
+            })
+            .map(Arc::new);
+        checkpoint(2);
+        if let Ok(directory) = &directory
+            && let Err(error) = verify(directory)
+        {
+            database = Err(error.clone());
+            images = Err(error);
+        }
+        Self {
+            database: Arc::new(Mutex::new(database)),
+            images,
+        }
+    }
+
     async fn database_job<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Database) -> Result<T, String> + Send + 'static,
@@ -295,28 +343,8 @@ pub fn run() {
             },
         )
         .setup(|app| {
-            let directory = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| error.to_string())
-                .and_then(|path| {
-                    storage::create_private_directory(&path)
-                        .map_err(|error| format!("保存先を作成できません: {error}"))?;
-                    Ok(path)
-                });
-            let database = directory
-                .clone()
-                .and_then(|path| Database::open(&path.join("pairrank.sqlite3")));
-            let images = directory
-                .and_then(|path| {
-                    let database = database.as_ref().map_err(Clone::clone)?;
-                    ImageService::open(path, database)
-                })
-                .map(Arc::new);
-            app.manage(Backend {
-                database: Arc::new(Mutex::new(database)),
-                images,
-            });
+            let directory = app.path().app_data_dir().map_err(|error| error.to_string());
+            app.manage(Backend::open_with(directory, |_| {}));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -346,6 +374,46 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_initialization_rejects_app_data_replacement_between_child_stores() {
+        for phase in 0..=2 {
+            let root = tempfile::tempdir().unwrap();
+            let app_data = root.path().join("app-data");
+            let previous = root.path().join("previous-app-data");
+            let first = Backend::open_with(Ok(app_data.clone()), |_| {});
+            first
+                .database
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .create_list("Saved rankings".into())
+                .unwrap();
+            drop(first);
+            let contents = std::fs::read(app_data.join("pairrank.sqlite3")).unwrap();
+            let backend = Backend::open_with(Ok(app_data.clone()), |stage| {
+                if stage == phase {
+                    std::fs::rename(&app_data, &previous).unwrap();
+                    std::fs::create_dir(&app_data).unwrap();
+                    std::fs::write(app_data.join("keep"), b"replacement").unwrap();
+                }
+            });
+            assert!(backend.database.lock().unwrap().is_err(), "phase {phase}");
+            assert!(backend.images.is_err(), "phase {phase}");
+            assert!(!app_data.join("pairrank.sqlite3").exists());
+            assert!(!app_data.join("images").exists());
+            assert_eq!(
+                std::fs::read(previous.join("pairrank.sqlite3")).unwrap(),
+                contents
+            );
+            assert_eq!(
+                std::fs::read(app_data.join("keep")).unwrap(),
+                b"replacement"
+            );
+        }
+    }
 
     fn backend() -> (tempfile::TempDir, Backend) {
         let directory = tempfile::tempdir().unwrap();

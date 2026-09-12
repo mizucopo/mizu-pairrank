@@ -519,6 +519,28 @@ describe("settings navigation", () => {
 });
 
 describe("credential mutation acknowledgments", () => {
+  it.each(["brave", "ollama"] as const)(
+    "rejects a whitespace-only %s key without changing credentials and permits correction",
+    async (provider) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      const field = provider === "brave" ? "braveKey" : "ollamaKey";
+      controller.state.drafts[field] = " \t　 ";
+      await controller.saveKey(provider);
+      expect(controller.state.error).toBe("APIキーの形式が正しくありません。");
+      expect(controller.state.drafts[field]).toBe(" \t　 ");
+      expect(controller.state.busy).toBe(false);
+      expect(api.setApiKey).not.toHaveBeenCalled();
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      controller.state.drafts[field] = " saved-key ";
+      await controller.saveKey(provider);
+      expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, "saved-key");
+      expect(controller.state.error).toBe("");
+      expect(controller.state.drafts[field]).toBe("");
+    },
+  );
+
   it.each([false, true])(
     "clears the acknowledged provider error before a failed refresh (remove=%s)",
     async (remove) => {

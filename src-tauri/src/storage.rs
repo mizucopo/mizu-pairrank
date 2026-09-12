@@ -31,6 +31,49 @@ impl PreparedDatabaseFile {
     }
 }
 
+pub struct PreparedAppData {
+    path: std::path::PathBuf,
+    identity: same_file::Handle,
+}
+
+impl PreparedAppData {
+    pub fn open(path: std::path::PathBuf) -> io::Result<Self> {
+        #[cfg(unix)]
+        let expected = create_private_directory_with(
+            &path,
+            &mut |directory| File::open(directory)?.sync_all(),
+            |_| {},
+        )?;
+        #[cfg(not(unix))]
+        create_private_directory(&path)?;
+        let directory = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())?
+            .into_std_file();
+        #[cfg(unix)]
+        verify_identity(&directory.metadata()?, expected)?;
+        let prepared = Self {
+            path,
+            identity: same_file::Handle::from_file(directory)?,
+        };
+        prepared.verify()?;
+        Ok(prepared)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn verify(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if !fs::symlink_metadata(&self.path)?.is_dir() {
+            return Err(io::Error::other("app-data directory was replaced"));
+        }
+        if same_file::Handle::from_path(&self.path)? != self.identity {
+            return Err(io::Error::other("app-data directory was replaced"));
+        }
+        Ok(())
+    }
+}
+
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return create_private_directory_with_sync(path, &mut |directory| {
@@ -45,7 +88,7 @@ fn create_private_directory_with_sync(
     path: &Path,
     sync: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    create_private_directory_with(path, sync, |_| {})
+    create_private_directory_with(path, sync, |_| {}).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -53,7 +96,7 @@ fn create_private_directory_with(
     path: &Path,
     sync: &mut impl FnMut(&Path) -> io::Result<()>,
     mut checkpoint: impl FnMut(bool),
-) -> io::Result<()> {
+) -> io::Result<(u64, u64)> {
     create_directory_tree(path, sync)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -90,7 +133,7 @@ fn create_private_directory_with(
                 let name = path
                     .file_name()
                     .ok_or_else(|| io::Error::other("missing managed directory name"))?;
-                restore_unreadable_entry(&parent, name, identity, 0o700)?
+                restore_unreadable_entry(&parent, name, identity, 0o700, false)?
             }
             Err(error) => return Err(error),
         };
@@ -103,7 +146,7 @@ fn create_private_directory_with(
         return Err(io::Error::other("managed directory was replaced"));
     }
     verify_identity(&current, identity)?;
-    Ok(())
+    Ok(identity)
 }
 
 #[cfg(unix)]
@@ -165,7 +208,7 @@ fn restrict_existing_file_with(
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("missing managed filename"))?;
-    restrict_existing_file_in_with(&directory, name, checkpoint)
+    restrict_existing_file_in_with(&directory, name, false, checkpoint)
 }
 
 #[cfg(unix)]
@@ -173,13 +216,14 @@ pub(crate) fn restrict_existing_file_in(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    restrict_existing_file_in_with(directory, name, |_| {}).map(|_| ())
+    restrict_existing_file_in_with(directory, name, true, |_| {}).map(|_| ())
 }
 
 #[cfg(unix)]
 fn restrict_existing_file_in_with(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
+    single_link: bool,
     mut checkpoint: impl FnMut(bool),
 ) -> io::Result<(u64, u64)> {
     use cap_std::fs::MetadataExt as _;
@@ -191,6 +235,7 @@ fn restrict_existing_file_in_with(
             "managed file is not a regular file",
         ));
     }
+    verify_single_link(metadata.nlink(), single_link)?;
     checkpoint(false);
     let identity = (metadata.dev(), metadata.ino());
     if metadata.permissions().mode() & 0o7777 != 0o600 {
@@ -198,15 +243,27 @@ fn restrict_existing_file_in_with(
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 checkpoint(true);
-                restore_unreadable_entry(directory, name, identity, 0o600)?
+                restore_unreadable_entry(directory, name, identity, 0o600, single_link)?
             }
             Err(error) => return Err(error),
         };
-        verify_identity(&file.metadata()?, identity)?;
+        let metadata = file.metadata()?;
+        verify_identity(&metadata, identity)?;
+        verify_single_link(metadata.nlink(), single_link)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
     }
     Ok(identity)
+}
+
+#[cfg(unix)]
+fn verify_single_link(link_count: u64, required: bool) -> io::Result<()> {
+    if required && link_count != 1 {
+        return Err(io::Error::other(
+            "managed image must have exactly one hard link",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -240,6 +297,7 @@ fn restore_unreadable_entry(
     name: &std::ffi::OsStr,
     expected: (u64, u64),
     mode: u32,
+    single_link: bool,
 ) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags, openat};
     use std::os::fd::AsRawFd;
@@ -250,7 +308,9 @@ fn restore_unreadable_entry(
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?);
-    verify_identity(&pinned.metadata()?, expected)?;
+    let metadata = pinned.metadata()?;
+    verify_identity(&metadata, expected)?;
+    verify_single_link(metadata.nlink(), single_link)?;
     // chmod through this live descriptor targets the pinned inode, even after rename.
     let descriptor = format!("/proc/self/fd/{}", pinned.as_raw_fd());
     fs::set_permissions(&descriptor, fs::Permissions::from_mode(mode))?;
@@ -263,6 +323,7 @@ fn restore_unreadable_entry(
     name: &std::ffi::OsStr,
     _expected: (u64, u64),
     mode: u32,
+    _single_link: bool,
 ) -> io::Result<File> {
     // Without a descriptor, pathname chmod could change a replacement inode.
     Err(io::Error::new(
@@ -397,6 +458,29 @@ mod tests {
                 assert_eq!(repaired_mode, original_mode);
             }
             assert_eq!(fs::read(managed.join("saved")).unwrap(), b"saved");
+        }
+    }
+
+    #[test]
+    fn image_permission_repair_rejects_a_hardlink_created_after_metadata_validation() {
+        for original_mode in [0o644, 0o000] {
+            let directory = tempfile::tempdir().unwrap();
+            let name = std::ffi::OsStr::new("managed.png");
+            let managed = directory.path().join(name);
+            let external = directory.path().join("external.png");
+            fs::write(&managed, b"unchanged image").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            let pinned = cap_std::fs::Dir::from_std_file(File::open(directory.path()).unwrap());
+            let result = restrict_existing_file_in_with(&pinned, name, true, |repairing| {
+                if !repairing {
+                    fs::hard_link(&managed, &external).unwrap();
+                }
+            });
+            let external_mode = mode(&external);
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(result.is_err());
+            assert_eq!(external_mode, original_mode);
+            assert_eq!(fs::read(external).unwrap(), b"unchanged image");
         }
     }
 
