@@ -239,6 +239,97 @@ describe("desktop app interaction", () => {
     },
   );
 
+  it.each([
+    ["pending", "button"],
+    ["failed", "Escape"],
+  ] as const)(
+    "recovers %s settings after cancelling list creation with %s and restores focus and drafts",
+    async (initial, dismissal) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      controller.state.drafts.braveKey = "unsaved key";
+      let finishOld: () => void = () => {};
+      if (initial === "pending") {
+        api.searchSettings.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishOld = () =>
+                resolve({
+                  braveConfigured: false,
+                  ollamaConfigured: false,
+                  defaultProvider: "brave",
+                });
+            }),
+        );
+      } else api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
+      const firstRead = controller.navigate("settings");
+      if (initial === "failed") await firstRead;
+      const opener = '[data-action="create-list"]';
+      await click(root, controller, opener);
+      let finishCurrent: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishCurrent = () =>
+              resolve({
+                braveConfigured: true,
+                ollamaConfigured: false,
+                defaultProvider: "brave",
+              });
+          }),
+      );
+      if (dismissal === "button") button(root, '[data-action="close-modal"]').click();
+      else {
+        const dialog = root.querySelector("dialog");
+        if (!dialog) throw new Error("Missing create-list dialog");
+        dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+      }
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(controller.state.readPending).toBe("settings");
+      expect(button(root, '[data-action="select-list"][data-id="1"]').disabled).toBe(false);
+      finishCurrent();
+      await settle(controller);
+      finishOld();
+      await firstRead;
+      expect(root.querySelector(".settings-card .badge")?.textContent).toBe("設定済み");
+      expect(document.activeElement).toBe(button(root, opener));
+      const key = root.querySelector("#braveKey");
+      if (!(key instanceof HTMLInputElement)) throw new Error("Missing API key input");
+      expect(key.value).toBe("unsaved key");
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+    },
+  );
+
+  it("allows leaving the settings reload after modal cancellation without losing navigation focus or drafts", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    controller.state.drafts.items = "unsaved item";
+    api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
+    await controller.navigate("settings");
+    await click(root, controller, '[data-action="create-list"]');
+    let failRead: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          failRead = () => reject(new Error("abandoned reload failed"));
+        }),
+    );
+    button(root, '[data-action="close-modal"]').click();
+    expect(controller.state.readPending).toBe("settings");
+    const navigation = '[data-action="select-list"][data-id="1"]';
+    await click(root, controller, navigation);
+    failRead();
+    await Promise.resolve();
+    expect(controller.state.view).toBe("items");
+    expect(controller.state.busy).toBe(false);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(document.activeElement).toBe(button(root, navigation));
+    const input = root.querySelector("textarea");
+    if (!(input instanceof HTMLTextAreaElement)) throw new Error("Missing bulk input");
+    expect(input.value).toBe("unsaved item");
+  });
+
   it("protects a credential write and enables navigation during its post-write refresh", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();

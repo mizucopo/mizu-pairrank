@@ -258,17 +258,43 @@ fn private_network_error() -> String {
 }
 
 async fn resolve_public_addresses(url: &Url, port: u16) -> Result<Vec<SocketAddr>, String> {
+    use std::net::ToSocketAddrs;
+    static SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(Semaphore::new(SEARCH_PARALLELISM)));
+    resolve_public_addresses_with(url, port, SLOTS.clone(), |host, port| {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+    .await
+}
+
+async fn resolve_public_addresses_with(
+    url: &Url,
+    port: u16,
+    slots: Arc<Semaphore>,
+    lookup: impl FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> Result<Vec<SocketAddr>, String> {
     let addresses: Vec<_> = match url.host() {
         Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
         Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
-        Some(Host::Domain(host)) => tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .map_err(|_| "画像URLの名前解決がタイムアウトしました。".to_owned())?
-        .map_err(|_| "画像URLの名前解決に失敗しました。".to_owned())?
-        .collect(),
+        Some(Host::Domain(host)) => {
+            let permit = slots.try_acquire_owned().map_err(|_| {
+                "画像URLの名前解決が実行中です。少し待ってから再試行してください。".to_owned()
+            })?;
+            let host = host.to_owned();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    lookup(host, port)
+                }),
+            )
+            .await
+            .map_err(|_| "画像URLの名前解決がタイムアウトしました。".to_owned())?
+            .map_err(|_| "画像URLの名前解決に失敗しました。".to_owned())?
+            .map_err(|_| "画像URLの名前解決に失敗しました。".to_owned())?
+        }
         None => return Err("画像URLにホスト名がありません。".to_owned()),
     };
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
@@ -318,6 +344,7 @@ pub struct ImageService {
     search_slots: Arc<Semaphore>,
     settings_slots: Arc<Semaphore>,
     key_write_slots: Arc<Semaphore>,
+    local_import_slots: Arc<Semaphore>,
 }
 
 impl ImageService {
@@ -401,6 +428,7 @@ impl ImageService {
             search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
             key_write_slots: Arc::new(Semaphore::new(1)),
+            local_import_slots: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -547,6 +575,24 @@ impl ImageService {
         })
         .await
         .map_err(|_| "検索設定を取得できませんでした。".to_owned())?
+    }
+
+    pub async fn pick_local(
+        self: &Arc<Self>,
+        picker: impl FnOnce() -> Result<Option<PathBuf>, String> + Send + 'static,
+    ) -> Result<Option<ImageAsset>, String> {
+        let permit = self
+            .local_import_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "画像の登録が実行中です。少し待ってから再試行してください。".to_owned())?;
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            picker()?.map(|path| service.import_local(path)).transpose()
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     pub async fn set_api_key(&self, provider: SearchProvider, key: String) -> Result<(), String> {
@@ -1141,6 +1187,69 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn cancelled_dns_lookups_keep_capacity_until_the_native_worker_finishes() {
+        for cancel in [false, true] {
+            let slots = Arc::new(Semaphore::new(1));
+            let url = Url::parse("https://example.com/image.png").unwrap();
+            let public = SocketAddr::from(([8, 8, 8, 8], 443));
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let first = tokio::spawn({
+                let slots = slots.clone();
+                let url = url.clone();
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        resolve_public_addresses_with(&url, 443, slots, move |_, _| {
+                            started.send(()).unwrap();
+                            let _ = wait.recv();
+                            Ok(vec![public])
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                first.abort();
+                assert!(first.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(first.await.unwrap().is_err());
+            }
+            let extra = tokio::time::timeout(
+                Duration::from_millis(100),
+                resolve_public_addresses_with(&url, 443, slots.clone(), move |_, _| {
+                    Ok(vec![public])
+                }),
+            )
+            .await;
+            drop(release); // Always unblock the native worker before asserting.
+            assert!(extra.is_ok_and(|result| {
+                result.is_err_and(|message| message.contains("名前解決が実行中"))
+            }));
+            let addresses = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(addresses) =
+                        resolve_public_addresses_with(&url, 443, slots.clone(), move |_, _| {
+                            Ok(vec![public])
+                        })
+                        .await
+                    {
+                        break addresses;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(addresses, vec![public]);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2127,6 +2236,7 @@ mod tests {
             search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
             key_write_slots: Arc::new(Semaphore::new(1)),
+            local_import_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
     }

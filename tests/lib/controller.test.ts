@@ -316,6 +316,90 @@ describe("image search validation", () => {
 });
 
 describe("settings navigation", () => {
+  it.each(["success", "failure"] as const)(
+    "reloads unread settings after cancelling list creation and ignores the abandoned %s",
+    async (outcome) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      controller.state.drafts.items = "unsaved item";
+      controller.state.drafts.braveKey = "unsaved key";
+      let finishOld: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishOld = () => {
+              if (outcome === "success") {
+                resolve({
+                  braveConfigured: true,
+                  ollamaConfigured: false,
+                  defaultProvider: "brave",
+                });
+              } else reject(new Error("abandoned settings read failed"));
+            };
+          }),
+      );
+      const abandoned = controller.navigate("settings");
+      await controller.openModal({ kind: "create-list" });
+      const settings = {
+        braveConfigured: false,
+        ollamaConfigured: true,
+        defaultProvider: "ollama" as const,
+      };
+      let finishCurrent: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishCurrent = () => resolve(settings);
+          }),
+      );
+      controller.closeModal();
+      expect(api.searchSettings).toHaveBeenCalledTimes(2);
+      expect(controller.state.modal).toBeNull();
+      expect(controller.state.view).toBe("settings");
+      finishOld();
+      await abandoned;
+      expect(controller.state.busy).toBe(true);
+      expect(controller.state.readPending).toBe("settings");
+      expect(controller.state.settings).toBeNull();
+      expect(controller.state.error).toBe("");
+      finishCurrent();
+      await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+      expect(controller.state.settings).toEqual(settings);
+      expect(controller.state.provider).toBe("ollama");
+      expect(controller.state.drafts.items).toBe("unsaved item");
+      expect(controller.state.drafts.braveKey).toBe("unsaved key");
+    },
+  );
+
+  it.each(["success", "failure"] as const)(
+    "retries a failed settings read after cancelling list creation (retry %s)",
+    async (outcome) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
+      await controller.navigate("settings");
+      expect(controller.state.error).toBe("initial settings read failed");
+      await controller.openModal({ kind: "create-list" });
+      if (outcome === "failure") {
+        api.searchSettings.mockRejectedValueOnce(new Error("retry settings read failed"));
+      }
+      controller.closeModal();
+      await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+      expect(api.searchSettings).toHaveBeenCalledTimes(2);
+      expect(controller.state.modal).toBeNull();
+      expect(controller.state.view).toBe("settings");
+      expect(controller.state.error).toBe(
+        outcome === "failure" ? "retry settings read failed" : "",
+      );
+      expect(controller.state.settings === null).toBe(outcome === "failure");
+      await controller.selectList(1);
+      expect(controller.state.view).toBe("items");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
   it.each([
     ["success", "screen"],
     ["failure", "screen"],

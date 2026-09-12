@@ -274,20 +274,21 @@ async fn set_local_image(
 ) -> Result<Option<ListState>, String> {
     let service = image_service(&app)?;
     let dialog_app = app.clone();
-    let image = tauri::async_runtime::spawn_blocking(move || {
-        let Some(file) = dialog_app
-            .dialog()
-            .file()
-            .add_filter("画像", &["png", "jpg", "jpeg", "webp"])
-            .blocking_pick_file()
-        else {
-            return Ok(None);
-        };
-        let path = file.into_path().map_err(|error| error.to_string())?;
-        service.import_local(path).map(Some)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+    let image = service
+        .pick_local(move || {
+            let Some(file) = dialog_app
+                .dialog()
+                .file()
+                .add_filter("画像", &["png", "jpg", "jpeg", "webp"])
+                .blocking_pick_file()
+            else {
+                return Ok(None);
+            };
+            file.into_path()
+                .map(Some)
+                .map_err(|error| error.to_string())
+        })
+        .await?;
     let Some(image) = image else {
         return Ok(None);
     };
@@ -371,6 +372,56 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn cancelled_local_picker_keeps_capacity_until_its_worker_exits() {
+        use std::time::Duration;
+        let (_directory, backend) = backend();
+        let service = backend.images.as_ref().unwrap().clone();
+        let (started, starts) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .pick_local(move || {
+                        started.send(()).unwrap();
+                        let _ = wait.recv();
+                        Ok(None)
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), starts)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let extra = service.pick_local(|| Ok(None)).await;
+        drop(release);
+        assert!(extra.is_err_and(|error| error.contains("画像の登録が実行中")));
+        let image = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(image) = service
+                    .pick_local(|| {
+                        Ok(Some(
+                            Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"),
+                        ))
+                    })
+                    .await
+                {
+                    break image;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(service.validate_import(&image).is_ok());
+        assert!(service.pick_local(|| Ok(None)).await.unwrap().is_none());
+    }
 
     #[cfg(unix)]
     #[test]

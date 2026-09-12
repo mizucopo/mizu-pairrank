@@ -210,10 +210,13 @@ export class AppController {
 
   closeModal(): void {
     if (this.state.busy && this.state.readPending !== "image") return;
+    const reloadSettings =
+      this.state.modal !== null && this.state.view === "settings" && this.state.settings === null;
     this.cancelRead("image");
     this.state.modal = null;
     this.state.error = "";
     this.changed();
+    if (reloadSettings) void this.navigate("settings");
   }
 
   private acceptCommittedList(list: ListState): void {
