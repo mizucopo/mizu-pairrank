@@ -432,8 +432,12 @@ impl ImageService {
         })
     }
 
-    pub fn remove_managed_file(&self, path: &str) {
-        self.remove_managed_file_with(path, || {});
+    pub fn remove_unused_files(
+        &self,
+        paths: impl IntoIterator<Item = String>,
+        references: &HashSet<String>,
+    ) {
+        self.remove_unused_files_with(paths, references, || {});
     }
 
     pub fn validate_import(&self, image: &ImageAsset) -> Result<(), String> {
@@ -449,22 +453,35 @@ impl ImageService {
             .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())
     }
 
-    fn remove_managed_file_with(&self, path: &str, checkpoint: impl FnOnce()) {
-        let Some(path) = self.managed_path(path) else {
-            return;
-        };
+    fn remove_unused_files_with(
+        &self,
+        paths: impl IntoIterator<Item = String>,
+        references: &HashSet<String>,
+        mut checkpoint: impl FnMut(),
+    ) {
         let remove = || -> std::io::Result<()> {
             let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
-            let filename = path
-                .file_name()
-                .ok_or_else(|| std::io::Error::other("missing image filename"))?;
-            if !pinned.symlink_metadata(filename)?.is_file() {
-                return Ok(());
+            // Resolve both complete sets before deleting anything: a retained alias
+            // must protect the same file even when the candidate uses another form.
+            let referenced_names = managed_image_names(references, &self.directory_identity)?;
+            let candidate_names = managed_image_names(paths, &self.directory_identity)?;
+            let mut removed = false;
+            for filename in candidate_names.difference(&referenced_names) {
+                let Ok(metadata) = pinned.symlink_metadata(filename) else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                checkpoint();
+                if pinned.remove_file(filename).is_ok() {
+                    removed = true;
+                }
             }
-            checkpoint();
-            pinned.remove_file(filename)?;
-            #[cfg(unix)]
-            pinned.into_std_file().sync_all()?;
+            if removed {
+                #[cfg(unix)]
+                pinned.into_std_file().sync_all()?;
+            }
             Ok(())
         };
         // Cleanup must never turn a committed database operation into a failure.
@@ -791,25 +808,7 @@ fn reconcile_images(
     references: &HashSet<String>,
 ) -> std::io::Result<()> {
     let pinned = verified_image_directory(directory, expected_identity)?;
-    let mut referenced_names = HashSet::new();
-    // Resolve every legacy parent before deleting anything. Path aliases may name
-    // the same directory even when their text differs from its canonical path.
-    for reference in references {
-        let path = Path::new(reference);
-        if !is_managed_image_name(path) {
-            continue;
-        }
-        let name = path.file_name().unwrap();
-        if path.components().count() == 1 {
-            referenced_names.insert(name.to_owned());
-        } else if path.is_absolute() {
-            let parent = open_image_directory(path.parent().unwrap())?;
-            let identity = same_file::Handle::from_file(parent.into_std_file())?;
-            if &identity == expected_identity {
-                referenced_names.insert(name.to_owned());
-            }
-        }
-    }
+    let referenced_names = managed_image_names(references, expected_identity)?;
     let mut removed = false;
     for entry in pinned.entries()? {
         let entry = entry?;
@@ -832,6 +831,32 @@ fn reconcile_images(
         pinned.into_std_file().sync_all()?;
     }
     Ok(())
+}
+
+fn managed_image_names<R: AsRef<str>>(
+    references: impl IntoIterator<Item = R>,
+    expected_identity: &same_file::Handle,
+) -> std::io::Result<HashSet<std::ffi::OsString>> {
+    let mut names = HashSet::new();
+    // Resolve every legacy parent before deleting anything. Path aliases may name
+    // the same directory even when their text differs from its canonical path.
+    for reference in references {
+        let path = Path::new(reference.as_ref());
+        if !is_managed_image_name(path) {
+            continue;
+        }
+        let name = path.file_name().unwrap();
+        if path.components().count() == 1 {
+            names.insert(name.to_owned());
+        } else if path.is_absolute() {
+            let parent = open_image_directory(path.parent().unwrap())?;
+            let identity = same_file::Handle::from_file(parent.into_std_file())?;
+            if &identity == expected_identity {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn open_initial_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
@@ -1383,7 +1408,7 @@ mod tests {
     #[test]
     fn cleanup_preserves_an_ordinary_directory_replacement_before_the_operation() {
         with_ordinary_directory_replacement(|service, _, reference| {
-            service.remove_managed_file(reference);
+            service.remove_unused_files([reference.to_owned()], &HashSet::new());
         });
     }
 
@@ -1438,7 +1463,7 @@ mod tests {
         let external_image = external.path().join(&image.path);
         std::fs::write(&external_image, b"external image").unwrap();
         let previous = directory.path().join("previous-images");
-        service.remove_managed_file_with(&image.path, || {
+        service.remove_unused_files_with([image.path.clone()], &HashSet::new(), || {
             std::fs::rename(&service.directory, &previous).unwrap();
             std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
         });
@@ -1731,7 +1756,7 @@ mod tests {
         let image = service.import_local(source).unwrap();
         assert_eq!(Path::new(&image.path).components().count(), 1);
         assert!(service.directory.join(&image.path).is_file());
-        service.remove_managed_file(&image.path);
+        service.remove_unused_files([image.path.clone()], &HashSet::new());
         assert!(!service.directory.join(&image.path).exists());
     }
 
@@ -1807,7 +1832,7 @@ mod tests {
             service.image_response(&too_large).status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
-        service.remove_managed_file(&image.path);
+        service.remove_unused_files([image.path.clone()], &HashSet::new());
         let missing = Request::builder().uri(uri).body(Vec::new()).unwrap();
         assert_eq!(
             service.image_response(&missing).status(),
@@ -1869,9 +1894,135 @@ mod tests {
         std::fs::write(&source, png(4, 2)).unwrap();
         let image = service.import_local(source.clone()).unwrap();
         let legacy = service.directory.join(&image.path);
-        service.remove_managed_file(legacy.to_str().unwrap());
+        service.remove_unused_files([legacy.to_str().unwrap().to_owned()], &HashSet::new());
         assert!(!legacy.exists());
         assert!(source.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_accepts_legacy_references_through_a_parent_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let app_data = directory.path().join("app-data");
+        let service = ImageService::new(app_data.clone()).unwrap();
+        let alias = directory.path().join("app-alias");
+        std::os::unix::fs::symlink(&app_data, &alias).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let image = service.import_local(source).unwrap();
+        let legacy = alias.join("images").join(&image.path);
+
+        assert!(
+            service
+                .validate_import(&ImageAsset {
+                    path: legacy.to_str().unwrap().to_owned(),
+                    source_url: None,
+                })
+                .is_err(),
+            "cleanup aliases must not expand import validation"
+        );
+        for method in ["GET", "HEAD"] {
+            let request = tauri::http::Request::builder()
+                .method(method)
+                .uri(format!(
+                    "pairrank-image://localhost/{}",
+                    legacy.to_str().unwrap()
+                ))
+                .body(Vec::new())
+                .unwrap();
+            assert_eq!(
+                service.image_response(&request).status(),
+                tauri::http::StatusCode::FORBIDDEN
+            );
+        }
+        service.remove_unused_files([legacy.to_str().unwrap().to_owned()], &HashSet::new());
+
+        assert!(
+            !service.directory.join(image.path).exists(),
+            "an unused legacy alias must be cleaned"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_the_whole_batch_when_a_legacy_parent_cannot_be_resolved() {
+        for unresolved_reference in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = ImageService::new(directory.path().to_owned()).unwrap();
+            let source = directory.path().join("source.png");
+            std::fs::write(&source, png(4, 2)).unwrap();
+            let first = service.import_local(source.clone()).unwrap();
+            let second = service.import_local(source).unwrap();
+            let unresolved = directory
+                .path()
+                .join("missing-parent")
+                .join(&second.path)
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let mut candidates = vec![first.path.clone(), second.path.clone()];
+            let references = if unresolved_reference {
+                HashSet::from([unresolved])
+            } else {
+                // Even valid candidates earlier in the batch must remain untouched.
+                candidates.push(unresolved);
+                HashSet::new()
+            };
+
+            service.remove_unused_files(candidates, &references);
+
+            assert!(service.directory.join(first.path).exists());
+            assert!(service.directory.join(second.path).exists());
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_only_regular_managed_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(4, 2)).unwrap();
+        let unused = service.import_local(source.clone()).unwrap();
+        let pending = service.import_local(source).unwrap();
+        let unmanaged = service.directory.join("notes.png");
+        std::fs::write(&unmanaged, b"unmanaged").unwrap();
+        let child_directory = format!("{}.png", Uuid::new_v4());
+        std::fs::create_dir(service.directory.join(&child_directory)).unwrap();
+        let external = directory.path().join(&unused.path);
+        std::fs::write(&external, b"external").unwrap();
+
+        service.remove_unused_files(
+            [
+                unused.path.clone(),
+                unused.path.clone(),
+                "notes.png".to_owned(),
+                child_directory.clone(),
+                external.to_str().unwrap().to_owned(),
+            ],
+            &HashSet::new(),
+        );
+
+        assert!(!service.directory.join(unused.path).exists());
+        assert!(service.directory.join(pending.path).exists());
+        assert!(service.directory.join(child_directory).is_dir());
+        assert_eq!(std::fs::read(unmanaged).unwrap(), b"unmanaged");
+        assert_eq!(std::fs::read(external).unwrap(), b"external");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_symlink_candidates_and_their_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let target = directory.path().join("external.png");
+        std::fs::write(&target, b"external").unwrap();
+        let name = format!("{}.png", Uuid::new_v4());
+        let link = service.directory.join(&name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        service.remove_unused_files([name], &HashSet::new());
+
+        assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(target).unwrap(), b"external");
     }
 
     #[cfg(unix)]
@@ -1985,7 +2136,7 @@ mod tests {
         let response = service.image_response(&request);
         assert_eq!(response.status(), tauri::http::StatusCode::OK);
         assert_eq!(image::load_from_memory(response.body()).unwrap().width(), 4);
-        service.remove_managed_file(&saved.path);
+        service.remove_unused_files([saved.path.clone()], &HashSet::new());
         assert_eq!(std::fs::read_dir(&service.directory).unwrap().count(), 0);
         assert_eq!(std::fs::read(source).unwrap(), original);
     }
@@ -3178,7 +3329,15 @@ mod tests {
         std::fs::write(&original, b"external image").unwrap();
         std::fs::remove_dir(&service.directory).unwrap();
         std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
-        service.remove_managed_file(service.directory.join(filename).to_str().unwrap());
+        service.remove_unused_files(
+            [service
+                .directory
+                .join(filename)
+                .to_str()
+                .unwrap()
+                .to_owned()],
+            &HashSet::new(),
+        );
         assert_eq!(std::fs::read(original).unwrap(), b"external image");
     }
 

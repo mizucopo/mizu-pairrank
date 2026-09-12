@@ -147,10 +147,12 @@ fn remove_unused_images(
     service: &ImageService,
     paths: impl IntoIterator<Item = String>,
 ) {
-    for path in paths {
-        if db.image_in_use(&path) == Ok(false) {
-            service.remove_managed_file(&path);
-        }
+    let mut paths = paths.into_iter().peekable();
+    if paths.peek().is_none() {
+        return;
+    }
+    if let Ok(references) = db.image_paths() {
+        service.remove_unused_files(paths, &references);
     }
 }
 
@@ -842,6 +844,14 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    fn image_directory_alias(directory: &Path) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("app-alias");
+        std::os::unix::fs::symlink(directory, &alias).unwrap();
+        (root, alias.join("images"))
+    }
+
     fn upgrade_to_future_schema(path: &Path) -> (rusqlite::Connection, String) {
         let mut connection = rusqlite::Connection::open(path).unwrap();
         let supported: u32 = connection
@@ -983,6 +993,205 @@ mod tests {
         );
         assert!(!directory.path().join("images").join(&image.path).exists());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_changes_clean_legacy_references_through_a_parent_alias() {
+        for operation in ["remove", "replace", "delete item", "delete list"] {
+            let (directory, backend) = backend();
+            let (list_id, item_id, mut previous) = list_with_image(&backend).await;
+            let previous_path = directory.path().join("images").join(&previous.path);
+            let (_alias_root, alias) = image_directory_alias(directory.path());
+            previous.path = alias.join(&previous.path).to_str().unwrap().to_owned();
+            backend
+                .database_job(move |db| db.set_image(list_id, item_id, Some(previous)))
+                .await
+                .unwrap();
+            let replacement = (operation == "replace").then(|| {
+                backend
+                    .images
+                    .as_ref()
+                    .unwrap()
+                    .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+                    .unwrap()
+            });
+            let replacement_path = replacement
+                .as_ref()
+                .map(|image| directory.path().join("images").join(&image.path));
+
+            let result = match operation {
+                "remove" | "replace" => backend
+                    .change_images(replacement, move |db, image| {
+                        db.set_image(list_id, item_id, image)
+                    })
+                    .await
+                    .map(|_| ()),
+                "delete item" => backend
+                    .change_images(None, move |db, _| db.delete_item(list_id, item_id))
+                    .await
+                    .map(|_| ()),
+                "delete list" => {
+                    backend
+                        .change_images(None, move |db, _| db.delete_list(list_id))
+                        .await
+                }
+                _ => unreachable!(),
+            };
+
+            result.unwrap();
+            assert!(!previous_path.exists(), "{operation}");
+            if let Some(path) = replacement_path {
+                assert!(path.is_file());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_cleanup_preserves_shared_references_with_different_path_forms() {
+        for (removed_form, retained_form) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            let (directory, backend) = backend();
+            let (list_id, item_id, image) = list_with_image(&backend).await;
+            let (_alias_root, alias) = image_directory_alias(directory.path());
+            let managed = directory.path().canonicalize().unwrap().join("images");
+            let image_path = managed.join(&image.path);
+            let references = [
+                image.path.clone(),
+                image_path.to_str().unwrap().to_owned(),
+                alias.join(&image.path).to_str().unwrap().to_owned(),
+            ];
+            let removed = ImageAsset {
+                path: references[removed_form].clone(),
+                source_url: None,
+            };
+            let retained = ImageAsset {
+                path: references[retained_form].clone(),
+                source_url: None,
+            };
+            let second_id = backend
+                .database_job(move |db| {
+                    db.set_image(list_id, item_id, Some(removed))?;
+                    let list = db.create_list("Second list".into())?;
+                    let list = db.add_items(list.id, vec!["Shared image".into()])?;
+                    db.set_image(list.id, list.items[0].id, Some(retained))?;
+                    Ok(list.id)
+                })
+                .await
+                .unwrap();
+
+            backend
+                .change_images(None, move |db, _| db.delete_list(list_id))
+                .await
+                .unwrap();
+            assert!(image_path.is_file(), "{removed_form} -> {retained_form}");
+            backend
+                .change_images(None, move |db, _| db.delete_list(second_id))
+                .await
+                .unwrap();
+            assert!(!image_path.exists(), "{removed_form} -> {retained_form}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_cleanup_preserves_another_services_pending_image_and_same_named_external_file() {
+        let (directory, backend) = backend();
+        let (list_id, _, previous) = list_with_image(&backend).await;
+        let second = ImageService::new(directory.path().to_owned()).unwrap();
+        let pending = second
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let pending_path = directory.path().join("images").join(&pending.path);
+        let pending_contents = std::fs::read(&pending_path).unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let external_path = external_root.path().join(&pending.path);
+        std::fs::write(&external_path, b"external image").unwrap();
+        let external = ImageAsset {
+            path: external_path.to_str().unwrap().to_owned(),
+            source_url: None,
+        };
+        backend
+            .database_job(move |db| {
+                let list = db.get_list(list_id)?;
+                let empty = list.items.iter().find(|item| item.image.is_none()).unwrap();
+                db.set_image(list_id, empty.id, Some(external))
+            })
+            .await
+            .unwrap();
+
+        backend
+            .change_images(None, move |db, _| db.delete_list(list_id))
+            .await
+            .unwrap();
+
+        assert!(!directory.path().join("images").join(previous.path).exists());
+        assert_eq!(std::fs::read(pending_path).unwrap(), pending_contents);
+        assert_eq!(std::fs::read(external_path).unwrap(), b"external image");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_association_preserves_an_image_referenced_by_an_absolute_or_alias_path() {
+        for use_alias in [false, true] {
+            let (directory, backend) = backend();
+            let (list_id, item_id, image) = list_with_image(&backend).await;
+            let (_alias_root, alias) = image_directory_alias(directory.path());
+            let managed = directory.path().canonicalize().unwrap().join("images");
+            let image_path = managed.join(&image.path);
+            let contents = std::fs::read(&image_path).unwrap();
+            let mut retained = image.clone();
+            retained.path = (if use_alias { alias } else { managed })
+                .join(&image.path)
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let retained_path = retained.path.clone();
+            backend
+                .database_job(move |db| db.set_image(list_id, item_id, Some(retained)))
+                .await
+                .unwrap();
+
+            assert!(
+                backend
+                    .change_images(Some(image), move |db, image| {
+                        db.set_image(list_id, -1, image)
+                    })
+                    .await
+                    .is_err()
+            );
+
+            assert_eq!(std::fs::read(image_path).unwrap(), contents);
+            let state = backend
+                .database_job(move |db| db.get_list(list_id))
+                .await
+                .unwrap();
+            let item = state.items.iter().find(|item| item.id == item_id).unwrap();
+            assert_eq!(item.image.as_ref().unwrap().path, retained_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_images_when_database_references_fail_after_a_committed_removal() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, image) = list_with_image(&backend).await;
+        let image_path = directory.path().join("images").join(&image.path);
+        let contents = std::fs::read(&image_path).unwrap();
+        let database_path = directory.path().join("test.sqlite3");
+
+        let state = backend
+            .change_images(None, move |db, image| {
+                let change = db.set_image(list_id, item_id, image)?;
+                upgrade_to_future_schema(&database_path);
+                Ok(change)
+            })
+            .await
+            .unwrap();
+
+        let item = state.items.iter().find(|item| item.id == item_id).unwrap();
+        assert!(item.image.is_none());
+        assert!(backend.database_job(|db| db.image_paths()).await.is_err());
+        assert_eq!(std::fs::read(image_path).unwrap(), contents);
+    }
+
     #[tokio::test]
     async fn failed_image_association_cleans_the_import_and_preserves_the_previous_image() {
         let (directory, backend) = backend();
