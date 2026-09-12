@@ -345,6 +345,50 @@ describe("desktop app interaction", () => {
     expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
   });
 
+  it.each(["brave", "ollama"] as const)(
+    "allows image search with a saved %s key even when settings reads keep failing",
+    async (provider) => {
+      const { root, controller, api } = setup();
+      api.searchSettings.mockRejectedValue(new Error("keyring read failed"));
+      await controller.initialize();
+      await click(root, controller, '[data-view="settings"]');
+      const input = root.querySelector(`[data-draft="${provider}Key"]`);
+      if (!(input instanceof HTMLInputElement)) throw new Error("Missing API key input");
+      input.value = "saved-key";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const form = input.form;
+      if (!form) throw new Error("Missing API key form");
+      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await settle(controller);
+      expect(
+        root
+          .querySelector(`[data-form="save-key"][data-provider="${provider}"]`)
+          ?.closest(".settings-card")
+          ?.querySelector(".badge")?.textContent,
+      ).toBe("設定済み");
+      expect(root.querySelector('[role="alert"]')?.textContent).toContain(
+        "設定状態を再取得できませんでした",
+      );
+
+      await controller.navigate("items");
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(
+        false,
+      );
+      const search = root.querySelector('[data-form="search-images"]');
+      if (!search) throw new Error("Missing image search form");
+      search.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await settle(controller);
+      expect(api.searchImages).toHaveBeenCalledExactlyOnceWith(provider, "りんご");
+
+      const select = root.querySelector("#search-provider");
+      if (!(select instanceof HTMLSelectElement)) throw new Error("Missing search provider");
+      select.value = provider === "brave" ? "ollama" : "brave";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+    },
+  );
+
   it("allows local images and no image while search API keys are unconfigured", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();

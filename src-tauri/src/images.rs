@@ -26,6 +26,7 @@ const MAX_PIXELS: u64 = 32_000_000;
 const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
+const MAX_ACTIVE_SEARCHES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,6 +311,7 @@ pub struct ImageService {
     transport: Arc<dyn ImageTransport>,
     decode_gate: Arc<Mutex<()>>,
     buffer_slots: Arc<Semaphore>,
+    search_slots: Semaphore,
 }
 
 impl ImageService {
@@ -367,6 +369,7 @@ impl ImageService {
             transport: Arc::new(HttpTransport),
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
+            search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
         })
     }
 
@@ -475,6 +478,12 @@ impl ImageService {
         {
             return Err("検索語は1〜400文字、50語以内で入力してください。".to_owned());
         }
+        // Keep completed previews bounded too: a dismissed invoke still runs natively.
+        // Reject excess searches instead of retaining an unbounded queue of commands.
+        let _search = self
+            .search_slots
+            .try_acquire()
+            .map_err(|_| "画像検索が実行中です。少し待ってから再試行してください。".to_owned())?;
         let credentials = self.credentials.clone();
         let key = tokio::task::spawn_blocking(move || credentials.get(provider))
             .await
@@ -1433,6 +1442,7 @@ mod tests {
             transport: transport.clone(),
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
+            search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
         };
         (directory, service, transport)
     }
@@ -1753,6 +1763,95 @@ mod tests {
         );
         assert!(parse_search_response(SearchProvider::Brave, b"broken json").is_err());
     }
+    #[tokio::test]
+    async fn concurrent_search_limit_covers_completed_previews_until_the_whole_search_finishes() {
+        struct SlowTailTransport {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: Arc<Semaphore>,
+        }
+        impl ImageTransport for SlowTailTransport {
+            fn search<'a>(
+                &'a self,
+                _: SearchProvider,
+                _: &'a str,
+                _: &'a str,
+            ) -> NetworkFuture<'a, Vec<u8>> {
+                Box::pin(async {
+                    Ok(serde_json::to_vec(&serde_json::json!({"results": [
+                        {"url": "https://example.com/fast", "properties": {"url": "https://example.com/fast.png"}},
+                        {"url": "https://example.com/slow", "properties": {"url": "https://example.com/slow.png"}}
+                    ]})).unwrap())
+                })
+            }
+            fn fetch<'a>(&'a self, url: &'a str, _: usize) -> NetworkFuture<'a, Resource> {
+                Box::pin(async move {
+                    self.started.send(()).unwrap();
+                    if url.ends_with("slow.png") {
+                        self.release.acquire().await.unwrap().forget();
+                    }
+                    Ok(Resource {
+                        bytes: png(4, 2),
+                        final_url: url.into(),
+                    })
+                })
+            }
+        }
+        let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        service.transport = Arc::new(SlowTailTransport {
+            started,
+            release: release.clone(),
+        });
+        service
+            .set_api_key(SearchProvider::Brave, "test-key".into())
+            .unwrap();
+        let service = Arc::new(service);
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let service = service.clone();
+            pending.push(tokio::spawn(async move {
+                service.search(SearchProvider::Brave, "image".into()).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..4 {
+                starts.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // The fast previews have released their encoded-buffer permits, while
+        // the two slow candidates keep their searches (and completed outputs) alive.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.buffer_slots.available_permits() != MAX_BUFFERED_IMAGES - 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let extra = tokio::time::timeout(
+            Duration::from_millis(100),
+            service.search(SearchProvider::Brave, "another".into()),
+        )
+        .await;
+        release.add_permits(10);
+        for search in pending {
+            assert_eq!(search.await.unwrap().unwrap().len(), 2);
+        }
+        assert!(
+            extra.is_ok_and(|result| result.is_err_and(|message| message.contains("画像検索")))
+        );
+        assert_eq!(
+            service
+                .search(SearchProvider::Brave, "later".into())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn shared_budgets_bound_fetch_buffers_and_decodes_across_searches_and_imports() {
         struct ParallelTransport {

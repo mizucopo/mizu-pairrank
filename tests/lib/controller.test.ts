@@ -254,6 +254,38 @@ describe("mutations after concurrent deletion", () => {
 
 describe("credential mutation acknowledgments", () => {
   it.each([
+    ["brave", false, true, false, "brave"],
+    ["brave", true, false, false, "brave"],
+    ["ollama", false, false, true, "ollama"],
+    ["ollama", true, false, false, "brave"],
+  ] as const)(
+    "keeps successful %s key changes (remove=%s) when the initial settings read and refresh both fail",
+    async (provider, remove, braveConfigured, ollamaConfigured, defaultProvider) => {
+      const api = backend();
+      api.searchSettings.mockRejectedValue(new Error("keyring read failed"));
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      expect(controller.state.settings).toBeNull();
+      const field = provider === "brave" ? "braveKey" : "ollamaKey";
+      controller.state.drafts[field] = "saved-key";
+      await controller.saveKey(provider, remove);
+      expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
+      expect(controller.state.settings).toEqual({
+        braveConfigured,
+        ollamaConfigured,
+        defaultProvider,
+      });
+      expect(controller.state.provider).toBe(defaultProvider);
+      expect(controller.state.drafts[field]).toBe("");
+      expect(controller.state.notice).toBe(
+        remove ? "APIキーを削除しました。" : "APIキーを保存しました。",
+      );
+      expect(controller.state.error).toContain("設定状態を再取得できませんでした");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it.each([
     ["brave", false, "brave"],
     ["brave", true, "ollama"],
     ["ollama", false, "ollama"],
@@ -290,20 +322,39 @@ describe("credential mutation acknowledgments", () => {
     },
   );
 
-  it("keeps the draft and known settings when the credential mutation itself fails", async () => {
-    const api = backend();
-    const controller = new AppController(api, vi.fn());
-    await controller.navigate("settings");
-    const before = controller.state.settings;
-    controller.state.drafts.braveKey = "retry-key";
-    api.setApiKey.mockRejectedValueOnce(new Error("keyring write failed"));
-    await controller.saveKey("brave");
-    expect(controller.state.drafts.braveKey).toBe("retry-key");
-    expect(controller.state.settings).toEqual(before);
-    expect(controller.state.notice).toBe("");
-    expect(controller.state.error).toBe("keyring write failed");
-    expect(api.searchSettings).toHaveBeenCalledOnce();
-  });
+  it.each([
+    ["brave", false, true],
+    ["brave", true, true],
+    ["ollama", false, true],
+    ["ollama", true, true],
+    ["brave", false, false],
+    ["brave", true, false],
+    ["ollama", false, false],
+    ["ollama", true, false],
+  ] as const)(
+    "keeps the draft and settings when %s key mutation fails (remove=%s, settings loaded=%s)",
+    async (provider, remove, loaded) => {
+      const api = backend();
+      const settings = {
+        braveConfigured: true,
+        ollamaConfigured: true,
+        defaultProvider: "brave" as const,
+      };
+      if (loaded) api.searchSettings.mockResolvedValueOnce(settings);
+      else api.searchSettings.mockRejectedValueOnce(new Error("keyring read failed"));
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      const field = provider === "brave" ? "braveKey" : "ollamaKey";
+      controller.state.drafts[field] = "retry-key";
+      api.setApiKey.mockRejectedValueOnce(new Error("keyring write failed"));
+      await controller.saveKey(provider, remove);
+      expect(controller.state.drafts[field]).toBe("retry-key");
+      expect(controller.state.settings).toEqual(loaded ? settings : null);
+      expect(controller.state.notice).toBe("");
+      expect(controller.state.error).toBe("keyring write failed");
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+    },
+  );
 
   it("refreshes both providers after acknowledging a successful key mutation", async () => {
     const api = backend();

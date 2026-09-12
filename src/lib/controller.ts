@@ -453,14 +453,18 @@ export class AppController {
       await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
       this.state.notice = remove ? "APIキーを削除しました。" : "APIキーを保存しました。";
-      if (this.state.settings) {
-        const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
-        const settings = { ...this.state.settings, [configured]: !remove };
-        settings.defaultProvider =
-          settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
-        this.state.settings = settings;
-        this.state.provider = settings.defaultProvider;
-      }
+      const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+      const settings: SearchSettings = {
+        braveConfigured: false,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+        ...this.state.settings,
+        [configured]: !remove,
+      };
+      settings.defaultProvider =
+        settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
+      this.state.settings = settings;
+      this.state.provider = settings.defaultProvider;
       try {
         await this.loadSettings();
       } catch (error) {
