@@ -197,10 +197,7 @@ async fn answer(
 }
 #[tauri::command]
 async fn search_settings(app: AppHandle) -> Result<SearchSettings, String> {
-    let service = image_service(&app)?;
-    tauri::async_runtime::spawn_blocking(move || service.settings())
-        .await
-        .map_err(|error| error.to_string())?
+    image_service(&app)?.settings().await
 }
 #[tauri::command]
 async fn set_api_key(app: AppHandle, provider: SearchProvider, key: String) -> Result<(), String> {

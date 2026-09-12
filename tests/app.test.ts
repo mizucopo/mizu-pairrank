@@ -203,7 +203,7 @@ describe("desktop app interaction", () => {
     navigation.click();
     await settle(controller);
     expect(navigation.isConnected).toBe(false);
-    expect(root.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
     pressKeyAtFocus("1");
     await settle(controller);
     expect(api.answer).toHaveBeenNthCalledWith(1, pair, "a_strong");
@@ -213,7 +213,7 @@ describe("desktop app interaction", () => {
     answer.click();
     await settle(controller);
     expect(answer.isConnected).toBe(false);
-    expect(root.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(button(root, '[data-answer="equal"]'));
     pressKeyAtFocus("2");
     await settle(controller);
     expect(api.answer).toHaveBeenNthCalledWith(2, { ...pair, revision: 6 }, "equal");
@@ -227,6 +227,158 @@ describe("desktop app interaction", () => {
     button(root, '[data-action="close-modal"]').focus();
     pressKeyAtFocus("5");
     expect(api.answer).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps focus on the clicked view button when another button still has native focus", async () => {
+    const { root, controller } = setup();
+    await controller.initialize();
+    button(root, '.tabs [data-view="items"]').focus();
+    await click(root, controller, '.tabs [data-view="ranking"]');
+    expect(document.activeElement).toBe(button(root, '.tabs [data-view="ranking"]'));
+  });
+
+  it.each(["items", "credentials"] as const)(
+    "preserves %s input focus and selection through a retry after an invalid form submission",
+    async (formKind) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      if (formKind === "credentials") await controller.navigate("settings");
+      const selector = formKind === "items" ? "#item-names" : "#braveKey";
+      const input = root.querySelector(selector);
+      if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) {
+        throw new Error("Missing form input");
+      }
+      const form = input.form;
+      const submit = form?.querySelector("button[type=submit]");
+      if (!(submit instanceof HTMLButtonElement)) throw new Error("Missing form submit button");
+      submit.focus();
+      submit.click();
+      expect(api.addItems).not.toHaveBeenCalled();
+      expect(api.setApiKey).not.toHaveBeenCalled();
+      input.focus();
+      input.value = "編集して再試行";
+      input.setSelectionRange(2, 5);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      let fail: (reason: Error) => void = () => {};
+      const pending = new Promise<never>((_resolve, reject) => {
+        fail = reject;
+      });
+      if (formKind === "items") api.addItems.mockReturnValueOnce(pending);
+      else api.setApiKey.mockReturnValueOnce(pending);
+      form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      expect(controller.state.busy).toBe(true);
+      fail(new Error("保存に失敗しました"));
+      await settle(controller);
+      const restored = root.querySelector(selector);
+      if (!(restored instanceof HTMLInputElement || restored instanceof HTMLTextAreaElement)) {
+        throw new Error("Missing restored input");
+      }
+      expect(document.activeElement).toBe(restored);
+      expect(restored.value).toBe("編集して再試行");
+      expect([restored.selectionStart, restored.selectionEnd]).toEqual([2, 5]);
+    },
+  );
+
+  it.each(["input", "button"] as const)(
+    "does not transfer form %s focus to a different list after concurrent deletion",
+    async (origin) => {
+      const { root, controller, api, state } = setup();
+      await controller.initialize();
+      const input = root.querySelector("textarea");
+      if (!(input instanceof HTMLTextAreaElement)) throw new Error("Missing item input");
+      input.value = "新しい項目";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const second = { ...state, id: 2, name: "別のリスト" };
+      api.listSummaries.mockResolvedValue([
+        { id: 2, name: second.name, itemCount: 2, comparisonCount: 0, converged: false },
+      ]);
+      api.getList.mockResolvedValueOnce(second);
+      if (origin === "input") {
+        input.focus();
+        input.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      } else {
+        const submit = button(root, '[data-form="add-items"] button[type="submit"]');
+        submit.focus();
+        submit.click();
+      }
+      await settle(controller);
+      expect(controller.state.active?.id).toBe(2);
+      expect(document.activeElement).toBe(root);
+    },
+  );
+
+  it.each(["sidebar", "settings", "form", "answer"] as const)(
+    "restores the %s button after it is disabled during an asynchronous operation",
+    async (operation) => {
+      const { root, controller, api, state, pair } = setup();
+      const second = { ...state, id: 2, name: "別のリスト" };
+      api.listSummaries.mockResolvedValue([
+        { id: 1, name: state.name, itemCount: 2, comparisonCount: 0, converged: false },
+        { id: 2, name: second.name, itemCount: 2, comparisonCount: 0, converged: false },
+      ]);
+      await controller.initialize();
+      let finish: () => void = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      let selector: string;
+      if (operation === "sidebar") {
+        selector = '[data-action="select-list"][data-id="2"]';
+        api.getList.mockImplementationOnce(async () => {
+          await pending;
+          return second;
+        });
+      } else if (operation === "settings") {
+        selector = '[data-view="settings"]';
+        api.searchSettings.mockImplementationOnce(async () => {
+          await pending;
+          return { braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" };
+        });
+      } else if (operation === "form") {
+        selector = '[data-form="add-items"] button[type="submit"]';
+        const input = root.querySelector("textarea");
+        if (!(input instanceof HTMLTextAreaElement)) throw new Error("Missing item input");
+        input.value = "新しい項目";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        api.addItems.mockImplementationOnce(async () => {
+          await pending;
+          return state;
+        });
+      } else {
+        await controller.startComparison();
+        selector = '[data-answer="b_weak"]';
+        api.answer.mockImplementationOnce(async () => {
+          await pending;
+          return { ...state, revision: 6, comparisonCount: 1 };
+        });
+        api.nextPair.mockResolvedValueOnce({ ...pair, revision: 6 });
+      }
+      const before = button(root, selector);
+      before.focus();
+      before.click();
+      expect(controller.state.busy).toBe(true);
+      expect(before.isConnected).toBe(false);
+      expect(button(root, selector).disabled).toBe(true);
+      finish();
+      await settle(controller);
+      expect(document.activeElement).toBe(button(root, selector));
+      expect(button(root, selector).disabled).toBe(false);
+    },
+  );
+
+  it("uses a safe focus fallback when answering settles the list and removes the answer button", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    await controller.startComparison();
+    api.answer.mockResolvedValueOnce({
+      ...state,
+      revision: 6,
+      convergence: { ...state.convergence, converged: true },
+    });
+    await click(root, controller, '[data-answer="equal"]');
+    expect(controller.state.view).toBe("ranking");
+    expect(root.querySelector("[data-answer]")).toBeNull();
+    expect(document.activeElement).toBe(root);
   });
 
   it("requires a confirmation before deletion and cancellation preserves the item", async () => {
@@ -344,6 +496,43 @@ describe("desktop app interaction", () => {
     expect(root.querySelector("h1")?.textContent).toBe(created.name);
     expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
   });
+
+  it.each([
+    ["brave", "keyring read failed"],
+    ["ollama", "keyring read failed"],
+    ["brave", ""],
+  ] as const)(
+    "keeps the healthy provider usable when the %s key status cannot be read",
+    async (unreadable, readError) => {
+      const { root, controller, api } = setup();
+      const healthy = unreadable === "brave" ? "ollama" : "brave";
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: healthy === "brave",
+        ollamaConfigured: healthy === "ollama",
+        defaultProvider: healthy,
+        errors: { [unreadable]: readError },
+      });
+      await controller.initialize();
+      await controller.navigate("settings");
+      const cards = [...root.querySelectorAll(".settings-card")];
+      expect(cards[unreadable === "brave" ? 0 : 1]?.textContent).toContain("確認できません");
+      const errorMessage = readError || "資格情報ストアから読み取れませんでした。";
+      expect(cards[unreadable === "brave" ? 0 : 1]?.textContent).toContain(errorMessage);
+      expect(cards[healthy === "brave" ? 0 : 1]?.textContent).toContain("設定済み");
+      await controller.navigate("items");
+      await controller.openModal({ kind: "image", itemId: 10 });
+      const provider = root.querySelector<HTMLSelectElement>("#search-provider");
+      expect(provider?.value).toBe(healthy);
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(
+        false,
+      );
+      if (!provider) throw new Error("Missing provider selector");
+      provider.value = unreadable;
+      provider.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+      expect(root.querySelector("dialog")?.textContent).toContain(errorMessage);
+    },
+  );
 
   it.each(["brave", "ollama"] as const)(
     "allows image search with a saved %s key even when settings reads keep failing",

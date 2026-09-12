@@ -21,39 +21,88 @@ export function mountApp(
 ): AppController {
   root.tabIndex = -1;
   const controller = new AppController(backend, render);
-  let modalOpener: {
-    action: string;
-    itemId: string | undefined;
+  type ButtonFocus = {
+    key: string;
     listId: number | null;
     index: number;
+  };
+  let modalOpener: ButtonFocus | null = null;
+  let pendingButtonFocus: ButtonFocus | null = null;
+  let pendingFieldFocus: {
+    key: string;
+    listId: number | null;
+    dialog: boolean;
+    selection: readonly [number | null, number | null] | null;
   } | null = null;
+  let renderedListId: number | null = null;
   let dialogWasOpen = false;
   let restoreModalFocus = false;
-  function matchingButtons(action: string, itemId: string | undefined): HTMLButtonElement[] {
-    return Array.from(root.querySelectorAll<HTMLButtonElement>("button[data-action]")).filter(
-      (button) => button.dataset.action === action && button.dataset.id === itemId,
+  function buttonKey(button: HTMLButtonElement): string {
+    const { action, view, answer, id, provider } = button.dataset;
+    return JSON.stringify([
+      action,
+      view,
+      answer,
+      id,
+      provider,
+      button.form?.dataset.form,
+      button.form?.dataset.provider,
+    ]);
+  }
+  function matchingButtons(key: string): HTMLButtonElement[] {
+    return Array.from(root.querySelectorAll<HTMLButtonElement>("button")).filter(
+      (button) => buttonKey(button) === key,
     );
   }
-  async function openModal(modal: Exclude<Modal, null>, button: HTMLButtonElement): Promise<void> {
-    const action = button.dataset.action;
-    if (controller.state.busy || !action) return;
-    const itemId = button.dataset.id;
-    modalOpener = {
-      action,
-      itemId,
-      listId: action === "create-list" ? null : (controller.state.active?.id ?? null),
-      index: matchingButtons(action, itemId).indexOf(button),
+  function rememberButton(button: HTMLButtonElement): ButtonFocus {
+    const key = buttonKey(button);
+    const isGlobal =
+      button.closest(".sidebar") ||
+      button.dataset.action === "create-list" ||
+      button.form?.dataset.form === "save-key";
+    return {
+      key,
+      listId: isGlobal ? null : renderedListId,
+      index: matchingButtons(key).indexOf(button),
     };
+  }
+  function restoreButton(target: ButtonFocus | null): void {
+    let button: HTMLButtonElement | undefined;
+    if (target && (target.listId === null || target.listId === controller.state.active?.id)) {
+      button = matchingButtons(target.key)[target.index];
+    }
+    if (button && !button.disabled) button.focus({ preventScroll: true });
+    else root.focus({ preventScroll: true });
+  }
+  async function openModal(modal: Exclude<Modal, null>, button: HTMLButtonElement): Promise<void> {
+    if (controller.state.busy) return;
+    modalOpener = rememberButton(button);
     restoreModalFocus = false;
     await controller.openModal(modal);
   }
   function render(): void {
     const focus = document.activeElement;
+    if (
+      !pendingButtonFocus &&
+      focus instanceof HTMLButtonElement &&
+      root.contains(focus) &&
+      !focus.closest("dialog")
+    ) {
+      pendingButtonFocus = rememberButton(focus);
+      pendingFieldFocus = null;
+    }
     const focusKey = focus instanceof HTMLElement ? focus.dataset.focus : undefined;
-    const selection =
-      focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement
-        ? ([focus.selectionStart, focus.selectionEnd] as const)
-        : null;
+    if (!pendingButtonFocus && focusKey && root.contains(focus)) {
+      pendingFieldFocus = {
+        key: focusKey,
+        listId: focusKey === "braveKey" || focusKey === "ollamaKey" ? null : renderedListId,
+        dialog: Boolean(focus?.closest("dialog")),
+        selection:
+          focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement
+            ? [focus.selectionStart, focus.selectionEnd]
+            : null,
+      };
+    }
     root.innerHTML = renderApp(controller.state, (path) =>
       assetUrl(
         path,
@@ -62,36 +111,46 @@ export function mountApp(
           : "asset",
       ),
     );
+    renderedListId = controller.state.active?.id ?? null;
     const dialog = root.querySelector("dialog");
     if (dialogWasOpen && !dialog) restoreModalFocus = true;
     dialogWasOpen = Boolean(dialog);
     if (dialog instanceof HTMLDialogElement) {
+      pendingButtonFocus = null;
       dialog.showModal();
       dialog.addEventListener("cancel", (event) => {
         event.preventDefault();
         controller.closeModal();
       });
     }
-    for (const element of root.querySelectorAll<HTMLElement>("[data-focus]")) {
-      if (element.dataset.focus !== focusKey || !focusKey) continue;
-      element.focus();
+    if (!controller.state.busy && !restoreModalFocus && pendingFieldFocus) {
+      const field = pendingFieldFocus;
       if (
-        selection &&
-        (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+        field.dialog === Boolean(dialog) &&
+        (field.listId === null || field.listId === controller.state.active?.id)
       ) {
-        element.setSelectionRange(selection[0], selection[1]);
+        const element = [...root.querySelectorAll<HTMLElement>("[data-focus]")].find(
+          (entry) => entry.dataset.focus === field.key,
+        );
+        element?.focus({ preventScroll: true });
+        if (
+          field.selection &&
+          (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+        ) {
+          element.setSelectionRange(field.selection[0], field.selection[1]);
+        }
       }
     }
-    if (!dialog && restoreModalFocus && !controller.state.busy) {
-      const opener = modalOpener;
-      modalOpener = null;
-      restoreModalFocus = false;
-      let button: HTMLButtonElement | undefined;
-      if (opener && (opener.listId === null || opener.listId === controller.state.active?.id)) {
-        button = matchingButtons(opener.action, opener.itemId)[opener.index];
+    if (!controller.state.busy) pendingFieldFocus = null;
+    if (!dialog && !controller.state.busy) {
+      if (restoreModalFocus) {
+        restoreButton(modalOpener);
+        modalOpener = null;
+        restoreModalFocus = false;
+      } else if (pendingButtonFocus) {
+        restoreButton(pendingButtonFocus);
       }
-      if (button && !button.disabled) button.focus({ preventScroll: true });
-      else root.focus({ preventScroll: true });
+      pendingButtonFocus = null;
     }
     // Rendering replaces the clicked button. Keep shortcut events inside the app.
     if (!dialog && !root.contains(document.activeElement)) {
@@ -117,6 +176,12 @@ export function mountApp(
     event.preventDefault();
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
+    if (document.activeElement instanceof HTMLElement && document.activeElement.dataset.focus) {
+      pendingButtonFocus = null;
+    } else if (event instanceof SubmitEvent && event.submitter instanceof HTMLButtonElement) {
+      pendingButtonFocus = rememberButton(event.submitter);
+      pendingFieldFocus = null;
+    }
     switch (form.dataset.form) {
       case "add-items":
         void controller.addItems();
@@ -137,6 +202,10 @@ export function mountApp(
     if (!(target instanceof Element)) return;
     const button = target.closest("button");
     if (!(button instanceof HTMLButtonElement) || button.disabled) return;
+    if (!button.closest("dialog") && !(button.form && button.type === "submit")) {
+      pendingButtonFocus = rememberButton(button);
+      pendingFieldFocus = null;
+    }
     const answer = answers.find((entry) => entry.value === button.dataset.answer);
     if (answer) {
       void controller.answer(answer.value);

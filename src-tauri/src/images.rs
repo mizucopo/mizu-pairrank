@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,6 +41,8 @@ pub struct SearchSettings {
     pub brave_configured: bool,
     pub ollama_configured: bool,
     pub default_provider: SearchProvider,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub errors: HashMap<SearchProvider, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +314,7 @@ pub struct ImageService {
     decode_gate: Arc<Mutex<()>>,
     buffer_slots: Arc<Semaphore>,
     search_slots: Semaphore,
+    settings_slots: Arc<Semaphore>,
 }
 
 impl ImageService {
@@ -370,21 +373,34 @@ impl ImageService {
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
             search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
+            settings_slots: Arc::new(Semaphore::new(1)),
         })
     }
 
     pub fn remove_managed_file(&self, path: &str) {
+        self.remove_managed_file_with(path, || {});
+    }
+
+    fn remove_managed_file_with(&self, path: &str, checkpoint: impl FnOnce()) {
         let Some(path) = self.managed_path(path) else {
             return;
         };
-        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
-            && path
-                .canonicalize()
-                .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
-        {
-            // Cleanup must never turn a committed database operation into a failure.
-            let _ = std::fs::remove_file(path).and_then(|()| sync_directory(&self.directory));
-        }
+        let remove = || -> std::io::Result<()> {
+            let pinned = verified_image_directory(&self.directory)?;
+            let filename = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("missing image filename"))?;
+            if !pinned.symlink_metadata(filename)?.is_file() {
+                return Ok(());
+            }
+            checkpoint();
+            pinned.remove_file(filename)?;
+            #[cfg(unix)]
+            pinned.into_std_file().sync_all()?;
+            Ok(())
+        };
+        // Cleanup must never turn a committed database operation into a failure.
+        let _ = remove();
     }
 
     fn managed_path(&self, reference: &str) -> Option<PathBuf> {
@@ -446,18 +462,40 @@ impl ImageService {
         }
     }
 
-    pub fn settings(&self) -> Result<SearchSettings, String> {
-        let brave_configured = self.credentials.get(SearchProvider::Brave)?.is_some();
-        let ollama_configured = self.credentials.get(SearchProvider::Ollama)?.is_some();
-        Ok(SearchSettings {
-            brave_configured,
-            ollama_configured,
-            default_provider: if ollama_configured && !brave_configured {
-                SearchProvider::Ollama
-            } else {
-                SearchProvider::Brave
-            },
+    pub async fn settings(&self) -> Result<SearchSettings, String> {
+        let permit = self
+            .settings_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                "検索設定の読み込みが実行中です。少し待ってから再試行してください。".to_owned()
+            })?;
+        let credentials = self.credentials.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut errors = HashMap::new();
+            let mut configured = |provider| match credentials.get(provider) {
+                Ok(key) => key.is_some(),
+                Err(error) => {
+                    errors.insert(provider, error);
+                    false
+                }
+            };
+            let brave_configured = configured(SearchProvider::Brave);
+            let ollama_configured = configured(SearchProvider::Ollama);
+            Ok(SearchSettings {
+                brave_configured,
+                ollama_configured,
+                default_provider: if ollama_configured && !brave_configured {
+                    SearchProvider::Ollama
+                } else {
+                    SearchProvider::Brave
+                },
+                errors,
+            })
         })
+        .await
+        .map_err(|_| "検索設定を取得できませんでした。".to_owned())?
     }
 
     pub fn set_api_key(&self, provider: SearchProvider, key: String) -> Result<(), String> {
@@ -611,16 +649,7 @@ fn image_storage_lock(app_data: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn reconcile_images(directory: &Path, references: &HashSet<String>) -> std::io::Result<()> {
-    let pinned = open_image_directory(directory)?;
-    let identity = same_file::Handle::from_file(pinned.try_clone()?.into_std_file())?;
-    if !std::fs::symlink_metadata(directory)?.is_dir()
-        || directory.canonicalize()? != directory
-        || same_file::Handle::from_path(directory)? != identity
-    {
-        return Err(std::io::Error::other(
-            "image storage directory was replaced",
-        ));
-    }
+    let pinned = verified_image_directory(directory)?;
     let mut removed = false;
     for entry in pinned.entries()? {
         let entry = entry?;
@@ -653,6 +682,20 @@ fn open_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
     return std::fs::File::open(directory).map(cap_std::fs::Dir::from_std_file);
     #[cfg(not(unix))]
     cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
+}
+
+fn verified_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let pinned = open_image_directory(directory)?;
+    let identity = same_file::Handle::from_file(pinned.try_clone()?.into_std_file())?;
+    if !std::fs::symlink_metadata(directory)?.is_dir()
+        || directory.canonicalize()? != directory
+        || same_file::Handle::from_path(directory)? != identity
+    {
+        return Err(std::io::Error::other(
+            "image storage directory was replaced",
+        ));
+    }
+    Ok(pinned)
 }
 
 fn is_managed_image_name(path: &Path) -> bool {
@@ -957,6 +1000,27 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_uses_the_validated_directory_when_its_path_is_replaced_before_unlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let source = directory.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let image = service.import_local(source.clone()).unwrap();
+        let external_image = external.path().join(&image.path);
+        std::fs::write(&external_image, b"external image").unwrap();
+        let previous = directory.path().join("previous-images");
+        service.remove_managed_file_with(&image.path, || {
+            std::fs::rename(&service.directory, &previous).unwrap();
+            std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+        });
+        assert_eq!(std::fs::read(external_image).unwrap(), b"external image");
+        assert!(!previous.join(image.path).exists());
+        assert_eq!(std::fs::read(source).unwrap(), png(2, 2));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1443,12 +1507,109 @@ mod tests {
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
             search_slots: Semaphore::new(MAX_ACTIVE_SEARCHES),
+            settings_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
     }
 
-    #[test]
-    fn successful_credential_mutations_do_not_depend_on_follow_up_keyring_reads() {
+    #[tokio::test]
+    async fn cancelled_settings_reads_keep_capacity_until_the_keyring_worker_finishes() {
+        struct BlockingCredentials {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl CredentialStore for BlockingCredentials {
+            fn get(&self, _provider: SearchProvider) -> Result<Option<String>, String> {
+                let wait = self.release.lock().unwrap().take();
+                if let Some(wait) = wait {
+                    self.started.send(()).unwrap();
+                    let _ = wait.recv();
+                }
+                Ok(None)
+            }
+            fn set(&self, _provider: SearchProvider, _key: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        service.credentials = Arc::new(BlockingCredentials {
+            started,
+            release: Mutex::new(Some(wait)),
+        });
+        let service = Arc::new(service);
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move { service.settings().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let extra = tokio::time::timeout(Duration::from_millis(100), service.settings()).await;
+        drop(release); // Also releases the worker if any later assertion fails.
+        assert!(extra.is_ok_and(|result| result.is_err_and(|message| message.contains("実行中"))));
+        let settings = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(settings) = service.settings().await {
+                    break settings;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!settings.brave_configured && !settings.ollama_configured);
+    }
+
+    #[tokio::test]
+    async fn settings_preserve_the_healthy_provider_when_the_other_key_cannot_be_read() {
+        struct PartlyReadableCredentials(SearchProvider);
+        impl CredentialStore for PartlyReadableCredentials {
+            fn get(&self, provider: SearchProvider) -> Result<Option<String>, String> {
+                if provider == self.0 {
+                    Err("keyring read failed".into())
+                } else {
+                    Ok(Some("healthy-secret".into()))
+                }
+            }
+            fn set(&self, _provider: SearchProvider, _key: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        for unreadable in [SearchProvider::Brave, SearchProvider::Ollama] {
+            let (_directory, mut service, _) = service(Ok(br#"{"results":[]}"#.to_vec()), vec![]);
+            service.credentials = Arc::new(PartlyReadableCredentials(unreadable));
+            let settings = service.settings().await.unwrap();
+            let healthy = if unreadable == SearchProvider::Brave {
+                SearchProvider::Ollama
+            } else {
+                SearchProvider::Brave
+            };
+            assert_eq!(settings.brave_configured, healthy == SearchProvider::Brave);
+            assert_eq!(
+                settings.ollama_configured,
+                healthy == SearchProvider::Ollama
+            );
+            assert_eq!(settings.default_provider, healthy);
+            assert_eq!(
+                settings.errors,
+                HashMap::from([(unreadable, "keyring read failed".to_owned())])
+            );
+            assert!(
+                !serde_json::to_string(&settings)
+                    .unwrap()
+                    .contains("healthy-secret")
+            );
+            assert!(service.search(healthy, "image".into()).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_credential_mutations_do_not_depend_on_follow_up_keyring_reads() {
         struct UnreadableCredentials(MemoryCredentials);
         impl CredentialStore for UnreadableCredentials {
             fn get(&self, _provider: SearchProvider) -> Result<Option<String>, String> {
@@ -1475,24 +1636,32 @@ mod tests {
             assert!(service.set_api_key(provider, String::new()).is_ok());
             assert_eq!(credentials.0.get(provider).unwrap(), None);
         }
-        assert_eq!(service.settings().unwrap_err(), "keyring read failed");
+        let settings = service.settings().await.unwrap();
+        assert!(!settings.brave_configured && !settings.ollama_configured);
+        assert_eq!(
+            settings.errors,
+            HashMap::from([
+                (SearchProvider::Brave, "keyring read failed".to_owned()),
+                (SearchProvider::Ollama, "keyring read failed".to_owned()),
+            ])
+        );
     }
 
-    #[test]
-    fn credentials_can_be_saved_switched_and_removed_without_returning_secrets() {
+    #[tokio::test]
+    async fn credentials_can_be_saved_switched_and_removed_without_returning_secrets() {
         let (_directory, service, _) = service(Ok(Vec::new()), vec![]);
-        let settings = service.settings().unwrap();
+        let settings = service.settings().await.unwrap();
         assert!(!settings.brave_configured && !settings.ollama_configured);
         assert_eq!(settings.default_provider, SearchProvider::Brave);
         service
             .set_api_key(SearchProvider::Ollama, "ollama-secret".to_owned())
             .unwrap();
-        let settings = service.settings().unwrap();
+        let settings = service.settings().await.unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Ollama);
         service
             .set_api_key(SearchProvider::Brave, "brave-secret".to_owned())
             .unwrap();
-        let settings = service.settings().unwrap();
+        let settings = service.settings().await.unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Brave);
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("secret"));
@@ -1500,7 +1669,7 @@ mod tests {
         service
             .set_api_key(SearchProvider::Brave, String::new())
             .unwrap();
-        let settings = service.settings().unwrap();
+        let settings = service.settings().await.unwrap();
         assert!(!settings.brave_configured);
         assert_eq!(settings.default_provider, SearchProvider::Ollama);
         assert!(

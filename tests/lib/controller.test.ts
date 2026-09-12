@@ -178,6 +178,47 @@ async function mutation(method: MutationMethod) {
 }
 
 describe("mutations after concurrent deletion", () => {
+  it.each([
+    ["renameList", "remaining"],
+    ["renameList", "empty"],
+    ["setRemoteImage", "remaining"],
+    ["setRemoteImage", "empty"],
+  ] as const)(
+    "reconciles a list deleted after successful %s to the %s state",
+    async (method, destination) => {
+      const { api, controller, run } = await mutation(method);
+      api.listSummaries.mockResolvedValue(destination === "remaining" ? [summary(list(2))] : []);
+      await run();
+      expect(controller.state.active).toEqual(destination === "remaining" ? list(2) : null);
+      expect(controller.state.lists.map((entry) => entry.id)).toEqual(
+        destination === "remaining" ? [2] : [],
+      );
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.modal).toBeNull();
+      expect(controller.state.candidates).toEqual([]);
+      expect(controller.state.drafts.items).toBe("");
+      expect(controller.state.error).toBe("リストが見つかりません。");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it("keeps a confirmed deleted list cleared if recovery fails after a successful mutation", async () => {
+    const { api, controller, run } = await mutation("setRemoteImage");
+    api.listSummaries
+      .mockResolvedValueOnce([summary(list(2))])
+      .mockRejectedValueOnce("一覧を読み込めません。");
+    await run();
+    expect(controller.state.active).toBeNull();
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.candidates).toEqual([]);
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.lists).toEqual([summary(list(2))]);
+    expect(controller.state.error).toBe("一覧を読み込めません。");
+    await run();
+    expect(api.setRemoteImage).toHaveBeenCalledOnce();
+  });
+
   it.each(mutationMethods)("reconciles a missing list during %s", async (method) => {
     const { api, controller, run } = await mutation(method);
     api[method].mockRejectedValueOnce("リストが見つかりません。");
@@ -253,6 +294,55 @@ describe("mutations after concurrent deletion", () => {
 });
 
 describe("credential mutation acknowledgments", () => {
+  it.each([false, true])(
+    "clears the acknowledged provider error before a failed refresh (remove=%s)",
+    async (remove) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValueOnce({
+        braveConfigured: false,
+        ollamaConfigured: true,
+        defaultProvider: "ollama",
+        errors: { brave: "old read error" },
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      controller.state.drafts.braveKey = "saved-key";
+      api.searchSettings.mockRejectedValueOnce(new Error("refresh failed"));
+      await controller.saveKey("brave", remove);
+      expect(controller.state.settings?.errors?.brave).toBeUndefined();
+      expect(controller.state.settings?.braveConfigured).toBe(!remove);
+      expect(controller.state.settings?.ollamaConfigured).toBe(true);
+      expect(controller.state.error).toContain("refresh failed");
+    },
+  );
+
+  it.each(["brave", "ollama"] as const)(
+    "preserves an acknowledged %s key across partial settings read failures",
+    async (provider) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: false,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+        errors: { [provider]: "keyring read failed" },
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate("settings");
+      const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+      expect(controller.state.settings?.[configured]).toBe(false);
+      controller.state.drafts[provider === "brave" ? "braveKey" : "ollamaKey"] = "saved-key";
+      await controller.saveKey(provider);
+      expect(controller.state.settings?.[configured]).toBe(true);
+      expect(controller.state.provider).toBe(provider);
+      expect(controller.state.settings?.errors?.[provider]).toBe("keyring read failed");
+      expect(controller.state.notice).toBe("APIキーを保存しました。");
+      await controller.openModal({ kind: "image", itemId: 10 });
+      expect(controller.state.settings?.[configured]).toBe(true);
+      expect(controller.state.provider).toBe(provider);
+    },
+  );
+
   it.each([
     ["brave", false, true, false, "brave"],
     ["brave", true, false, false, "brave"],
@@ -377,6 +467,29 @@ describe("credential mutation acknowledgments", () => {
 });
 
 describe("comparison state and persistence boundaries", () => {
+  it.each(["restart", "settled answer"] as const)(
+    "recovers when a successful %s is followed by a sidebar refresh confirming list deletion",
+    async (operation) => {
+      const { controller, api, saved } = await comparison();
+      const remaining = list(2);
+      api.listSummaries.mockResolvedValue([summary(remaining)]);
+      if (operation === "restart") await controller.startComparison();
+      else {
+        api.answer.mockResolvedValueOnce({
+          ...saved,
+          convergence: { ...saved.convergence, converged: true },
+        });
+        await controller.answer("equal");
+      }
+      expect(controller.state.active).toEqual(remaining);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.view).toBe("items");
+      expect(controller.state.notice).toBe("");
+      expect(controller.state.error).toBe("リストが見つかりません。");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
   it.each(["remaining", "empty"] as const)(
     "recovers a deleted active sidebar selection to the %s state",
     async (destination) => {
@@ -592,6 +705,7 @@ describe("comparison state and persistence boundaries", () => {
       await controller.confirmDelete();
       if (destination === "new list") {
         api.createList.mockResolvedValue(second);
+        api.listSummaries.mockResolvedValue([summary(second)]);
         await controller.openModal({ kind: "create-list" });
         controller.state.drafts.name = second.name;
         await controller.saveName();

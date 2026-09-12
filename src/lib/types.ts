@@ -43,6 +43,7 @@ export type SearchSettings = {
   braveConfigured: boolean;
   ollamaConfigured: boolean;
   defaultProvider: SearchProvider;
+  errors?: Partial<Record<SearchProvider, string>>;
 };
 export type AppApi = {
   listSummaries: () => Promise<ListSummary[]>;

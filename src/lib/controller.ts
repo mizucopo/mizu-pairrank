@@ -156,8 +156,30 @@ export class AppController {
   }
 
   private async loadSettings(): Promise<void> {
-    this.state.settings = await this.api.searchSettings();
-    this.state.provider = this.state.settings.defaultProvider;
+    this.acceptSettings(await this.api.searchSettings());
+  }
+
+  private acceptSettings(current: SearchSettings): void {
+    const settings = { ...current };
+    let hasErrors = false;
+    for (const provider of ["brave", "ollama"] as const) {
+      if (current.errors?.[provider] !== undefined) {
+        hasErrors = true;
+        const field = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+        settings[field] = this.state.settings?.[field] ?? false;
+      }
+    }
+    if (hasErrors) {
+      if (settings.braveConfigured && settings.errors?.brave === undefined)
+        settings.defaultProvider = "brave";
+      else if (settings.ollamaConfigured && settings.errors?.ollama === undefined)
+        settings.defaultProvider = "ollama";
+      else
+        settings.defaultProvider =
+          settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
+    }
+    this.state.settings = settings;
+    this.state.provider = settings.defaultProvider;
   }
 
   async openModal(modal: Exclude<Modal, null>): Promise<void> {
@@ -176,10 +198,7 @@ export class AppController {
     if (modal.kind === "image") {
       await this.performImageRead(
         () => this.api.searchSettings(),
-        (settings) => {
-          this.state.settings = settings;
-          this.state.provider = settings.defaultProvider;
-        },
+        (settings) => this.acceptSettings(settings),
       );
     } else this.changed();
   }
@@ -214,7 +233,14 @@ export class AppController {
 
   private async acceptList(list: ListState): Promise<void> {
     this.acceptCommittedList(list);
+    await this.refreshListSummaries(list.id);
+  }
+
+  private async refreshListSummaries(listId: number): Promise<void> {
     this.state.lists = await this.api.listSummaries();
+    if (!this.state.lists.some((entry) => entry.id === listId)) {
+      await this.handleListError(listId, new Error("リストが見つかりません。"));
+    }
   }
 
   async saveName(): Promise<void> {
@@ -301,7 +327,7 @@ export class AppController {
           .catch((error: unknown) => this.handleListError(list.id, error));
         if (pair && pair.revision !== current.revision) continue;
         if (!pair && current.items.length >= 2) continue;
-        this.state.lists = await this.api.listSummaries();
+        await this.refreshListSummaries(list.id);
         this.state.pair = pair;
         this.state.view = pair ? "compare" : "items";
         return;
@@ -323,6 +349,7 @@ export class AppController {
       this.state.candidates = [];
       this.state.searched = false;
       this.state.drafts.items = "";
+      this.state.notice = "";
       this.state.view = "items";
       this.state.active = await this.loadFirstAvailableList();
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
@@ -373,7 +400,7 @@ export class AppController {
         this.state.view = "ranking";
         this.state.notice = "順位ほぼ確定。比較を続けることもできます。";
       }
-      this.state.lists = await this.api.listSummaries();
+      await this.refreshListSummaries(result.id);
       if (!result.convergence.converged) {
         const next = await this.api
           .nextPair(result.id)
@@ -461,10 +488,13 @@ export class AppController {
         ...this.state.settings,
         [configured]: !remove,
       };
+      if (settings.errors) {
+        settings.errors = { ...settings.errors };
+        delete settings.errors[provider];
+      }
       settings.defaultProvider =
         settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
-      this.state.settings = settings;
-      this.state.provider = settings.defaultProvider;
+      this.acceptSettings(settings);
       try {
         await this.loadSettings();
       } catch (error) {
