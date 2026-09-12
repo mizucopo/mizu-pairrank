@@ -308,6 +308,8 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 
 pub struct ImageService {
     directory: PathBuf,
+    // Keep the startup directory alive so replacing its pathname cannot redefine storage.
+    directory_identity: Arc<same_file::Handle>,
     storage_lease: Arc<std::fs::File>,
     credentials: Arc<dyn CredentialStore>,
     transport: Arc<dyn ImageTransport>,
@@ -339,6 +341,10 @@ impl ImageService {
         let directory = directory
             .canonicalize()
             .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
+        let directory_identity = open_image_directory(&directory)
+            .and_then(|directory| same_file::Handle::from_file(directory.into_std_file()))
+            .map(Arc::new)
+            .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
         #[cfg(unix)]
         restrict_image_permissions(&directory)
             .map_err(|_| "保存済み画像の権限を設定できませんでした。".to_owned())?;
@@ -350,7 +356,7 @@ impl ImageService {
                     // Read the complete reference set before deleting anything. No other
                     // ImageService can import or associate files while this lock is exclusive.
                     let references = database.image_paths()?;
-                    reconcile_images(&directory, &references)
+                    reconcile_images(&directory, &directory_identity, &references)
                         .map_err(|_| "未使用画像を確認できませんでした。".to_owned())?;
                 }
                 storage_lease
@@ -367,6 +373,7 @@ impl ImageService {
             .map_err(|_| "画像の保存先をロックできませんでした。".to_owned())?;
         Ok(Self {
             directory,
+            directory_identity,
             storage_lease: Arc::new(storage_lease),
             credentials: Arc::new(SystemCredentials),
             transport: Arc::new(HttpTransport),
@@ -386,7 +393,7 @@ impl ImageService {
             return;
         };
         let remove = || -> std::io::Result<()> {
-            let pinned = verified_image_directory(&self.directory)?;
+            let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
             let filename = path
                 .file_name()
                 .ok_or_else(|| std::io::Error::other("missing image filename"))?;
@@ -423,13 +430,13 @@ impl ImageService {
             if reference.contains(['/', '\\']) {
                 return Err(StatusCode::FORBIDDEN);
             }
-            let path = self.managed_path(reference).ok_or(StatusCode::FORBIDDEN)?;
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| StatusCode::NOT_FOUND)?;
-            if !metadata.is_file()
-                || !path
-                    .canonicalize()
-                    .is_ok_and(|resolved| resolved.parent() == Some(self.directory.as_path()))
-            {
+            self.managed_path(reference).ok_or(StatusCode::FORBIDDEN)?;
+            let pinned = verified_image_directory(&self.directory, &self.directory_identity)
+                .map_err(|_| StatusCode::FORBIDDEN)?;
+            let metadata = pinned
+                .symlink_metadata(reference)
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            if !metadata.is_file() {
                 return Err(StatusCode::FORBIDDEN);
             }
             if metadata.len() > MAX_IMAGE_BYTES as u64 {
@@ -438,7 +445,7 @@ impl ImageService {
             if request.method() == Method::HEAD {
                 return Ok((Vec::new(), metadata.len()));
             }
-            let file = std::fs::File::open(path).map_err(|_| StatusCode::NOT_FOUND)?;
+            let file = pinned.open(reference).map_err(|_| StatusCode::NOT_FOUND)?;
             let mut bytes = Vec::new();
             file.take(MAX_IMAGE_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -586,6 +593,7 @@ impl ImageService {
             .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
         let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
         let directory = self.directory.clone();
+        let directory_identity = self.directory_identity.clone();
         let decode_gate = self.decode_gate.clone();
         let storage_lease = self.storage_lease.clone();
         tokio::task::spawn_blocking(move || {
@@ -596,7 +604,12 @@ impl ImageService {
             let _permit = decode_gate
                 .lock()
                 .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-            save_image(&directory, &bytes, Some(candidate.source_url))
+            save_image(
+                &directory,
+                &directory_identity,
+                &bytes,
+                Some(candidate.source_url),
+            )
         })
         .await
         .map_err(|_| "画像保存処理を完了できませんでした。".to_owned())?
@@ -620,7 +633,7 @@ impl ImageService {
         file.take(MAX_IMAGE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "選択した画像ファイルを読み取れませんでした。".to_owned())?;
-        save_image(&self.directory, &bytes, None)
+        save_image(&self.directory, &self.directory_identity, &bytes, None)
     }
 }
 
@@ -648,8 +661,12 @@ fn image_storage_lock(app_data: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn reconcile_images(directory: &Path, references: &HashSet<String>) -> std::io::Result<()> {
-    let pinned = verified_image_directory(directory)?;
+fn reconcile_images(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+    references: &HashSet<String>,
+) -> std::io::Result<()> {
+    let pinned = verified_image_directory(directory, expected_identity)?;
     let mut removed = false;
     for entry in pinned.entries()? {
         let entry = entry?;
@@ -684,10 +701,14 @@ fn open_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
     cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
 }
 
-fn verified_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
+fn verified_image_directory(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+) -> std::io::Result<cap_std::fs::Dir> {
     let pinned = open_image_directory(directory)?;
     let identity = same_file::Handle::from_file(pinned.try_clone()?.into_std_file())?;
-    if !std::fs::symlink_metadata(directory)?.is_dir()
+    if &identity != expected_identity
+        || !std::fs::symlink_metadata(directory)?.is_dir()
         || directory.canonicalize()? != directory
         || same_file::Handle::from_path(directory)? != identity
     {
@@ -912,36 +933,32 @@ fn sync_directory(_directory: &Path) -> std::io::Result<()> {
 
 fn save_image(
     directory: &Path,
+    expected_identity: &same_file::Handle,
     bytes: &[u8],
     source_url: Option<String>,
 ) -> Result<ImageAsset, String> {
-    save_image_with(directory, bytes, source_url, |_| {})
+    save_image_with(directory, expected_identity, bytes, source_url, |_| {})
 }
 
 fn save_image_with(
     directory: &Path,
+    expected_identity: &same_file::Handle,
     bytes: &[u8],
     source_url: Option<String>,
     mut checkpoint: impl FnMut(bool),
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
     // All creation, synchronization and rollback stay relative to this open directory.
-    let pinned = open_image_directory(directory)
-        .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
+    let pinned = verified_image_directory(directory, expected_identity)
+        .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())?;
     let directory_handle = pinned
         .try_clone()
         .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?
         .into_std_file();
-    let identity = same_file::Handle::from_file(
-        directory_handle
-            .try_clone()
-            .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?,
-    )
-    .map_err(|_| "画像の保存先を開けませんでした。".to_owned())?;
     let unchanged = || -> std::io::Result<bool> {
         Ok(std::fs::symlink_metadata(directory)?.is_dir()
             && directory.canonicalize()? == directory
-            && same_file::Handle::from_path(directory)? == identity)
+            && &same_file::Handle::from_path(directory)? == expected_identity)
     };
     if !unchanged().unwrap_or(false) {
         return Err("画像の保存先が変更されています。アプリを再起動してください。".to_owned());
@@ -1002,6 +1019,100 @@ mod tests {
     use std::sync::Mutex;
 
     #[cfg(unix)]
+    fn with_ordinary_directory_replacement(check: impl FnOnce(&mut ImageService, &Path, &str)) {
+        let app_data = tempfile::tempdir().unwrap();
+        let mut service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let source = app_data.path().join("source.png");
+        let original = png(4, 2);
+        std::fs::write(&source, &original).unwrap();
+        let image = service.import_local(source.clone()).unwrap();
+        let previous = app_data.path().join("previous-images");
+        std::fs::rename(&service.directory, &previous).unwrap();
+        std::fs::create_dir(&service.directory).unwrap();
+        let replacement = service.directory.join(&image.path);
+        std::fs::write(&replacement, b"replacement image").unwrap();
+
+        check(&mut service, &source, &image.path);
+
+        assert_eq!(std::fs::read(replacement).unwrap(), b"replacement image");
+        assert_eq!(std::fs::read_dir(&service.directory).unwrap().count(), 1);
+        assert!(previous.join(image.path).is_file());
+        assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_an_ordinary_directory_replacement_before_the_operation() {
+        with_ordinary_directory_replacement(|service, source, _| {
+            assert!(service.import_local(source.to_owned()).is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_protocol_rejects_an_ordinary_directory_replacement_before_the_operation() {
+        with_ordinary_directory_replacement(|service, _, reference| {
+            for method in ["GET", "HEAD"] {
+                let request = tauri::http::Request::builder()
+                    .method(method)
+                    .uri(format!("pairrank-image://localhost/{reference}"))
+                    .body(Vec::new())
+                    .unwrap();
+                let response = service.image_response(&request);
+                assert_eq!(response.status(), tauri::http::StatusCode::FORBIDDEN);
+                assert!(response.body().is_empty());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_an_ordinary_directory_replacement_before_the_operation() {
+        with_ordinary_directory_replacement(|service, _, reference| {
+            service.remove_managed_file(reference);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_rejects_an_ordinary_directory_replacement_before_the_operation() {
+        with_ordinary_directory_replacement(|service, _, _| {
+            assert!(
+                reconcile_images(
+                    &service.directory,
+                    &service.directory_identity,
+                    &HashSet::new(),
+                )
+                .is_err()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_import_rejects_an_ordinary_directory_replacement_before_the_operation() {
+        with_ordinary_directory_replacement(|images, _, _| {
+            let (_directory, _service, transport) = service(
+                Ok(Vec::new()),
+                vec![resource("https://example.com/image.png", png(3, 2))],
+            );
+            images.transport = transport.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(images.import_remote(ImageCandidate {
+                id: "https://example.com/image.png".to_owned(),
+                title: "Image".to_owned(),
+                preview_url: String::new(),
+                source_url: "https://example.com/item".to_owned(),
+            }));
+            assert!(result.is_err());
+            assert_eq!(transport.fetches.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cleanup_uses_the_validated_directory_when_its_path_is_replaced_before_unlink() {
         let directory = tempfile::tempdir().unwrap();
@@ -1033,7 +1144,9 @@ mod tests {
         std::fs::write(&external_file, b"external image").unwrap();
         std::fs::rename(&canonical, directory.path().join("previous-images")).unwrap();
         std::os::unix::fs::symlink(external.path(), &canonical).unwrap();
-        assert!(reconcile_images(&canonical, &HashSet::new()).is_err());
+        assert!(
+            reconcile_images(&canonical, &service.directory_identity, &HashSet::new()).is_err()
+        );
         assert_eq!(std::fs::read(external_file).unwrap(), b"external image");
     }
 
@@ -1248,12 +1361,18 @@ mod tests {
             std::fs::write(&source, &original).unwrap();
             let previous = service.import_local(source.clone()).unwrap();
             let previous_directory = app_data.path().join("old-images");
-            let result = save_image_with(&service.directory, &original, None, |created| {
-                if created == replace_after_creation {
-                    std::fs::rename(&service.directory, &previous_directory).unwrap();
-                    std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
-                }
-            });
+            let result = save_image_with(
+                &service.directory,
+                &service.directory_identity,
+                &original,
+                None,
+                |created| {
+                    if created == replace_after_creation {
+                        std::fs::rename(&service.directory, &previous_directory).unwrap();
+                        std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+                    }
+                },
+            );
             assert!(
                 result.is_err(),
                 "a changed save directory must not produce a committed reference"
@@ -1501,6 +1620,14 @@ mod tests {
         });
         let service = ImageService {
             directory: directory.path().canonicalize().unwrap(),
+            directory_identity: Arc::new(
+                same_file::Handle::from_file(
+                    open_image_directory(directory.path())
+                        .unwrap()
+                        .into_std_file(),
+                )
+                .unwrap(),
+            ),
             storage_lease: Arc::new(tempfile::tempfile().unwrap()),
             credentials: Arc::new(MemoryCredentials::default()),
             transport: transport.clone(),
@@ -1918,7 +2045,15 @@ mod tests {
     #[test]
     fn invalid_unsupported_and_oversized_images_are_rejected_without_creating_files() {
         let (directory, service, _) = service(Ok(Vec::new()), vec![]);
-        assert!(save_image(&service.directory, b"<svg></svg>", None).is_err());
+        assert!(
+            save_image(
+                &service.directory,
+                &service.directory_identity,
+                b"<svg></svg>",
+                None
+            )
+            .is_err()
+        );
         assert!(normalize_image(b"GIF89a", 320).is_err());
         assert!(normalize_image(&vec![0; MAX_IMAGE_BYTES + 1], 320).is_err());
         assert!(
