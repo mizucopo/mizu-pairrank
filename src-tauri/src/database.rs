@@ -678,6 +678,52 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn database_open_rejects_a_hardlinked_file_without_changing_the_external_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for original_mode in [0o600, 0o644] {
+            let directory = tempfile::tempdir().unwrap();
+            let external = directory.path().join("external.sqlite3");
+            let managed = directory.path().join("pairrank.sqlite3");
+            Connection::open(&external)
+                .unwrap()
+                .execute_batch("VACUUM")
+                .unwrap();
+            std::fs::set_permissions(&external, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            let before = std::fs::read(&external).unwrap();
+            assert!(!before.is_empty());
+            std::fs::hard_link(&external, &managed).unwrap();
+
+            let result = Database::open(&managed);
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&external).unwrap(), before);
+            assert_eq!(
+                std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+                original_mode
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlink_added_after_preparation_is_rejected_before_migration() {
+        for opened in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let managed = directory.path().join("pairrank.sqlite3");
+            let external = directory.path().join("external.sqlite3");
+            let result = Database::open_with(&managed, |sqlite_opened| {
+                if sqlite_opened == opened {
+                    std::fs::hard_link(&managed, &external).unwrap();
+                }
+            });
+            assert!(result.is_err());
+            assert!(std::fs::read(&external).unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
     fn check_ordinary_database_replacement(restore_before_validation: bool) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pairrank.sqlite3");

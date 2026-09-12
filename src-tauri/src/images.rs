@@ -317,6 +317,7 @@ pub struct ImageService {
     buffer_slots: Arc<Semaphore>,
     search_slots: Arc<Semaphore>,
     settings_slots: Arc<Semaphore>,
+    key_write_slots: Arc<Semaphore>,
 }
 
 impl ImageService {
@@ -399,6 +400,7 @@ impl ImageService {
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
             search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
+            key_write_slots: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -547,12 +549,26 @@ impl ImageService {
         .map_err(|_| "検索設定を取得できませんでした。".to_owned())?
     }
 
-    pub fn set_api_key(&self, provider: SearchProvider, key: String) -> Result<(), String> {
+    pub async fn set_api_key(&self, provider: SearchProvider, key: String) -> Result<(), String> {
         let key = key.trim();
         if key.len() > 4096 || key.chars().any(char::is_control) {
             return Err("APIキーの形式が正しくありません。".to_owned());
         }
-        self.credentials.set(provider, key)
+        let permit = self
+            .key_write_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                "APIキーの保存が実行中です。少し待ってから再試行してください。".to_owned()
+            })?;
+        let key = key.to_owned();
+        let credentials = self.credentials.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            credentials.set(provider, &key)
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     pub async fn search(
@@ -2110,6 +2126,7 @@ mod tests {
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
             search_slots: Arc::new(Semaphore::new(MAX_ACTIVE_SEARCHES)),
             settings_slots: Arc::new(Semaphore::new(1)),
+            key_write_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
     }
@@ -2233,6 +2250,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_key_writes_keep_shared_capacity_until_the_keyring_worker_finishes() {
+        struct BlockingCredentials {
+            keys: MemoryCredentials,
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl CredentialStore for BlockingCredentials {
+            fn get(&self, provider: SearchProvider) -> Result<Option<String>, String> {
+                self.keys.get(provider)
+            }
+            fn set(&self, provider: SearchProvider, key: &str) -> Result<(), String> {
+                let wait = self.release.lock().unwrap().take();
+                if let Some(wait) = wait {
+                    self.started.send(()).unwrap();
+                    let _ = wait.recv();
+                }
+                self.keys.set(provider, key)
+            }
+        }
+        for (provider, key, next_provider, next_key) in [
+            (
+                SearchProvider::Brave,
+                "saved-key",
+                SearchProvider::Ollama,
+                "",
+            ),
+            (
+                SearchProvider::Ollama,
+                "",
+                SearchProvider::Brave,
+                "saved-key",
+            ),
+        ] {
+            let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let keys = MemoryCredentials::default();
+            keys.set(SearchProvider::Ollama, "original-key").unwrap();
+            service.credentials = Arc::new(BlockingCredentials {
+                keys,
+                started,
+                release: Mutex::new(Some(wait)),
+            });
+            let service = Arc::new(service);
+            let first = tokio::spawn({
+                let service = service.clone();
+                async move { service.set_api_key(provider, key.to_owned()).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let extra = tokio::time::timeout(
+                Duration::from_millis(100),
+                service.set_api_key(next_provider, next_key.to_owned()),
+            )
+            .await;
+            drop(release); // Release the worker even if the capacity assertion fails.
+            assert!(
+                extra.is_ok_and(
+                    |result| result.is_err_and(|message| message.contains("保存が実行中"))
+                )
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if service
+                        .set_api_key(next_provider, next_key.to_owned())
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let settings = service.settings().await.unwrap();
+            assert!(settings.brave_configured);
+            assert!(!settings.ollama_configured);
+        }
+    }
+
+    #[tokio::test]
     async fn settings_preserve_the_healthy_provider_when_the_other_key_cannot_be_read() {
         struct PartlyReadableCredentials(SearchProvider);
         impl CredentialStore for PartlyReadableCredentials {
@@ -2294,13 +2397,14 @@ mod tests {
             assert!(
                 service
                     .set_api_key(provider, "saved-key".to_owned())
+                    .await
                     .is_ok()
             );
             assert_eq!(
                 credentials.0.get(provider).unwrap().as_deref(),
                 Some("saved-key")
             );
-            assert!(service.set_api_key(provider, String::new()).is_ok());
+            assert!(service.set_api_key(provider, String::new()).await.is_ok());
             assert_eq!(credentials.0.get(provider).unwrap(), None);
         }
         let settings = service.settings().await.unwrap();
@@ -2322,11 +2426,13 @@ mod tests {
         assert_eq!(settings.default_provider, SearchProvider::Brave);
         service
             .set_api_key(SearchProvider::Ollama, "ollama-secret".to_owned())
+            .await
             .unwrap();
         let settings = service.settings().await.unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Ollama);
         service
             .set_api_key(SearchProvider::Brave, "brave-secret".to_owned())
+            .await
             .unwrap();
         let settings = service.settings().await.unwrap();
         assert_eq!(settings.default_provider, SearchProvider::Brave);
@@ -2335,6 +2441,7 @@ mod tests {
         assert!(serialized.contains("braveConfigured"));
         service
             .set_api_key(SearchProvider::Brave, String::new())
+            .await
             .unwrap();
         let settings = service.settings().await.unwrap();
         assert!(!settings.brave_configured);
@@ -2342,6 +2449,7 @@ mod tests {
         assert!(
             service
                 .set_api_key(SearchProvider::Brave, "key\ninjected".to_owned())
+                .await
                 .is_err()
         );
     }
@@ -2395,6 +2503,7 @@ mod tests {
         );
         service
             .set_api_key(SearchProvider::Brave, "test-key".to_owned())
+            .await
             .unwrap();
         let results = service
             .search(SearchProvider::Brave, "  猫  ".to_owned())
@@ -2436,6 +2545,7 @@ mod tests {
         ]);
         service
             .set_api_key(SearchProvider::Ollama, "test-key".to_owned())
+            .await
             .unwrap();
         let results = service
             .search(SearchProvider::Ollama, "猫".to_owned())
@@ -2458,6 +2568,7 @@ mod tests {
         );
         service
             .set_api_key(SearchProvider::Ollama, "test-key".to_owned())
+            .await
             .unwrap();
         assert!(
             service
@@ -2717,6 +2828,7 @@ mod tests {
         });
         service
             .set_api_key(SearchProvider::Brave, "test-key".into())
+            .await
             .unwrap();
         let service = Arc::new(service);
         let mut pending = Vec::new();
@@ -2805,6 +2917,7 @@ mod tests {
         });
         service
             .set_api_key(SearchProvider::Brave, "test-key".into())
+            .await
             .unwrap();
         let source = directory.path().join("source.png");
         std::fs::write(&source, png(4, 2)).unwrap();
@@ -2898,6 +3011,7 @@ mod tests {
         );
         service
             .set_api_key(SearchProvider::Brave, "test-key".into())
+            .await
             .unwrap();
         let gate = service.decode_gate.clone();
         let (occupied, occupied_rx) = std::sync::mpsc::channel();

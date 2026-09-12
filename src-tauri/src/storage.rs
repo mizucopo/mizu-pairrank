@@ -24,6 +24,7 @@ impl PreparedDatabaseFile {
             if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected {
                 return Err(io::Error::other("prepared database file was replaced"));
             }
+            verify_single_link(metadata.nlink(), true)?;
         }
         #[cfg(not(unix))]
         let _ = path;
@@ -222,7 +223,7 @@ fn restrict_existing_file_with(
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("missing managed filename"))?;
-    restrict_existing_file_in_with(&directory, name, false, checkpoint)
+    restrict_existing_file_in_with(&directory, name, checkpoint)
 }
 
 #[cfg(unix)]
@@ -230,14 +231,13 @@ pub(crate) fn restrict_existing_file_in(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
 ) -> io::Result<()> {
-    restrict_existing_file_in_with(directory, name, true, |_| {}).map(|_| ())
+    restrict_existing_file_in_with(directory, name, |_| {}).map(|_| ())
 }
 
 #[cfg(unix)]
 fn restrict_existing_file_in_with(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
-    single_link: bool,
     mut checkpoint: impl FnMut(bool),
 ) -> io::Result<(u64, u64)> {
     use cap_std::fs::MetadataExt as _;
@@ -249,7 +249,7 @@ fn restrict_existing_file_in_with(
             "managed file is not a regular file",
         ));
     }
-    verify_single_link(metadata.nlink(), single_link)?;
+    verify_single_link(metadata.nlink(), true)?;
     checkpoint(false);
     let identity = (metadata.dev(), metadata.ino());
     if metadata.permissions().mode() & 0o7777 != 0o600 {
@@ -257,13 +257,13 @@ fn restrict_existing_file_in_with(
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 checkpoint(true);
-                restore_unreadable_entry(directory, name, identity, 0o600, single_link)?
+                restore_unreadable_entry(directory, name, identity, 0o600, true)?
             }
             Err(error) => return Err(error),
         };
         let metadata = file.metadata()?;
         verify_identity(&metadata, identity)?;
-        verify_single_link(metadata.nlink(), single_link)?;
+        verify_single_link(metadata.nlink(), true)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
     }
@@ -274,7 +274,7 @@ fn restrict_existing_file_in_with(
 fn verify_single_link(link_count: u64, required: bool) -> io::Result<()> {
     if required && link_count != 1 {
         return Err(io::Error::other(
-            "managed image must have exactly one hard link",
+            "managed file must have exactly one hard link",
         ));
     }
     Ok(())
@@ -373,6 +373,7 @@ pub fn prepare_database_file(path: &Path) -> io::Result<PreparedDatabaseFile> {
                 File::open(parent)?.sync_all()?;
             }
             let metadata = file.metadata()?;
+            verify_single_link(metadata.nlink(), true)?;
             (metadata.dev(), metadata.ino())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -565,7 +566,7 @@ mod tests {
             fs::write(&managed, b"unchanged image").unwrap();
             fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
             let pinned = cap_std::fs::Dir::from_std_file(File::open(directory.path()).unwrap());
-            let result = restrict_existing_file_in_with(&pinned, name, true, |repairing| {
+            let result = restrict_existing_file_in_with(&pinned, name, |repairing| {
                 if !repairing {
                     fs::hard_link(&managed, &external).unwrap();
                 }
@@ -575,6 +576,48 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(external_mode, original_mode);
             assert_eq!(fs::read(external).unwrap(), b"unchanged image");
+        }
+    }
+
+    #[test]
+    fn database_permission_repair_rejects_a_hardlink_created_after_metadata_validation() {
+        for original_mode in [0o644, 0o000] {
+            let directory = tempfile::tempdir().unwrap();
+            let managed = directory.path().join("pairrank.sqlite3");
+            let external = directory.path().join("external.sqlite3");
+            fs::write(&managed, b"unchanged database").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            let result = restrict_existing_file_with(&managed, |repairing| {
+                if !repairing {
+                    fs::hard_link(&managed, &external).unwrap();
+                }
+            });
+            let external_mode = mode(&external);
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(result.is_err());
+            assert_eq!(external_mode, original_mode);
+            assert_eq!(fs::read(external).unwrap(), b"unchanged database");
+        }
+    }
+
+    #[test]
+    fn database_preparation_rejects_hardlinked_sidecars_without_changing_their_targets() {
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let directory = tempfile::tempdir().unwrap();
+            let managed = directory.path().join("pairrank.sqlite3");
+            prepare_database_file(&managed).unwrap();
+            let external = directory.path().join("external");
+            fs::write(&external, b"external content").unwrap();
+            fs::set_permissions(&external, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::hard_link(
+                &external,
+                directory.path().join(format!("pairrank.sqlite3{suffix}")),
+            )
+            .unwrap();
+
+            assert!(prepare_database_file(&managed).is_err());
+            assert_eq!(mode(&external), 0o644);
+            assert_eq!(fs::read(external).unwrap(), b"external content");
         }
     }
 
