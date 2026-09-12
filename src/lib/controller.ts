@@ -10,6 +10,7 @@ import type {
 } from "./types.js";
 
 export type View = "items" | "compare" | "ranking" | "settings";
+type ReadKind = "image" | "settings";
 export type Modal =
   | { kind: "create-list" }
   | { kind: "rename-list" }
@@ -32,7 +33,7 @@ export type AppState = {
   settings: SearchSettings | null;
   candidates: ImageCandidate[];
   searched: boolean;
-  imageReadPending: boolean;
+  readPending: ReadKind | null;
   provider: SearchProvider;
   drafts: { name: string; items: string; query: string; braveKey: string; ollamaKey: string };
 };
@@ -66,12 +67,12 @@ export class AppController {
     settings: null,
     candidates: [],
     searched: false,
-    imageReadPending: false,
+    readPending: null,
     provider: "brave",
     drafts: { name: "", items: "", query: "", braveKey: "", ollamaKey: "" },
   };
 
-  private imageRead: symbol | null = null;
+  private readRequest: symbol | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -127,6 +128,7 @@ export class AppController {
   }
 
   async selectList(id: number): Promise<void> {
+    this.cancelRead("settings");
     await this.perform(async () => {
       const list = await this.api
         .getList(id)
@@ -140,6 +142,8 @@ export class AppController {
   }
 
   async navigate(view: View): Promise<void> {
+    if (view === "settings" && this.state.readPending === "settings") return;
+    this.cancelRead("settings");
     if (this.state.busy) return;
     if (view === "compare") {
       await this.startComparison();
@@ -149,14 +153,12 @@ export class AppController {
     this.state.modal = null;
     this.state.error = "";
     if (view === "settings") {
-      await this.perform(async () => {
-        await this.loadSettings();
-      });
+      await this.performRead(
+        "settings",
+        () => this.api.searchSettings(),
+        (settings) => this.acceptSettings(settings),
+      );
     } else this.changed();
-  }
-
-  private async loadSettings(): Promise<void> {
-    this.acceptSettings(await this.api.searchSettings());
   }
 
   private acceptSettings(current: SearchSettings): void {
@@ -183,6 +185,7 @@ export class AppController {
   }
 
   async openModal(modal: Exclude<Modal, null>): Promise<void> {
+    this.cancelRead("settings");
     if (this.state.busy) return;
     this.state.modal = modal;
     this.state.error = "";
@@ -196,7 +199,8 @@ export class AppController {
     this.state.candidates = [];
     this.state.searched = false;
     if (modal.kind === "image") {
-      await this.performImageRead(
+      await this.performRead(
+        "image",
         () => this.api.searchSettings(),
         (settings) => this.acceptSettings(settings),
       );
@@ -204,12 +208,8 @@ export class AppController {
   }
 
   closeModal(): void {
-    if (this.state.busy && !this.state.imageReadPending) return;
-    if (this.state.imageReadPending) {
-      this.imageRead = null;
-      this.state.imageReadPending = false;
-      this.state.busy = false;
-    }
+    if (this.state.busy && this.state.readPending !== "image") return;
+    this.cancelRead("image");
     this.state.modal = null;
     this.state.error = "";
     this.changed();
@@ -416,7 +416,8 @@ export class AppController {
     if (this.state.busy || !query || this.state.modal?.kind !== "image") return;
     this.state.candidates = [];
     this.state.searched = false;
-    await this.performImageRead(
+    await this.performRead(
+      "image",
       () => this.api.searchImages(this.state.provider, query),
       (candidates) => {
         this.state.candidates = candidates;
@@ -425,29 +426,38 @@ export class AppController {
     );
   }
 
-  private async performImageRead<T>(
+  private cancelRead(kind: ReadKind): void {
+    if (this.state.readPending !== kind) return;
+    this.readRequest = null;
+    this.state.readPending = null;
+    this.state.busy = false;
+  }
+
+  private async performRead<T>(
+    kind: ReadKind,
     load: () => Promise<T>,
     accept: (result: T) => void,
+    messages: { notice?: string; errorPrefix?: string } = {},
   ): Promise<void> {
     if (this.state.busy) return;
     const request = Symbol();
-    this.imageRead = request;
+    this.readRequest = request;
     this.state.busy = true;
-    this.state.imageReadPending = true;
+    this.state.readPending = kind;
     this.state.error = "";
-    this.state.notice = "";
+    this.state.notice = messages.notice ?? "";
     this.changed();
     try {
       const result = await load();
-      if (this.imageRead === request) accept(result);
+      if (this.readRequest === request) accept(result);
     } catch (error) {
-      if (this.imageRead === request) this.state.error = errorMessage(error);
+      if (this.readRequest === request) {
+        this.state.error = `${messages.errorPrefix ?? ""}${errorMessage(error)}`;
+      }
     } finally {
-      // A dismissed read must not update a reopened dialog or release a later operation.
-      if (this.imageRead === request) {
-        this.imageRead = null;
-        this.state.imageReadPending = false;
-        this.state.busy = false;
+      // A dismissed read must not update a new screen or release a later operation.
+      if (this.readRequest === request) {
+        this.cancelRead(kind);
         this.changed();
       }
     }
@@ -476,6 +486,7 @@ export class AppController {
     const field = provider === "brave" ? "braveKey" : "ollamaKey";
     const key = remove ? "" : this.state.drafts[field].trim();
     if (!remove && !key) return;
+    let committed = false;
     await this.perform(async () => {
       await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
@@ -495,11 +506,18 @@ export class AppController {
       settings.defaultProvider =
         settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
       this.acceptSettings(settings);
-      try {
-        await this.loadSettings();
-      } catch (error) {
-        this.state.error = `設定状態を再取得できませんでした: ${errorMessage(error)}`;
-      }
+      committed = true;
     });
+    if (committed && this.state.view === "settings" && !this.state.modal) {
+      await this.performRead(
+        "settings",
+        () => this.api.searchSettings(),
+        (settings) => this.acceptSettings(settings),
+        {
+          notice: this.state.notice,
+          errorPrefix: "設定状態を再取得できませんでした: ",
+        },
+      );
+    }
   }
 }

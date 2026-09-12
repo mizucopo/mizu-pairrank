@@ -75,7 +75,7 @@ export function mountApp(
     else root.focus({ preventScroll: true });
   }
   async function openModal(modal: Exclude<Modal, null>, button: HTMLButtonElement): Promise<void> {
-    if (controller.state.busy) return;
+    if (controller.state.busy && controller.state.readPending !== "settings") return;
     modalOpener = rememberButton(button);
     restoreModalFocus = false;
     await controller.openModal(modal);

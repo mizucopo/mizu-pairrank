@@ -190,6 +190,86 @@ describe("desktop app interaction", () => {
     expect(restored.value).toBe("あとで登録する果物\nぶどう");
   });
 
+  it.each(["existing list", "new list"] as const)(
+    "keeps navigation to the %s available while reading credentials on the settings screen",
+    async (destination) => {
+      const { root, controller, api } = setup();
+      if (destination === "new list") api.listSummaries.mockResolvedValueOnce([]);
+      await controller.initialize();
+      let finish: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = () =>
+              resolve({
+                braveConfigured: false,
+                ollamaConfigured: true,
+                defaultProvider: "ollama",
+              });
+          }),
+      );
+      const reading = controller.navigate("settings");
+      const navigation =
+        destination === "existing list"
+          ? '[data-action="select-list"][data-id="1"]'
+          : '[data-action="create-list"]';
+      expect(button(root, navigation).disabled).toBe(false);
+      expect(button(root, '[data-form="save-key"] button[type="submit"]').disabled).toBe(true);
+      await click(root, controller, navigation);
+      expect(controller.state.busy).toBe(false);
+      finish();
+      await reading;
+      expect(controller.state.settings).toBeNull();
+      if (destination === "existing list") {
+        expect(controller.state.view).toBe("items");
+        expect(root.querySelector("h1")?.textContent).toBe("好きな果物");
+      } else {
+        expect(controller.state.modal).toEqual({ kind: "create-list" });
+        expect(root.querySelector("dialog")).not.toBeNull();
+      }
+    },
+  );
+
+  it("protects a credential write and enables navigation during its post-write refresh", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await controller.navigate("settings");
+    controller.state.drafts.braveKey = "saved-key";
+    let finishWrite: () => void = () => {};
+    api.setApiKey.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishWrite = resolve;
+        }),
+    );
+    let failRead: (error: Error) => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          failRead = reject;
+        }),
+    );
+    const saving = controller.saveKey("brave");
+    const navigation = '[data-action="select-list"][data-id="1"]';
+    expect(button(root, navigation).disabled).toBe(true);
+    await controller.navigate("items");
+    expect(controller.state.view).toBe("settings");
+    finishWrite();
+    await vi.waitFor(() => {
+      expect(root.textContent).toContain("APIキーを保存しました。");
+      expect(button(root, navigation).disabled).toBe(false);
+      expect(button(root, '[data-form="save-key"] button[type="submit"]').disabled).toBe(true);
+    });
+    await click(root, controller, navigation);
+    expect(controller.state.view).toBe("items");
+    failRead(new Error("old post-write read failed"));
+    await saving;
+    expect(root.querySelector("h1")?.textContent).toBe("好きな果物");
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(controller.state.settings?.braveConfigured).toBe(true);
+    expect(controller.state.busy).toBe(false);
+  });
+
   it("keeps keyboard shortcuts working after navigation and answer buttons are replaced", async () => {
     const { root, controller, api, pair } = setup();
     const pressKeyAtFocus = (key: string) => {
@@ -308,7 +388,7 @@ describe("desktop app interaction", () => {
   );
 
   it.each(["sidebar", "settings", "form", "answer"] as const)(
-    "restores the %s button after it is disabled during an asynchronous operation",
+    "restores the %s button after an asynchronous operation",
     async (operation) => {
       const { root, controller, api, state, pair } = setup();
       const second = { ...state, id: 2, name: "別のリスト" };
@@ -358,7 +438,7 @@ describe("desktop app interaction", () => {
       before.click();
       expect(controller.state.busy).toBe(true);
       expect(before.isConnected).toBe(false);
-      expect(button(root, selector).disabled).toBe(true);
+      expect(button(root, selector).disabled).toBe(operation !== "settings");
       finish();
       await settle(controller);
       expect(document.activeElement).toBe(button(root, selector));

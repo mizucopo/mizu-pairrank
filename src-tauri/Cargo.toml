@@ -31,6 +31,9 @@ base64 = "0.22"
 cap-std = "4.0.3"
 same-file = "1.0.6"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 rusqlite = { version = "0.39", features = ["trace"] }
 tempfile = "3"

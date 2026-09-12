@@ -293,6 +293,209 @@ describe("mutations after concurrent deletion", () => {
   });
 });
 
+describe("settings navigation", () => {
+  it.each([
+    ["success", "screen"],
+    ["failure", "screen"],
+    ["success", "write"],
+    ["failure", "write"],
+  ] as const)(
+    "ignores a post-write refresh %s after leaving settings for another %s",
+    async (outcome, destination) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate("settings");
+      controller.state.drafts.braveKey = "saved-key";
+      let finishOld: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishOld = () => {
+              if (outcome === "success") {
+                resolve({
+                  braveConfigured: false,
+                  ollamaConfigured: false,
+                  defaultProvider: "brave",
+                });
+              } else reject(new Error("old post-write refresh failed"));
+            };
+          }),
+      );
+      const saving = controller.saveKey("brave");
+      await vi.waitFor(() => expect(controller.state.notice).toBe("APIキーを保存しました。"));
+      expect(controller.state.settings?.braveConfigured).toBe(true);
+      await controller.navigate(destination === "screen" ? "ranking" : "items");
+      expect(controller.state.view).toBe(destination === "screen" ? "ranking" : "items");
+      expect(controller.state.busy).toBe(false);
+      let finishNew: () => void = () => {};
+      let current: Promise<void> | undefined;
+      if (destination === "write") {
+        controller.state.drafts.items = "new item";
+        api.addItems.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishNew = () => resolve(list());
+            }),
+        );
+        current = controller.addItems();
+      }
+      finishOld();
+      await saving;
+      expect(controller.state.busy).toBe(destination === "write");
+      expect(controller.state.settings?.braveConfigured).toBe(true);
+      expect(controller.state.error).toBe("");
+      if (current) {
+        expect(controller.state.drafts.items).toBe("new item");
+        finishNew();
+        await current;
+        expect(controller.state.busy).toBe(false);
+        expect(controller.state.drafts.items).toBe("");
+      }
+    },
+  );
+
+  it("allows leaving settings while credentials are still being read", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    let finish: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () =>
+            resolve({ braveConfigured: false, ollamaConfigured: true, defaultProvider: "ollama" });
+        }),
+    );
+    const reading = controller.navigate("settings");
+    expect(controller.state.view).toBe("settings");
+    await controller.navigate("ranking");
+    expect(controller.state.view).toBe("ranking");
+    expect(controller.state.busy).toBe(false);
+    finish();
+    await reading;
+    expect(controller.state.view).toBe("ranking");
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.provider).toBe("brave");
+  });
+
+  it.each([
+    ["success", "read"],
+    ["failure", "read"],
+    ["success", "write"],
+    ["failure", "write"],
+  ] as const)(
+    "ignores an abandoned settings %s while a newer %s remains pending",
+    async (outcome, operation) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      let finishOld: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishOld = () => {
+              if (outcome === "success") {
+                resolve({
+                  braveConfigured: true,
+                  ollamaConfigured: false,
+                  defaultProvider: "brave",
+                });
+              } else reject(new Error("old credential read failed"));
+            };
+          }),
+      );
+      const abandoned = controller.navigate("settings");
+      let finishNew: () => void = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finishNew = resolve;
+      });
+      const currentSettings = {
+        braveConfigured: false,
+        ollamaConfigured: true,
+        defaultProvider: "ollama" as const,
+      };
+      let current: Promise<void>;
+      if (operation === "read") {
+        await controller.navigate("items");
+        api.searchSettings.mockImplementationOnce(async () => {
+          await pending;
+          return currentSettings;
+        });
+        current = controller.navigate("settings");
+      } else {
+        await controller.openModal({ kind: "create-list" });
+        controller.state.drafts.name = "new list";
+        api.createList.mockImplementationOnce(async () => {
+          await pending;
+          return list(3);
+        });
+        api.listSummaries.mockResolvedValue([summary(list(3))]);
+        current = controller.saveName();
+      }
+      finishOld();
+      await abandoned;
+      expect(controller.state.busy).toBe(true);
+      expect(controller.state.settings).toBeNull();
+      expect(controller.state.provider).toBe("brave");
+      expect(controller.state.error).toBe("");
+      expect(controller.state.notice).toBe("");
+      if (operation === "write") {
+        await controller.navigate("ranking");
+        controller.closeModal();
+        expect(controller.state.view).toBe("settings");
+        expect(controller.state.modal).toEqual({ kind: "create-list" });
+      }
+      finishNew();
+      await current;
+      expect(controller.state.busy).toBe(false);
+      expect(controller.state.error).toBe("");
+      if (operation === "read") {
+        expect(controller.state.settings).toEqual(currentSettings);
+        expect(controller.state.provider).toBe("ollama");
+      } else {
+        expect(controller.state.active?.id).toBe(3);
+        expect(controller.state.modal).toBeNull();
+      }
+    },
+  );
+
+  it("avoids duplicate settings reads and keeps backend capacity rejections recoverable after reentry", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    let finish: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () =>
+            resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
+        }),
+    );
+    const reading = controller.navigate("settings");
+    await controller.navigate("settings");
+    await controller.navigate("settings");
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    await controller.navigate("items");
+    const capacityError = "検索設定の読み込みが実行中です。少し待ってから再試行してください。";
+    api.searchSettings.mockRejectedValueOnce(capacityError);
+    await controller.navigate("settings");
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    expect(controller.state.error).toBe(capacityError);
+    expect(controller.state.busy).toBe(false);
+    await controller.selectList(2);
+    finish();
+    await reading;
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.view).toBe("items");
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.error).toBe("");
+    await controller.navigate("settings");
+    expect(controller.state.settings?.braveConfigured).toBe(false);
+    expect(controller.state.error).toBe("");
+  });
+});
+
 describe("credential mutation acknowledgments", () => {
   it.each([false, true])(
     "clears the acknowledged provider error before a failed refresh (remove=%s)",

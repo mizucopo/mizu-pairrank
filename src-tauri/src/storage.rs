@@ -77,20 +77,34 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
 
 #[cfg(unix)]
 pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+    restrict_existing_file_with(path, |_| {})
+}
+
+#[cfg(unix)]
+fn restrict_existing_file_with(path: &Path, mut checkpoint: impl FnMut(bool)) -> io::Result<()> {
+    use cap_std::fs::PermissionsExt as _;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = cap_std::fs::Dir::from_std_file(File::open(parent)?);
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing managed filename"))?;
+    let metadata = directory.symlink_metadata(name)?;
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "managed file is not a regular file",
         ));
     }
+    checkpoint(false);
     if metadata.permissions().mode() & 0o7777 != 0o600 {
-        let file = match File::open(path) {
+        let file = match open_managed_file(&directory, name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                // An owned file restored without read permission cannot be opened for fchmod.
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-                File::open(path)?
+                checkpoint(true);
+                restore_unreadable_file(&directory, name)?
             }
             Err(error) => return Err(error),
         };
@@ -98,6 +112,60 @@ pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
         file.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_managed_file(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let file = File::from(openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("managed file is not a regular file"));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_unreadable_file(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::os::fd::AsRawFd;
+    // O_PATH can pin an owned 0000 file without following a replacement symlink.
+    let pinned = File::from(openat(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !pinned.metadata()?.is_file() {
+        return Err(io::Error::other("managed file is not a regular file"));
+    }
+    // chmod through this live descriptor targets the pinned inode, even after rename.
+    let descriptor = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+    fs::set_permissions(&descriptor, fs::Permissions::from_mode(0o600))?;
+    File::open(descriptor)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn restore_unreadable_file(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use rustix::fs::{AtFlags, Mode, chmodat};
+    // Unlike pathname chmod, this never changes a substituted symlink's target.
+    chmodat(
+        directory,
+        name,
+        Mode::RUSR | Mode::WUSR,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    open_managed_file(directory, name)
 }
 
 #[cfg(unix)]
@@ -138,6 +206,31 @@ pub fn prepare_database_file(_path: &Path) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_repair_rejects_symlink_replacement_without_changing_the_target() {
+        for (original_mode, replace_in_repair) in [(0o644, false), (0o000, false), (0o000, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let managed = directory.path().join("pairrank.sqlite3");
+            let external = directory.path().join("external.sqlite3");
+            fs::write(&managed, b"managed").unwrap();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            fs::write(&external, b"external").unwrap();
+            fs::set_permissions(&external, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut replaced = false;
+            let result = restrict_existing_file_with(&managed, |repairing| {
+                if repairing == replace_in_repair {
+                    fs::rename(&managed, directory.path().join("previous.sqlite3")).unwrap();
+                    std::os::unix::fs::symlink(&external, &managed).unwrap();
+                    replaced = true;
+                }
+            });
+            assert!(replaced);
+            assert!(result.is_err());
+            assert_eq!(mode(&external), 0o644);
+            assert_eq!(fs::read(&external).unwrap(), b"external");
+        }
+    }
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777

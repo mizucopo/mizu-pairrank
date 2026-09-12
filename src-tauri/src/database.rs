@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::models::{ImageAsset, Item, ListState, ListSummary};
 use crate::rating::{
@@ -32,9 +34,37 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with(path, || {})
+    }
+
+    fn open_with(path: &Path, checkpoint: impl FnOnce()) -> Result<Self, String> {
+        // Resolve legitimate parent aliases (for example macOS /var), never the DB leaf.
+        #[cfg(unix)]
+        let resolved = if path == Path::new(":memory:") {
+            path.to_owned()
+        } else {
+            let parent = path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            parent
+                .canonicalize()
+                .map_err(|error| format!("保存先を開けません: {error}"))?
+                .join(
+                    path.file_name()
+                        .ok_or_else(|| "保存データのファイル名がありません。".to_owned())?,
+                )
+        };
+        #[cfg(unix)]
+        let path = resolved.as_path();
         crate::storage::prepare_database_file(path)
             .map_err(|error| format!("保存データの権限を設定できません: {error}"))?;
-        let mut connection = Connection::open(path).map_err(db_error)?;
+        checkpoint();
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(db_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(db_error)?;
@@ -603,6 +633,51 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_open_rejects_symlink_replacement_after_file_preparation() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pairrank.sqlite3");
+        let external = directory.path().join("external.sqlite3");
+        std::fs::write(&external, []).unwrap();
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let result = Database::open_with(&path, || {
+            std::fs::rename(&path, directory.path().join("previous.sqlite3")).unwrap();
+            std::os::unix::fs::symlink(&external, &path).unwrap();
+        });
+        assert!(result.is_err());
+        assert!(std::fs::read(&external).unwrap().is_empty());
+        assert_eq!(
+            std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!directory.path().join("external.sqlite3-journal").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_opens_through_a_legitimate_parent_directory_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let path = alias.join("pairrank.sqlite3");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .create_list("Saved through alias".to_owned())
+                .unwrap();
+        }
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.list_summaries().unwrap()[0].name,
+            "Saved through alias"
+        );
+        assert!(actual.join("pairrank.sqlite3").is_file());
+    }
 
     fn memory_database() -> Database {
         Database::open(Path::new(":memory:")).unwrap()
