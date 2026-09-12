@@ -333,21 +333,32 @@ impl ImageService {
         app_data: PathBuf,
         database: Option<&crate::database::Database>,
     ) -> Result<Self, String> {
+        Self::open_storage_with(app_data, database, || {})
+    }
+
+    fn open_storage_with(
+        app_data: PathBuf,
+        database: Option<&crate::database::Database>,
+        checkpoint: impl FnOnce(),
+    ) -> Result<Self, String> {
         let directory = app_data.join("images");
         crate::storage::create_private_directory(&directory)
-            .map_err(|_| "画像の保存フォルダーを作成できませんでした。".to_owned())?;
+            .map_err(|error| format!("画像の保存フォルダーを作成できませんでした: {error}"))?;
         sync_directory(&app_data)
             .map_err(|_| "画像の保存フォルダーを同期できませんでした。".to_owned())?;
-        let directory = directory
-            .canonicalize()
-            .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
-        let directory_identity = open_image_directory(&directory)
+        checkpoint();
+        let directory_identity = open_initial_image_directory(&directory)
             .and_then(|directory| same_file::Handle::from_file(directory.into_std_file()))
             .map(Arc::new)
             .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
+        let directory = directory
+            .canonicalize()
+            .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
+        verified_image_directory(&directory, &directory_identity)
+            .map_err(|_| "画像の保存フォルダーを開けませんでした。".to_owned())?;
         #[cfg(unix)]
-        restrict_image_permissions(&directory)
-            .map_err(|_| "保存済み画像の権限を設定できませんでした。".to_owned())?;
+        restrict_image_permissions(&directory, &directory_identity)
+            .map_err(|error| format!("保存済み画像の権限を設定できませんでした: {error}"))?;
         // Lock the image directory itself on Unix: replacing a separate lock file
         // must not let two instances reconcile the same directory independently.
         #[cfg(unix)]
@@ -393,6 +404,19 @@ impl ImageService {
 
     pub fn remove_managed_file(&self, path: &str) {
         self.remove_managed_file_with(path, || {});
+    }
+
+    pub fn validate_import(&self, image: &ImageAsset) -> Result<(), String> {
+        let validate = || -> std::io::Result<()> {
+            let path = self
+                .managed_path(&image.path)
+                .ok_or_else(|| std::io::Error::other("invalid managed image reference"))?;
+            let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
+            crate::storage::open_managed_file(&pinned, path.file_name().unwrap())?;
+            Ok(())
+        };
+        validate()
+            .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())
     }
 
     fn remove_managed_file_with(&self, path: &str, checkpoint: impl FnOnce()) {
@@ -702,6 +726,25 @@ fn reconcile_images(
     references: &HashSet<String>,
 ) -> std::io::Result<()> {
     let pinned = verified_image_directory(directory, expected_identity)?;
+    let mut referenced_names = HashSet::new();
+    // Resolve every legacy parent before deleting anything. Path aliases may name
+    // the same directory even when their text differs from its canonical path.
+    for reference in references {
+        let path = Path::new(reference);
+        if !is_managed_image_name(path) {
+            continue;
+        }
+        let name = path.file_name().unwrap();
+        if path.components().count() == 1 {
+            referenced_names.insert(name.to_owned());
+        } else if path.is_absolute() {
+            let parent = open_image_directory(path.parent().unwrap())?;
+            let identity = same_file::Handle::from_file(parent.into_std_file())?;
+            if &identity == expected_identity {
+                referenced_names.insert(name.to_owned());
+            }
+        }
+    }
     let mut removed = false;
     for entry in pinned.entries()? {
         let entry = entry?;
@@ -710,9 +753,7 @@ fn reconcile_images(
         if !entry.file_type()?.is_file() || !is_managed_image_name(&path) {
             continue;
         }
-        if name.to_str().is_some_and(|name| references.contains(name))
-            || path.to_str().is_some_and(|path| references.contains(path))
-        {
+        if referenced_names.contains(&name) {
             continue;
         }
         match pinned.remove_file(name) {
@@ -726,6 +767,20 @@ fn reconcile_images(
         pinned.into_std_file().sync_all()?;
     }
     Ok(())
+}
+
+fn open_initial_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+
+    let parent = directory
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = directory
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("missing image directory name"))?;
+    // Parent aliases are legitimate; the configured images leaf must not be a link.
+    open_image_directory(parent)?.open_dir_nofollow(name)
 }
 
 fn open_image_directory(directory: &Path) -> std::io::Result<cap_std::fs::Dir> {
@@ -764,16 +819,31 @@ fn is_managed_image_name(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn restrict_image_permissions(directory: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(directory)? {
+fn restrict_image_permissions(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+) -> std::io::Result<()> {
+    restrict_image_permissions_with(directory, expected_identity, || {})
+}
+
+#[cfg(unix)]
+fn restrict_image_permissions_with(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+    checkpoint: impl FnOnce(),
+) -> std::io::Result<()> {
+    let pinned = verified_image_directory(directory, expected_identity)?;
+    checkpoint();
+    for entry in pinned.entries()? {
         let entry = entry?;
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        if file_type.is_file() && is_managed_image_name(&entry.path()) {
-            match crate::storage::restrict_existing_file(&entry.path()) {
+        let name = entry.file_name();
+        if file_type.is_file() && is_managed_image_name(Path::new(&name)) {
+            match crate::storage::restrict_existing_file_in(&pinned, &name) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -1251,6 +1321,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn startup_rejects_an_images_leaf_replaced_before_its_initial_open() {
+        let app_data = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let image = external.path().join(format!("{}.png", Uuid::new_v4()));
+        std::fs::write(&image, b"external image").unwrap();
+        let directory = app_data.path().join("images");
+        let result = ImageService::open_storage_with(app_data.path().to_owned(), None, || {
+            std::fs::remove_dir(&directory).unwrap();
+            std::os::unix::fs::symlink(external.path(), &directory).unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "startup must not adopt a replacement symlink target"
+        );
+        assert_eq!(std::fs::read(image).unwrap(), b"external image");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_rejects_a_configured_images_junction_or_symlink() {
+        for junction in [true, false] {
+            let app_data = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let directory = app_data.path().join("images");
+            let image = external.path().join(format!("{}.png", Uuid::new_v4()));
+            std::fs::write(&image, b"external image").unwrap();
+            if junction {
+                assert!(
+                    std::process::Command::new("cmd")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(&directory)
+                        .arg(external.path())
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            } else if let Err(error) =
+                std::os::windows::fs::symlink_dir(external.path(), &directory)
+            {
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314)
+                {
+                    eprintln!("skipping symlink case: symbolic-link privilege is unavailable");
+                    continue;
+                }
+                panic!("cannot create directory symlink: {error}");
+            }
+            let result = ImageService::new(app_data.path().to_owned());
+            assert!(
+                result.is_err(),
+                "startup must reject an images directory link"
+            );
+            assert_eq!(std::fs::read(image).unwrap(), b"external image");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn startup_reconciliation_rejects_a_directory_replaced_before_opening_it() {
         let directory = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
@@ -1335,6 +1463,58 @@ mod tests {
         assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"unmanaged");
         assert_eq!(std::fs::read(source).unwrap(), png(2, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_preserves_legacy_references_through_a_parent_alias_and_removes_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let app_data = root.path().join("app-data");
+        std::fs::create_dir(&app_data).unwrap();
+        let alias = root.path().join("app-alias");
+        std::os::unix::fs::symlink(&app_data, &alias).unwrap();
+        let mut database = crate::database::Database::open(&app_data.join("test.sqlite3")).unwrap();
+        let source = root.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let service = ImageService::open(alias.clone(), &database).unwrap();
+        let mut referenced = service.import_local(source.clone()).unwrap();
+        let orphan = service.import_local(source).unwrap();
+        let referenced_path = service.directory.join(&referenced.path);
+        let orphan_path = service.directory.join(orphan.path);
+        referenced.path = alias
+            .join("images")
+            .join(&referenced.path)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let list = database.create_list("Images".into()).unwrap();
+        let list = database.add_items(list.id, vec!["Item".into()]).unwrap();
+        database
+            .set_image(list.id, list.items[0].id, Some(referenced))
+            .unwrap();
+        drop(service);
+
+        let _reopened = ImageService::open(app_data, &database).unwrap();
+        assert!(
+            referenced_path.exists(),
+            "a parent alias must preserve the referenced image"
+        );
+        assert!(!orphan_path.exists());
+    }
+
+    #[test]
+    fn reconciliation_preserves_images_when_a_legacy_reference_parent_cannot_be_resolved() {
+        let app_data = tempfile::tempdir().unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let source = app_data.path().join("source.png");
+        std::fs::write(&source, png(2, 2)).unwrap();
+        let image = service.import_local(source).unwrap();
+        let missing = app_data.path().join("missing-alias").join(&image.path);
+        let references = HashSet::from([missing.to_str().unwrap().to_owned()]);
+        assert!(
+            reconcile_images(&service.directory, &service.directory_identity, &references).is_err()
+        );
+        assert!(service.directory.join(image.path).exists());
     }
 
     #[test]
@@ -1633,6 +1813,42 @@ mod tests {
         service.remove_managed_file(&saved.path);
         assert_eq!(std::fs::read_dir(&service.directory).unwrap().count(), 0);
         assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_repair_stays_in_the_pinned_image_directory_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let app_data = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let service = ImageService::new(app_data.path().to_owned()).unwrap();
+        let name = format!("{}.png", Uuid::new_v4());
+        let managed = service.directory.join(&name);
+        let unrelated = external.path().join(&name);
+        for path in [&managed, &unrelated] {
+            std::fs::write(path, b"unchanged image").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let previous = app_data.path().join("previous-images");
+        restrict_image_permissions_with(&service.directory, &service.directory_identity, || {
+            std::fs::rename(&service.directory, &previous).unwrap();
+            std::os::unix::fs::symlink(external.path(), &service.directory).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(previous.join(&name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unchanged image");
     }
 
     #[cfg(unix)]

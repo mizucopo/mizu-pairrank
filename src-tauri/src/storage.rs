@@ -155,10 +155,8 @@ pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn restrict_existing_file_with(
     path: &Path,
-    mut checkpoint: impl FnMut(bool),
+    checkpoint: impl FnMut(bool),
 ) -> io::Result<(u64, u64)> {
-    use cap_std::fs::MetadataExt as _;
-    use cap_std::fs::PermissionsExt as _;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -167,6 +165,25 @@ fn restrict_existing_file_with(
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("missing managed filename"))?;
+    restrict_existing_file_in_with(&directory, name, checkpoint)
+}
+
+#[cfg(unix)]
+pub(crate) fn restrict_existing_file_in(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    restrict_existing_file_in_with(directory, name, |_| {}).map(|_| ())
+}
+
+#[cfg(unix)]
+fn restrict_existing_file_in_with(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    mut checkpoint: impl FnMut(bool),
+) -> io::Result<(u64, u64)> {
+    use cap_std::fs::MetadataExt as _;
+    use cap_std::fs::PermissionsExt as _;
     let metadata = directory.symlink_metadata(name)?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -177,11 +194,11 @@ fn restrict_existing_file_with(
     checkpoint(false);
     let identity = (metadata.dev(), metadata.ino());
     if metadata.permissions().mode() & 0o7777 != 0o600 {
-        let file = match open_managed_file(&directory, name) {
+        let file = match open_managed_file(directory, name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 checkpoint(true);
-                restore_unreadable_entry(&directory, name, identity, 0o600)?
+                restore_unreadable_entry(directory, name, identity, 0o600)?
             }
             Err(error) => return Err(error),
         };
@@ -242,29 +259,18 @@ fn restore_unreadable_entry(
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn restore_unreadable_entry(
-    directory: &cap_std::fs::Dir,
+    _directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
-    expected: (u64, u64),
+    _expected: (u64, u64),
     mode: u32,
 ) -> io::Result<File> {
-    use cap_std::fs::MetadataExt as _;
-    use rustix::fs::{AtFlags, Mode, chmodat};
-    let metadata = directory.symlink_metadata(name)?;
-    if (metadata.dev(), metadata.ino()) != expected {
-        return Err(io::Error::other("managed storage was replaced"));
-    }
-    // Unlike pathname chmod, this never changes a substituted symlink's target.
-    chmodat(
-        directory,
-        name,
-        Mode::from_bits_truncate(mode as _),
-        AtFlags::SYMLINK_NOFOLLOW,
-    )?;
-    let file = directory
-        .open_with(name, &managed_open_options())?
-        .into_std();
-    verify_identity(&file.metadata()?, expected)?;
-    Ok(file)
+    // Without a descriptor, pathname chmod could change a replacement inode.
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{name:?} の権限を安全に復元できません。所有者の読み取り権限（推奨 {mode:o}）を手動で復元して再試行してください。"
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -312,6 +318,25 @@ pub fn prepare_database_file(_path: &Path) -> io::Result<PreparedDatabaseFile> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unreadable_file_requires_manual_permission_recovery_without_modification() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("pairrank.sqlite3");
+        fs::write(&managed, b"saved ranking").unwrap();
+        for original_mode in [0o200, 0o000] {
+            fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
+            let result = restrict_existing_file(&managed);
+            let unchanged_mode = mode(&managed);
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("所有者の読み取り権限"));
+            assert_eq!(unchanged_mode, original_mode);
+            assert_eq!(fs::read(&managed).unwrap(), b"saved ranking");
+        }
+    }
+
     #[test]
     fn directory_permission_repair_preserves_replacements_after_metadata_validation() {
         for symlink in [false, true] {
@@ -349,21 +374,28 @@ mod tests {
     }
 
     #[test]
-    fn directory_permission_repair_restores_owned_unreadable_directories() {
+    fn directory_permission_repair_preserves_data_and_rejects_unsafe_recovery() {
         let root = tempfile::tempdir().unwrap();
         let managed = root.path().join("app-data");
         fs::create_dir(&managed).unwrap();
         fs::write(managed.join("saved"), b"saved").unwrap();
-        for original_mode in [0o755, 0o300, 0o000] {
+        for original_mode in [0o755, 0o500, 0o300, 0o000] {
             fs::set_permissions(&managed, fs::Permissions::from_mode(original_mode)).unwrap();
             let result = create_private_directory(&managed);
             let repaired_mode = mode(&managed);
             fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(
-                result.is_ok(),
-                "could not repair {original_mode:o}: {result:?}"
-            );
-            assert_eq!(repaired_mode, 0o700);
+            if cfg!(target_os = "linux") || original_mode & 0o400 != 0 {
+                assert!(
+                    result.is_ok(),
+                    "could not repair {original_mode:o}: {result:?}"
+                );
+                assert_eq!(repaired_mode, 0o700);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("所有者の読み取り権限"));
+                assert_eq!(repaired_mode, original_mode);
+            }
             assert_eq!(fs::read(managed.join("saved")).unwrap(), b"saved");
         }
     }
@@ -519,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn image_storage_restores_restrictive_owned_modes_without_changing_source_images() {
+    fn image_storage_permission_handling_preserves_managed_and_source_images() {
         let directory = tempfile::tempdir().unwrap();
         let images = directory.path().join("images");
         create_private_directory(&images).unwrap();
@@ -529,10 +561,18 @@ mod tests {
         fs::write(&source, b"source image").unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
 
-        for restored_mode in [0o400, 0o200, 0o000] {
+        for restored_mode in [0o400, 0o444, 0o200, 0o000] {
             fs::set_permissions(&managed, fs::Permissions::from_mode(restored_mode)).unwrap();
-            crate::images::ImageService::new(directory.path().to_owned()).unwrap();
-            assert_eq!(mode(&managed), 0o600);
+            let result = crate::images::ImageService::new(directory.path().to_owned());
+            let repaired_mode = mode(&managed);
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+            if cfg!(target_os = "linux") || restored_mode & 0o400 != 0 {
+                assert!(result.is_ok());
+                assert_eq!(repaired_mode, 0o600);
+            } else {
+                assert!(result.err().unwrap().contains("所有者の読み取り権限"));
+                assert_eq!(repaired_mode, restored_mode);
+            }
             assert_eq!(fs::read(&managed).unwrap(), b"managed image");
             assert_eq!(mode(&source), 0o400);
             assert_eq!(fs::read(&source).unwrap(), b"source image");

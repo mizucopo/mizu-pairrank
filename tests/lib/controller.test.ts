@@ -293,6 +293,28 @@ describe("mutations after concurrent deletion", () => {
   });
 });
 
+describe("image search validation", () => {
+  it("rejects whitespace-only queries without a request and permits correction", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    controller.state.drafts.query = " \t　 ";
+    await controller.searchImages();
+    expect(controller.state.error).toBe("検索語は1〜400文字、50語以内で入力してください。");
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+    expect(controller.state.drafts.query).toBe(" \t　 ");
+    expect(controller.state.busy).toBe(false);
+    expect(api.searchImages).not.toHaveBeenCalled();
+    controller.state.drafts.query = "  修正した検索語  ";
+    await controller.searchImages();
+    expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("brave", "修正した検索語");
+    expect(controller.state.error).toBe("");
+    expect(controller.state.searched).toBe(true);
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+  });
+});
+
 describe("settings navigation", () => {
   it.each([
     ["success", "screen"],
@@ -851,6 +873,30 @@ describe("comparison state and persistence boundaries", () => {
   });
 
   describe.each(["startup", "after deletion"] as const)("list selection %s", (context) => {
+    it("refreshes the first available list summary from the loaded snapshot", async () => {
+      const { api, controller, load } = await listSelection(context);
+      const stale = list(2);
+      const current = {
+        ...stale,
+        name: "別のウィンドウで更新",
+        items: stale.items.slice(0, 1),
+        comparisonCount: 15,
+        convergence: { ...stale.convergence, converged: true },
+      };
+      api.listSummaries.mockResolvedValue([summary(stale), summary(list(3))]);
+      api.getList.mockResolvedValueOnce(current);
+      if (context === "startup") controller.state.drafts.items = "startup draft";
+      await load();
+      expect(controller.state.active).toEqual(current);
+      expect(controller.state.lists).toEqual([
+        { id: 2, name: "別のウィンドウで更新", itemCount: 1, comparisonCount: 15, converged: true },
+        summary(list(3)),
+      ]);
+      expect(controller.state.view).toBe(context === "startup" ? "ranking" : "items");
+      expect(controller.state.drafts.items).toBe(context === "startup" ? "startup draft" : "");
+      expect(controller.state.pair).toBeNull();
+    });
+
     it("opens an empty interactive state when no lists remain", async () => {
       const { api, controller, load } = await listSelection(context);
       api.listSummaries.mockResolvedValueOnce([summary(list(2))]).mockResolvedValueOnce([]);

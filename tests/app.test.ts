@@ -784,6 +784,52 @@ describe("desktop app interaction", () => {
     expect(api.listSummaries).toHaveBeenCalledOnce();
   });
 
+  it.each(["input", "button"] as const)(
+    "shows whitespace query validation while preserving %s focus and permits retry",
+    async (origin) => {
+      const { root, controller, api } = setup();
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: true,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+      });
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      const input = root.querySelector("#image-query");
+      if (!(input instanceof HTMLInputElement)) throw new Error("Missing query input");
+      input.value = "   ";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const submitSelector = '[data-form="search-images"] button[type="submit"]';
+      if (origin === "input") {
+        input.focus();
+        input.setSelectionRange(1, 2);
+        input.form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      } else {
+        const submit = button(root, submitSelector);
+        submit.focus();
+        submit.click();
+      }
+      await settle(controller);
+      expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe(
+        "検索語は1〜400文字、50語以内で入力してください。",
+      );
+      expect(api.searchImages).not.toHaveBeenCalled();
+      const restored = root.querySelector("#image-query");
+      if (!(restored instanceof HTMLInputElement)) throw new Error("Missing restored query");
+      expect(restored.value).toBe("   ");
+      expect(document.activeElement).toBe(
+        origin === "input" ? restored : button(root, submitSelector),
+      );
+      if (origin === "input")
+        expect([restored.selectionStart, restored.selectionEnd]).toEqual([1, 2]);
+      restored.value = "りんご";
+      restored.dispatchEvent(new Event("input", { bubbles: true }));
+      await click(root, controller, submitSelector);
+      expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("brave", "りんご");
+      expect(root.querySelector('dialog [role="alert"]')).toBeNull();
+    },
+  );
+
   it("clears old candidates when switching provider and preserves the item after search failure", async () => {
     const { root, controller, api, state } = setup();
     api.searchSettings.mockResolvedValue({

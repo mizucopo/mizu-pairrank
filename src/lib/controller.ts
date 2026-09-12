@@ -114,7 +114,9 @@ export class AppController {
       const first = this.state.lists[0];
       if (!first) return null;
       try {
-        return await this.api.getList(first.id);
+        const list = await this.api.getList(first.id);
+        this.updateListSummary(list);
+        return list;
       } catch (error) {
         // Another window may delete the list after the summaries were read.
         if (errorMessage(error) !== "リストが見つかりません。") throw error;
@@ -218,6 +220,10 @@ export class AppController {
     // Keep committed state usable even if a later sidebar refresh fails.
     this.state.active = list;
     this.state.pair = null;
+    this.updateListSummary(list);
+  }
+
+  private updateListSummary(list: ListState): void {
     const summary: ListSummary = {
       id: list.id,
       name: list.name,
@@ -418,7 +424,12 @@ export class AppController {
 
   async searchImages(): Promise<void> {
     const query = this.state.drafts.query.trim();
-    if (this.state.busy || !query || this.state.modal?.kind !== "image") return;
+    if (this.state.busy || this.state.modal?.kind !== "image") return;
+    if (!query) {
+      this.state.error = "検索語は1〜400文字、50語以内で入力してください。";
+      this.changed();
+      return;
+    }
     this.state.candidates = [];
     this.state.searched = false;
     await this.performRead(

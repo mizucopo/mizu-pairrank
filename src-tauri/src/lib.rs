@@ -42,12 +42,18 @@ impl Backend {
         + Send
         + 'static,
     ) -> Result<T, String> {
-        let images = self.images.clone().ok();
+        let images = self.images.clone();
         let imported = image.clone();
         let result = self
             .database_job(move |db| {
+                if let Some(image) = &image {
+                    images
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .validate_import(image)?;
+                }
                 let change = operation(db, image)?;
-                if let Some(images) = &images {
+                if let Ok(images) = &images {
                     remove_unused_images(db, images, change.cleanup_paths);
                 }
                 Ok(change.value)
@@ -443,6 +449,52 @@ mod tests {
                 .join(&imported_path)
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_association_rejects_storage_replaced_after_import() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, previous) = list_with_image(&backend).await;
+        let image = backend
+            .images
+            .as_ref()
+            .unwrap()
+            .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
+            .unwrap();
+        let imported_name = image.path.clone();
+        let managed = directory.path().join("images");
+        let displaced = directory.path().join("previous-images");
+        std::fs::rename(&managed, &displaced).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        let foreign = managed.join(&imported_name);
+        std::fs::write(&foreign, b"replacement image").unwrap();
+
+        let result = backend
+            .change_images(Some(image), move |db, image| {
+                db.set_image(list_id, item_id, image)
+            })
+            .await;
+        assert!(result.is_err());
+        let state = backend
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .path,
+            previous.path
+        );
+        assert!(displaced.join(previous.path).exists());
+        assert!(displaced.join(imported_name).exists());
+        assert_eq!(std::fs::read(foreign).unwrap(), b"replacement image");
     }
 
     #[tokio::test]
