@@ -237,17 +237,6 @@ impl Database {
         })
     }
 
-    pub fn image_in_use(&self, path: &str) -> Result<bool, String> {
-        let transaction = self.read_transaction()?;
-        transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM items WHERE image_path = ?1 AND deleted = 0)",
-                [path],
-                |row| row.get(0),
-            )
-            .map_err(db_error)
-    }
-
     pub fn image_paths(&self) -> Result<HashSet<String>, String> {
         let transaction = self.read_transaction()?;
         transaction
@@ -847,13 +836,12 @@ mod tests {
         }
     }
 
-    fn read_operations(database: &Database, id: i64) -> [Result<(), String>; 5] {
+    fn read_operations(database: &Database, id: i64) -> [Result<(), String>; 4] {
         [
             database.list_summaries().map(|_| ()),
             database.get_list(id).map(|_| ()),
             database.comparison_state(id).map(|_| ()),
             database.image_paths().map(|_| ()),
-            database.image_in_use("saved.png").map(|_| ()),
         ]
     }
 
