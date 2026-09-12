@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::models::{ImageAsset, Item, ListState, ListSummary};
 use crate::rating::{
@@ -35,43 +35,65 @@ pub struct ComparisonState {
 
 pub struct Database {
     connection: Connection,
+    app_data: Option<Arc<crate::storage::PreparedAppData>>,
 }
 
 impl Database {
+    pub fn app_data(&self) -> Result<Arc<crate::storage::PreparedAppData>, String> {
+        self.app_data
+            .clone()
+            .ok_or_else(|| "保存先がありません。".to_owned())
+    }
+
+    pub fn open_in(
+        app_data: Arc<crate::storage::PreparedAppData>,
+        filename: &std::ffi::OsStr,
+    ) -> Result<Self, String> {
+        Self::open_in_with(app_data, filename, || {})
+    }
+
+    fn open_in_with(
+        app_data: Arc<crate::storage::PreparedAppData>,
+        filename: &std::ffi::OsStr,
+        checkpoint: impl FnOnce(),
+    ) -> Result<Self, String> {
+        app_data.verify().map_err(|error| error.to_string())?;
+        checkpoint();
+        let connection = crate::sqlite_vfs::open(app_data.clone(), filename)?;
+        app_data.verify().map_err(|error| error.to_string())?;
+        Self::initialize(connection, Some(app_data))
+    }
+
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with(path, |_| {})
     }
 
-    fn open_with(path: &Path, mut checkpoint: impl FnMut(bool)) -> Result<Self, String> {
-        // Resolve legitimate parent aliases (for example macOS /var), never the DB leaf.
-        #[cfg(unix)]
-        let resolved = if path == Path::new(":memory:") {
-            path.to_owned()
-        } else {
-            let parent = path
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            parent
-                .canonicalize()
-                .map_err(|error| format!("保存先を開けません: {error}"))?
-                .join(
-                    path.file_name()
-                        .ok_or_else(|| "保存データのファイル名がありません。".to_owned())?,
-                )
-        };
-        #[cfg(unix)]
-        let path = resolved.as_path();
-        let prepared = crate::storage::prepare_database_file(path)
-            .map_err(|error| format!("保存データの権限を設定できません: {error}"))?;
-        checkpoint(false);
-        let mut flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        if prepared.has_identity() {
-            flags.remove(OpenFlags::SQLITE_OPEN_CREATE);
+    #[cfg(test)]
+    fn open_with(path: &Path, checkpoint: impl FnMut(bool)) -> Result<Self, String> {
+        if path == Path::new(":memory:") {
+            return Self::initialize(test_connection(path).map_err(db_error)?, None);
         }
-        let mut connection = Connection::open_with_flags(path, flags).map_err(db_error)?;
-        checkpoint(true);
-        verify_prepared_database(&connection, &prepared, path)?;
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = parent.canonicalize().map_err(|error| error.to_string())?;
+        let app_data = Arc::new(
+            crate::storage::PreparedAppData::open(parent).map_err(|error| error.to_string())?,
+        );
+        let filename = path
+            .file_name()
+            .ok_or_else(|| "保存データのファイル名がありません。".to_owned())?;
+        let connection = crate::sqlite_vfs::open_with(app_data.clone(), filename, checkpoint)?;
+        app_data.verify().map_err(|error| error.to_string())?;
+        Self::initialize(connection, Some(app_data))
+    }
+
+    fn initialize(
+        mut connection: Connection,
+        app_data: Option<Arc<crate::storage::PreparedAppData>>,
+    ) -> Result<Self, String> {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(db_error)?;
@@ -79,7 +101,10 @@ impl Database {
         connection
             .pragma_update(None, "foreign_keys", true)
             .map_err(db_error)?;
-        let database = Self { connection };
+        let database = Self {
+            connection,
+            app_data,
+        };
         // Never silently interpret stored ratings with a different model or configuration.
         database.list_summaries()?;
         Ok(database)
@@ -322,12 +347,14 @@ impl Database {
     }
 
     fn read_transaction(&self) -> Result<Transaction<'_>, String> {
+        self.verify_storage()?;
         let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
         ensure_supported_schema(&transaction)?;
         Ok(transaction)
     }
 
     fn write_transaction(&mut self) -> Result<Transaction<'_>, String> {
+        self.verify_storage()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -335,6 +362,15 @@ impl Database {
         // Keep the writer lock from version validation through the caller's commit.
         ensure_supported_schema(&transaction)?;
         Ok(transaction)
+    }
+
+    fn verify_storage(&self) -> Result<(), String> {
+        if let Some(app_data) = &self.app_data {
+            app_data
+                .verify()
+                .map_err(|_| "保存先が変更されました。アプリを再起動してください。".to_owned())?;
+        }
+        Ok(())
     }
 
     fn mutate_images(
@@ -421,32 +457,11 @@ fn read_image_paths(
         .map_err(db_error)
 }
 
-fn verify_prepared_database(
-    connection: &Connection,
-    prepared: &crate::storage::PreparedDatabaseFile,
-    path: &Path,
-) -> Result<(), String> {
-    if !prepared.has_identity() {
-        return Ok(());
-    }
-    let changed =
-        || "保存データが起動中に差し替えられました。アプリを再起動してください。".to_owned();
-    prepared.verify_path(path).map_err(|_| changed())?;
-    let mut moved: std::os::raw::c_int = 0;
-    // SAFETY: the connection is live, "main" is NUL-terminated, and the opcode
-    // writes one C int synchronously to the valid, exclusively borrowed pointer.
-    let result = unsafe {
-        rusqlite::ffi::sqlite3_file_control(
-            connection.handle(),
-            c"main".as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-            (&mut moved as *mut std::os::raw::c_int).cast(),
-        )
-    };
-    if result != rusqlite::ffi::SQLITE_OK || moved != 0 {
-        return Err(changed());
-    }
-    Ok(())
+#[cfg(test)]
+pub(crate) fn test_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
+    crate::sqlite_vfs::initialize()
+        .expect("SQLite storage routing must be initialized before test connections");
+    Connection::open(path)
 }
 
 fn db_error(error: rusqlite::Error) -> String {
@@ -857,7 +872,7 @@ mod tests {
                     .pragma_update(None, "journal_mode", mode)
                     .unwrap();
                 let state = settled_list_with_image(&mut database);
-                let mut other = Connection::open(&path).unwrap();
+                let mut other = test_connection(&path).unwrap();
                 upgrade_to_future_schema(&mut other).unwrap();
                 let before = stored_contents(&other);
 
@@ -881,7 +896,7 @@ mod tests {
                 .pragma_update(None, "journal_mode", mode)
                 .unwrap();
             let state = settled_list_with_image(&mut database);
-            let mut other = Connection::open(&path).unwrap();
+            let mut other = test_connection(&path).unwrap();
             upgrade_to_future_schema(&mut other).unwrap();
             let before = stored_contents(&other);
 
@@ -916,7 +931,7 @@ mod tests {
                     .pragma_update(None, "journal_mode", mode)
                     .unwrap();
                 let state = settled_list_with_image(&mut database);
-                let mut other = Connection::open(&path).unwrap();
+                let mut other = test_connection(&path).unwrap();
                 let upgrade = other
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
@@ -1014,7 +1029,7 @@ mod tests {
                     .pragma_update(None, "journal_mode", mode)
                     .unwrap();
                 let state = settled_list_with_image(&mut database);
-                let other = Rc::new(RefCell::new(Connection::open(&path).unwrap()));
+                let other = Rc::new(RefCell::new(test_connection(&path).unwrap()));
                 other.borrow().busy_timeout(Duration::ZERO).unwrap();
                 let writer = other.clone();
                 let attempted = Rc::new(RefCell::new(None));
@@ -1064,7 +1079,7 @@ mod tests {
             .unwrap();
         let state = settled_list_with_image(&mut database);
         let before = serde_json::to_value(database.list_summaries().unwrap()).unwrap();
-        let mut other = Connection::open(&path).unwrap();
+        let mut other = test_connection(&path).unwrap();
         let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
         let observed = completed.clone();
 
@@ -1093,6 +1108,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn initialization_preserves_replacement_app_data_contents_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for existing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("app-data");
+            let original = root.path().join("original");
+            let replacement = root.path().join("replacement");
+            std::fs::create_dir(&replacement).unwrap();
+            let filename = std::ffi::OsStr::new("pairrank.sqlite3");
+            if existing {
+                std::fs::write(replacement.join(filename), []).unwrap();
+                std::fs::set_permissions(
+                    replacement.join(filename),
+                    std::fs::Permissions::from_mode(0o640),
+                )
+                .unwrap();
+            }
+            let prepared = Arc::new(crate::storage::PreparedAppData::open(path.clone()).unwrap());
+            let result = Database::open_in_with(prepared, filename, || {
+                std::fs::rename(&path, &original).unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+            });
+            assert!(result.is_err());
+            if existing {
+                assert!(std::fs::read(path.join(filename)).unwrap().is_empty());
+                assert_eq!(
+                    std::fs::metadata(path.join(filename))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o640
+                );
+            } else {
+                assert!(
+                    !path.join(filename).exists(),
+                    "initialization created a DB in the replacement directory"
+                );
+            }
+            assert!(!path.join("pairrank.sqlite3-journal").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn database_open_rejects_a_hardlinked_file_without_changing_the_external_database() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1100,7 +1161,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let external = directory.path().join("external.sqlite3");
             let managed = directory.path().join("pairrank.sqlite3");
-            Connection::open(&external)
+            test_connection(&external)
                 .unwrap()
                 .execute_batch("VACUUM")
                 .unwrap();
@@ -1127,6 +1188,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let managed = directory.path().join("pairrank.sqlite3");
             let external = directory.path().join("external.sqlite3");
+            std::fs::write(&managed, []).unwrap();
             let result = Database::open_with(&managed, |sqlite_opened| {
                 if sqlite_opened == opened {
                     std::fs::hard_link(&managed, &external).unwrap();
@@ -1185,6 +1247,7 @@ mod tests {
     fn a_prepared_database_removed_before_sqlite_open_is_not_recreated() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pairrank.sqlite3");
+        std::fs::write(&path, []).unwrap();
         let result = Database::open_with(&path, |opened| {
             if !opened {
                 std::fs::remove_file(&path).unwrap();
@@ -1199,7 +1262,7 @@ mod tests {
     fn database_preparation_preserves_an_existing_connections_process_lock() {
         const PROBE_PATH: &str = "PAIRRANK_DATABASE_LOCK_PROBE_PATH";
         if let Some(path) = std::env::var_os(PROBE_PATH) {
-            let connection = Connection::open(std::path::PathBuf::from(path)).unwrap();
+            let connection = test_connection(std::path::PathBuf::from(path)).unwrap();
             connection.busy_timeout(Duration::ZERO).unwrap();
             let error = connection.execute_batch("BEGIN IMMEDIATE").unwrap_err();
             assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _)
@@ -1215,8 +1278,12 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE")
             .unwrap();
         {
-            let prepared = crate::storage::prepare_database_file(&path).unwrap();
-            verify_prepared_database(&database.connection, &prepared, &path).unwrap();
+            let reopened = crate::sqlite_vfs::open(
+                database.app_data().unwrap(),
+                std::ffi::OsStr::new("pairrank.sqlite3"),
+            )
+            .unwrap();
+            drop(reopened);
         }
         // A different process observes the OS lock, independent of SQLite's
         // in-process bookkeeping for its own connections.
@@ -1237,6 +1304,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pairrank.sqlite3");
+        std::fs::write(&path, []).unwrap();
         let external = directory.path().join("external.sqlite3");
         std::fs::write(&external, []).unwrap();
         std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1282,6 +1350,111 @@ mod tests {
         Database::open(Path::new(":memory:")).unwrap()
     }
 
+    #[test]
+    fn native_storage_recovers_hot_journals_and_uncheckpointed_wal_after_exit() {
+        const PROBE_PATH: &str = "PAIRRANK_RECOVERY_PROBE_PATH";
+        const PROBE_MODE: &str = "PAIRRANK_RECOVERY_PROBE_MODE";
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let database = Database::open(Path::new(&path)).unwrap();
+            let mode = std::env::var(PROBE_MODE).unwrap();
+            database
+                .connection
+                .pragma_update(None, "journal_mode", &mode)
+                .unwrap();
+            database
+                .connection
+                .pragma_update(None, "wal_autocheckpoint", 0)
+                .unwrap();
+            if mode == "DELETE" {
+                database.connection.execute_batch("PRAGMA cache_size=1; BEGIN IMMEDIATE; UPDATE lists SET name='uncommitted'; CREATE TABLE crash_payload(data BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100) INSERT INTO crash_payload SELECT randomblob(4096) FROM n;").unwrap();
+            } else {
+                database
+                    .connection
+                    .execute_batch("UPDATE lists SET name='committed in WAL'")
+                    .unwrap();
+            }
+            // Exit without running Connection::drop: leave SQLite's recovery files intact.
+            std::process::exit(0);
+        }
+        for mode in ["DELETE", "WAL"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("pairrank.sqlite3");
+            {
+                let mut database = Database::open(&path).unwrap();
+                database.create_list("original".to_owned()).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "database::tests::native_storage_recovers_hot_journals_and_uncheckpointed_wal_after_exit", "--nocapture"])
+                .env(PROBE_PATH, &path).env(PROBE_MODE, mode).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let sidecar = directory.path().join(if mode == "DELETE" {
+                "pairrank.sqlite3-journal"
+            } else {
+                "pairrank.sqlite3-wal"
+            });
+            assert!(std::fs::metadata(&sidecar).unwrap().len() > 32);
+            let database = Database::open(&path).unwrap();
+            assert_eq!(
+                database.list_summaries().unwrap()[0].name,
+                if mode == "DELETE" {
+                    "original"
+                } else {
+                    "committed in WAL"
+                }
+            );
+            let integrity: String = database
+                .connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE name='crash_payload'",
+                        [],
+                        |row| row.get::<_, u32>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_storage_namespace_survives_the_first_connection_closing() {
+        for mode in ["DELETE", "WAL"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("pairrank.sqlite3");
+            let first = Database::open(&path).unwrap();
+            first
+                .connection
+                .pragma_update(None, "journal_mode", mode)
+                .unwrap();
+            let mut second = Database::open(&path).unwrap();
+            // Establish the WAL shared-memory node before releasing its first connection.
+            first.list_summaries().unwrap();
+            second.list_summaries().unwrap();
+            drop(first);
+            second
+                .create_list("remaining connection".to_owned())
+                .unwrap();
+            assert_eq!(
+                second.list_summaries().unwrap()[0].name,
+                "remaining connection"
+            );
+            drop(second);
+            assert_eq!(
+                Database::open(&path).unwrap().list_summaries().unwrap()[0].name,
+                "remaining connection"
+            );
+        }
+    }
+
     fn populated_list(database: &mut Database, name: &str) -> ListState {
         let list = database.create_list(name.to_owned()).unwrap();
         database
@@ -1306,7 +1479,7 @@ mod tests {
         let path = directory.path().join("shared.sqlite3");
         let mut database = Database::open(&path).unwrap();
         let list = populated_list(&mut database, "Delete after another writer");
-        let mut other = Connection::open(&path).unwrap();
+        let mut other = test_connection(&path).unwrap();
         let writer = other
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
@@ -1428,9 +1601,9 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("initial-migration.sqlite3");
-        let mut first = Connection::open(&path).unwrap();
+        let mut first = test_connection(&path).unwrap();
         first.pragma_update(None, "journal_mode", "WAL").unwrap();
-        let mut second = Connection::open(&path).unwrap();
+        let mut second = test_connection(&path).unwrap();
         let result = Rc::new(RefCell::new(None));
         let completed = result.clone();
         MIGRATE_AFTER_VERSION.with(|pending| {
@@ -1480,10 +1653,10 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("concurrent-upgrade.sqlite3");
-        let mut first = Connection::open(&path).unwrap();
+        let mut first = test_connection(&path).unwrap();
         first.pragma_update(None, "journal_mode", "WAL").unwrap();
         migrate(&mut first, MIGRATIONS).unwrap();
-        let mut second = Connection::open(&path).unwrap();
+        let mut second = test_connection(&path).unwrap();
         let result = Rc::new(RefCell::new(None));
         let completed = result.clone();
         UPGRADE_AFTER_VERSION.with(|pending| {
@@ -1517,7 +1690,7 @@ mod tests {
 
     #[test]
     fn pending_migrations_preserve_data_and_apply_in_order_as_one_upgrade() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
         connection
             .execute(
@@ -1559,7 +1732,7 @@ mod tests {
 
     #[test]
     fn failed_upgrade_rolls_back_every_pending_schema_data_and_version_change() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
         connection.execute(
             "INSERT INTO lists (name, model_version, model_parameters) VALUES ('original', 1, '{}')",
@@ -1597,7 +1770,7 @@ mod tests {
 
     #[test]
     fn failed_initial_migration_leaves_an_empty_unversioned_database() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         let migrations = [Migration {
             version: 1,
             sql: "CREATE TABLE partial (id INTEGER); INSERT INTO missing_table VALUES (1);",
@@ -1610,7 +1783,7 @@ mod tests {
 
     #[test]
     fn migration_rejects_broken_references_before_commit() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         migrate(&mut connection, MIGRATIONS).unwrap();
         // Table-rebuild migrations may run with immediate foreign key enforcement disabled.
         connection
@@ -1640,7 +1813,7 @@ mod tests {
 
     #[test]
     fn newer_or_unmanaged_databases_are_not_changed() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE existing (value TEXT); INSERT INTO existing VALUES ('saved');",
@@ -1668,7 +1841,7 @@ mod tests {
 
     #[test]
     fn unmanaged_table_with_similar_sqlite_prefix_is_not_mistaken_for_internal_metadata() {
-        let mut connection = Connection::open_in_memory().unwrap();
+        let mut connection = test_connection(Path::new(":memory:")).unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE sqliteBackup (value TEXT); INSERT INTO sqliteBackup VALUES ('saved');",

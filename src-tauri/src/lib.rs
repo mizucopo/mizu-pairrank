@@ -3,6 +3,7 @@ mod database;
 mod images;
 mod models;
 mod rating;
+mod sqlite_vfs;
 mod storage;
 
 use database::{Database, ImageChange};
@@ -29,6 +30,7 @@ impl Backend {
     ) -> Self {
         let directory = directory.and_then(|path| {
             storage::PreparedAppData::open(path)
+                .map(Arc::new)
                 .map_err(|error| format!("保存先を作成できません: {error}"))
         });
         let verify = |directory: &storage::PreparedAppData| {
@@ -42,7 +44,8 @@ impl Backend {
             .map_err(Clone::clone)
             .and_then(|directory| {
                 verify(directory)?;
-                let database = Database::open(&directory.path().join("pairrank.sqlite3"))?;
+                let database =
+                    Database::open_in(directory.clone(), std::ffi::OsStr::new("pairrank.sqlite3"))?;
                 verify(directory)?;
                 Ok(database)
             });
@@ -53,7 +56,7 @@ impl Backend {
             .and_then(|directory| {
                 verify(directory)?;
                 let database = database.as_ref().map_err(Clone::clone)?;
-                let images = ImageService::open(directory.path().to_owned(), database)?;
+                let images = ImageService::open(database)?;
                 verify(directory)?;
                 Ok(images)
             })
@@ -809,6 +812,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_image_only_startup_failure_keeps_the_database_usable() {
+        let directory = tempfile::tempdir().unwrap();
+        let app_data = directory.path().join("app-data");
+        std::fs::create_dir(&app_data).unwrap();
+        std::fs::write(app_data.join("images"), b"ordinary file").unwrap();
+        let backend = Backend::open_with(Ok(app_data.clone()), |_| {});
+        assert!(backend.images.is_err());
+        let list = backend
+            .database_job(|database| database.create_list("Still usable".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(list.name, "Still usable");
+        assert_eq!(
+            backend
+                .database_job(|database| database.list_summaries())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(app_data.join("images")).unwrap(),
+            b"ordinary file"
+        );
+    }
+
     fn backend() -> (tempfile::TempDir, Backend) {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("test.sqlite3")).unwrap();
@@ -853,7 +883,7 @@ mod tests {
     }
 
     fn upgrade_to_future_schema(path: &Path) -> (rusqlite::Connection, String) {
-        let mut connection = rusqlite::Connection::open(path).unwrap();
+        let mut connection = database::test_connection(path).unwrap();
         let supported: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -1203,7 +1233,7 @@ mod tests {
             .import_local(Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png"))
             .unwrap();
         let imported_path = image.path.clone();
-        rusqlite::Connection::open(directory.path().join("test.sqlite3")).unwrap()
+        database::test_connection(directory.path().join("test.sqlite3")).unwrap()
             .execute_batch("CREATE TRIGGER fail_image AFTER UPDATE OF image_path ON items BEGIN SELECT RAISE(ABORT, 'disk failure'); END;").unwrap();
         assert!(
             backend
