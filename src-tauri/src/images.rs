@@ -421,6 +421,14 @@ impl ImageService {
         &self,
         request: &tauri::http::Request<Vec<u8>>,
     ) -> tauri::http::Response<Vec<u8>> {
+        self.image_response_with(request, || {})
+    }
+
+    fn image_response_with(
+        &self,
+        request: &tauri::http::Request<Vec<u8>>,
+        checkpoint: impl FnOnce(),
+    ) -> tauri::http::Response<Vec<u8>> {
         use tauri::http::{Method, Response, StatusCode};
         let read = || -> Result<(Vec<u8>, u64), StatusCode> {
             if request.method() != Method::GET && request.method() != Method::HEAD {
@@ -433,19 +441,21 @@ impl ImageService {
             self.managed_path(reference).ok_or(StatusCode::FORBIDDEN)?;
             let pinned = verified_image_directory(&self.directory, &self.directory_identity)
                 .map_err(|_| StatusCode::FORBIDDEN)?;
-            let metadata = pinned
-                .symlink_metadata(reference)
-                .map_err(|_| StatusCode::NOT_FOUND)?;
-            if !metadata.is_file() {
-                return Err(StatusCode::FORBIDDEN);
-            }
+            checkpoint();
+            let file = crate::storage::open_managed_file(&pinned, std::ffi::OsStr::new(reference))
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                    _ => StatusCode::FORBIDDEN,
+                })?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if metadata.len() > MAX_IMAGE_BYTES as u64 {
                 return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
             if request.method() == Method::HEAD {
                 return Ok((Vec::new(), metadata.len()));
             }
-            let file = pinned.open(reference).map_err(|_| StatusCode::NOT_FOUND)?;
             let mut bytes = Vec::new();
             file.take(MAX_IMAGE_BYTES as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -638,27 +648,62 @@ impl ImageService {
 }
 
 fn image_storage_lock(app_data: &Path) -> std::io::Result<std::fs::File> {
-    let path = app_data.join(".images.lock");
-    match crate::storage::create_private_file(&path) {
-        Ok(file) => {
-            file.sync_all()?;
-            sync_directory(app_data)?;
-        }
+    image_storage_lock_with(app_data, || {})
+}
+
+fn image_storage_lock_with(
+    app_data: &Path,
+    checkpoint: impl FnOnce(),
+) -> std::io::Result<std::fs::File> {
+    let directory = open_image_directory(app_data)?;
+    let name = ".images.lock";
+    let mut options = crate::storage::managed_open_options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (file, created) = match directory.open_with(name, &options) {
+        Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !std::fs::symlink_metadata(&path)?.is_file() {
-                return Err(std::io::Error::other(
-                    "image storage lock is not a regular file",
-                ));
-            }
+            options.create_new(false);
+            let file = directory.open_with(name, &options);
             #[cfg(unix)]
-            crate::storage::restrict_existing_file(&path)?;
+            let file = file.or_else(|error| {
+                if error.kind() != std::io::ErrorKind::PermissionDenied {
+                    return Err(error);
+                }
+                crate::storage::restrict_existing_file(&app_data.join(name))?;
+                directory.open_with(name, &options)
+            });
+            (file?, false)
         }
         Err(error) => return Err(error),
+    };
+    let file = file.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "image storage lock is not a regular file",
+        ));
     }
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+        }
+    }
+    if created {
+        file.sync_all()?;
+        #[cfg(unix)]
+        directory.into_std_file().sync_all()?;
+    }
+    // The validated handle must remain the lease even if its pathname changes.
+    checkpoint();
+    Ok(file)
 }
 
 fn reconcile_images(
@@ -1019,6 +1064,87 @@ mod tests {
     use std::sync::Mutex;
 
     #[cfg(unix)]
+    #[test]
+    fn image_protocol_rejects_a_leaf_replaced_by_a_symlink_after_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let reference = format!("{}.png", Uuid::new_v4());
+        let path = service.directory.join(&reference);
+        let other = service.directory.join("other-file");
+        std::fs::write(&other, b"do not serve").unwrap();
+        for method in ["GET", "HEAD"] {
+            std::fs::write(&path, png(2, 2)).unwrap();
+            let request = tauri::http::Request::builder()
+                .method(method)
+                .uri(format!("pairrank-image://localhost/{reference}"))
+                .body(Vec::new())
+                .unwrap();
+            let response = service.image_response_with(&request, || {
+                std::fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink("other-file", &path).unwrap();
+            });
+            assert_eq!(response.status(), tauri::http::StatusCode::FORBIDDEN);
+            assert!(response.body().is_empty());
+            assert_eq!(std::fs::read(&other).unwrap(), b"do not serve");
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_protocol_rejects_a_fifo_replacing_the_leaf_before_opening_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let reference = format!("{}.png", Uuid::new_v4());
+        let path = service.directory.join(&reference);
+        std::fs::write(&path, png(2, 2)).unwrap();
+        let request = tauri::http::Request::builder()
+            .method("HEAD")
+            .uri(format!("pairrank-image://localhost/{reference}"))
+            .body(Vec::new())
+            .unwrap();
+        let response = service.image_response_with(&request, || {
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        });
+        assert_eq!(response.status(), tauri::http::StatusCode::FORBIDDEN);
+        assert!(response.body().is_empty());
+    }
+
+    #[test]
+    fn image_protocol_uses_the_opened_file_size_for_head_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ImageService::new(directory.path().to_owned()).unwrap();
+        let reference = format!("{}.png", Uuid::new_v4());
+        let path = service.directory.join(&reference);
+        std::fs::write(&path, png(2, 2)).unwrap();
+        let request = tauri::http::Request::builder()
+            .method("HEAD")
+            .uri(format!("pairrank-image://localhost/{reference}"))
+            .body(Vec::new())
+            .unwrap();
+        let response = service.image_response_with(&request, || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_IMAGE_BYTES as u64 + 1)
+                .unwrap();
+        });
+        assert_eq!(
+            response.status(),
+            tauri::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(response.body().is_empty());
+    }
+
+    #[cfg(unix)]
     fn with_ordinary_directory_replacement(check: impl FnOnce(&mut ImageService, &Path, &str)) {
         let app_data = tempfile::tempdir().unwrap();
         let mut service = ImageService::new(app_data.path().to_owned()).unwrap();
@@ -1148,6 +1274,40 @@ mod tests {
             reconcile_images(&canonical, &service.directory_identity, &HashSet::new()).is_err()
         );
         assert_eq!(std::fs::read(external_file).unwrap(), b"external image");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_lock_keeps_the_validated_inode_when_the_path_is_replaced() {
+        for already_exists in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(".images.lock");
+            let external = directory.path().join("external.lock");
+            std::fs::write(&external, b"external").unwrap();
+            if already_exists {
+                std::fs::write(&path, b"existing lock").unwrap();
+            }
+            let mut live_instance = None;
+            let lease = image_storage_lock_with(directory.path(), || {
+                let existing = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                existing.lock_shared().unwrap();
+                live_instance = Some(existing);
+                std::fs::rename(&path, directory.path().join("previous.lock")).unwrap();
+                std::os::unix::fs::symlink(&external, &path).unwrap();
+            })
+            .unwrap();
+            assert!(
+                matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "a live instance must prevent reconciliation, existing lock: {already_exists}"
+            );
+            drop(live_instance);
+            lease.try_lock().unwrap();
+            assert_eq!(std::fs::read(&external).unwrap(), b"external");
+        }
     }
 
     #[test]

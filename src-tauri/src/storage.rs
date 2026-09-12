@@ -114,15 +114,17 @@ fn restrict_existing_file_with(path: &Path, mut checkpoint: impl FnMut(bool)) ->
     Ok(())
 }
 
-#[cfg(unix)]
-fn open_managed_file(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> io::Result<File> {
-    use rustix::fs::{Mode, OFlags, openat};
-    let file = File::from(openat(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
+pub fn managed_open_options() -> cap_std::fs::OpenOptions {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    options
+}
+
+pub fn open_managed_file(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> io::Result<File> {
+    let file = directory
+        .open_with(name, &managed_open_options())?
+        .into_std();
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("managed file is not a regular file"));
     }
