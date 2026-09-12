@@ -1,40 +1,17 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
+#[cfg(windows)]
+pub(crate) mod windows;
+
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-
-#[derive(Default)]
-pub struct PreparedDatabaseFile {
-    // Extra open/close calls for this inode can release another SQLite connection's
-    // process-wide POSIX locks, so keep identity values instead of another descriptor.
-    identity: Option<(u64, u64)>,
-}
-
-impl PreparedDatabaseFile {
-    pub fn has_identity(&self) -> bool {
-        self.identity.is_some()
-    }
-
-    pub fn verify_path(&self, path: &Path) -> io::Result<()> {
-        #[cfg(unix)]
-        if let Some(expected) = self.identity {
-            let metadata = fs::symlink_metadata(path)?;
-            if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected {
-                return Err(io::Error::other("prepared database file was replaced"));
-            }
-            verify_single_link(metadata.nlink(), true)?;
-        }
-        #[cfg(not(unix))]
-        let _ = path;
-        Ok(())
-    }
-}
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 pub struct PreparedAppData {
     path: std::path::PathBuf,
     identity: same_file::Handle,
+    directory: cap_std::fs::Dir,
 }
 
 impl PreparedAppData {
@@ -47,12 +24,25 @@ impl PreparedAppData {
         )?;
         #[cfg(not(unix))]
         create_private_directory(&path)?;
-        let directory = open_app_data_directory(&path)?.into_std_file();
+        let directory = open_app_data_directory(&path)?;
         #[cfg(unix)]
-        verify_identity(&directory.metadata()?, expected)?;
+        let directory = cap_std::fs::Dir::from_std_file(File::from(rustix::fs::openat(
+            &directory,
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?));
+        #[cfg(unix)]
+        verify_identity(
+            &directory.try_clone()?.into_std_file().metadata()?,
+            expected,
+        )?;
         let prepared = Self {
             path,
-            identity: same_file::Handle::from_file(directory)?,
+            identity: same_file::Handle::from_file(directory.try_clone()?.into_std_file())?,
+            directory,
         };
         prepared.verify()?;
         Ok(prepared)
@@ -60,6 +50,10 @@ impl PreparedAppData {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn directory(&self) -> &cap_std::fs::Dir {
+        &self.directory
     }
 
     pub fn verify(&self) -> io::Result<()> {
@@ -72,6 +66,99 @@ impl PreparedAppData {
         }
         Ok(())
     }
+}
+
+fn validate_child_name(name: &std::ffi::OsStr) -> io::Result<()> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid storage child name",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn create_private_directory_in(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<cap_std::fs::Dir> {
+    validate_child_name(name)?;
+    #[cfg(windows)]
+    return windows::create_private_directory_in(parent, name);
+    #[cfg(unix)]
+    create_private_directory_in_with(parent, name, &mut |file| file.sync_all())
+}
+
+#[cfg(unix)]
+fn create_private_directory_in_with(
+    parent: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    sync: &mut impl FnMut(&File) -> io::Result<()>,
+) -> io::Result<cap_std::fs::Dir> {
+    validate_child_name(name)?;
+    {
+        use cap_std::fs::MetadataExt as _;
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let expected = parent.symlink_metadata(name)?;
+        if !expected.is_dir() {
+            return Err(io::Error::other("managed directory is not a directory"));
+        }
+        let identity = (expected.dev(), expected.ino());
+        let opened = openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from);
+        let directory = match opened {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                restore_unreadable_entry(parent, name, identity, 0o700, false)?
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = directory.metadata()?;
+        verify_identity(&metadata, identity)?;
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        sync(&directory)?;
+        sync(&parent.try_clone()?.into_std_file())?;
+        Ok(cap_std::fs::Dir::from_std_file(directory))
+    }
+}
+
+pub(crate) fn directory_entries(
+    directory: &cap_std::fs::Dir,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    #[cfg(windows)]
+    return windows::directory_entries(directory);
+    #[cfg(unix)]
+    directory
+        .entries()?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+pub(crate) fn remove_file_in(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    validate_child_name(name)?;
+    #[cfg(windows)]
+    return windows::remove_file_in(directory, name);
+    #[cfg(unix)]
+    directory.remove_file(name)
 }
 
 fn open_app_data_directory(path: &Path) -> io::Result<cap_std::fs::Dir> {
@@ -89,6 +176,7 @@ fn open_app_data_directory(path: &Path) -> io::Result<cap_std::fs::Dir> {
         .open_dir_nofollow(name)
 }
 
+#[cfg(any(test, not(unix)))]
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return create_private_directory_with_sync(path, &mut |directory| {
@@ -98,7 +186,7 @@ pub fn create_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn create_private_directory_with_sync(
     path: &Path,
     sync: &mut impl FnMut(&Path) -> io::Result<()>,
@@ -190,27 +278,12 @@ fn create_directory_tree(
     sync(parent)
 }
 
-pub fn create_private_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
+#[cfg(all(test, unix, not(target_os = "linux")))]
 pub fn restrict_existing_file(path: &Path) -> io::Result<()> {
     restrict_existing_file_with(path, |_| {}).map(|_| ())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn restrict_existing_file_with(
     path: &Path,
     checkpoint: impl FnMut(bool),
@@ -358,48 +431,6 @@ fn restore_unreadable_entry(
     ))
 }
 
-#[cfg(unix)]
-pub fn prepare_database_file(path: &Path) -> io::Result<PreparedDatabaseFile> {
-    if path == Path::new(":memory:") {
-        return Ok(PreparedDatabaseFile::default());
-    }
-    let identity = match create_private_file(path) {
-        Ok(file) => {
-            file.sync_all()?;
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                File::open(parent)?.sync_all()?;
-            }
-            let metadata = file.metadata()?;
-            verify_single_link(metadata.nlink(), true)?;
-            (metadata.dev(), metadata.ino())
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            restrict_existing_file_with(path, |_| {})?
-        }
-        Err(error) => return Err(error),
-    };
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        match restrict_existing_file(Path::new(&sidecar)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(PreparedDatabaseFile {
-        identity: Some(identity),
-    })
-}
-
-#[cfg(not(unix))]
-pub fn prepare_database_file(_path: &Path) -> io::Result<PreparedDatabaseFile> {
-    Ok(PreparedDatabaseFile::default())
-}
-
 #[cfg(test)]
 mod app_data_tests {
     use super::*;
@@ -473,6 +504,53 @@ mod app_data_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn open_storage_connection(path: &Path) -> Result<rusqlite::Connection, String> {
+        let parent =
+            std::sync::Arc::new(PreparedAppData::open(path.parent().unwrap().to_owned()).unwrap());
+        crate::sqlite_vfs::open(parent, path.file_name().unwrap())
+    }
+
+    #[test]
+    fn child_directory_creation_requires_parent_sync_and_retries_it() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = PreparedAppData::open(root.path().join("app-data")).unwrap();
+        let parent_identity = parent.directory().dir_metadata().unwrap();
+        use cap_std::fs::MetadataExt as _;
+        let parent_identity = (parent_identity.dev(), parent_identity.ino());
+        let mut synchronized = Vec::new();
+        let error = create_private_directory_in_with(
+            parent.directory(),
+            std::ffi::OsStr::new("images"),
+            &mut |file| {
+                let metadata = file.metadata()?;
+                let identity = (metadata.dev(), metadata.ino());
+                synchronized.push(identity);
+                if identity == parent_identity {
+                    Err(io::Error::other("parent sync failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "parent sync failed");
+        assert_eq!(synchronized.len(), 2);
+        assert_eq!(synchronized[1], parent_identity);
+        let previous = synchronized.clone();
+        synchronized.clear();
+        create_private_directory_in_with(
+            parent.directory(),
+            std::ffi::OsStr::new("images"),
+            &mut |file| {
+                let metadata = file.metadata()?;
+                synchronized.push((metadata.dev(), metadata.ino()));
+                file.sync_all()
+            },
+        )
+        .unwrap();
+        assert_eq!(synchronized, previous);
+    }
 
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -605,7 +683,7 @@ mod tests {
         for suffix in ["-journal", "-wal", "-shm"] {
             let directory = tempfile::tempdir().unwrap();
             let managed = directory.path().join("pairrank.sqlite3");
-            prepare_database_file(&managed).unwrap();
+            open_storage_connection(&managed).unwrap();
             let external = directory.path().join("external");
             fs::write(&external, b"external content").unwrap();
             fs::set_permissions(&external, fs::Permissions::from_mode(0o644)).unwrap();
@@ -615,7 +693,7 @@ mod tests {
             )
             .unwrap();
 
-            assert!(prepare_database_file(&managed).is_err());
+            assert!(open_storage_connection(&managed).is_err());
             assert_eq!(mode(&external), 0o644);
             assert_eq!(fs::read(external).unwrap(), b"external content");
         }
@@ -804,7 +882,7 @@ mod tests {
     fn existing_database_sidecars_are_restricted_without_modifying_their_contents() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("pairrank.sqlite3");
-        prepare_database_file(&database).unwrap();
+        open_storage_connection(&database).unwrap();
         let sidecars: Vec<_> = ["-wal", "-shm", "-journal"]
             .into_iter()
             .map(|suffix| {
@@ -814,7 +892,7 @@ mod tests {
                 path
             })
             .collect();
-        prepare_database_file(&database).unwrap();
+        open_storage_connection(&database).unwrap();
         for path in sidecars {
             assert_eq!(mode(&path), 0o600);
             assert_eq!(fs::read(path).unwrap(), b"sidecar content");
@@ -829,7 +907,7 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
         let database = directory.path().join("pairrank.sqlite3");
         std::os::unix::fs::symlink(&source, &database).unwrap();
-        assert!(prepare_database_file(&database).is_err());
+        assert!(open_storage_connection(&database).is_err());
         assert_eq!(mode(&source), 0o644);
         assert_eq!(fs::read(source).unwrap(), b"unchanged source");
     }
