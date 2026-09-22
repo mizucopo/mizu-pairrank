@@ -24,6 +24,13 @@ struct Backend {
 }
 
 impl Backend {
+    fn open_in_documents(documents: Result<std::path::PathBuf, String>) -> Self {
+        let directory = documents
+            .map(|path| path.join("mizu-pairrank"))
+            .map_err(|error| format!("ドキュメントの場所を取得できません: {error}"));
+        Self::open_with(directory, |_| {})
+    }
+
     fn open_with(
         directory: Result<std::path::PathBuf, String>,
         mut checkpoint: impl FnMut(u8),
@@ -389,8 +396,8 @@ pub fn run() {
             },
         )
         .setup(|app| {
-            let directory = app.path().app_data_dir().map_err(|error| error.to_string());
-            app.manage(Backend::open_with(directory, |_| {}));
+            let documents = app.path().document_dir().map_err(|error| error.to_string());
+            app.manage(Backend::open_in_documents(documents));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -770,6 +777,90 @@ mod tests {
         .unwrap();
         assert!(service.validate_import(&image).is_ok());
         assert!(service.pick_local(|| Ok(None)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn documents_storage_preserves_rankings_and_images_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let documents = root.path().join("Documents");
+        std::fs::create_dir(&documents).unwrap();
+        let storage = documents.join("mizu-pairrank");
+        let first = Backend::open_in_documents(Ok(documents.clone()));
+        let (list_id, _, image) = list_with_image(&first).await;
+        let saved = first
+            .database_job(move |db| {
+                let list = db.get_list(list_id)?;
+                db.answer(
+                    list_id,
+                    list.items[0].id,
+                    list.items[1].id,
+                    Preference::AStrong,
+                    list.revision,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.comparison_count, 1);
+        assert!(storage.join("pairrank.sqlite3").is_file());
+        let image_contents = std::fs::read(storage.join("images").join(&image.path)).unwrap();
+        drop(first);
+
+        let reopened = Backend::open_in_documents(Ok(documents));
+        let loaded = reopened
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+        let response = reopened
+            .images
+            .as_ref()
+            .unwrap()
+            .image_response(&image_request(&image.path, "GET"));
+        assert_eq!(response.status(), tauri::http::StatusCode::OK);
+        assert_eq!(response.body(), &image_contents);
+    }
+
+    #[tokio::test]
+    async fn documents_lookup_failure_stops_storage_initialization() {
+        let backend = Backend::open_in_documents(Err("document directory unavailable".into()));
+        let error = backend
+            .database_job(|db| db.list_summaries())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "ドキュメントの場所を取得できません: document directory unavailable"
+        );
+        assert!(
+            backend
+                .images
+                .is_err_and(|image_error| image_error == error)
+        );
+    }
+
+    #[tokio::test]
+    async fn documents_storage_creation_failure_stops_storage_initialization() {
+        let root = tempfile::tempdir().unwrap();
+        let documents = root.path().join("Documents");
+        std::fs::create_dir(&documents).unwrap();
+        let storage = documents.join("mizu-pairrank");
+        std::fs::write(&storage, b"existing file").unwrap();
+
+        let backend = Backend::open_in_documents(Ok(documents));
+        let error = backend
+            .database_job(|db| db.list_summaries())
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("保存先を作成できません:"));
+        assert!(
+            backend
+                .images
+                .is_err_and(|image_error| image_error == error)
+        );
+        assert_eq!(std::fs::read(storage).unwrap(), b"existing file");
     }
 
     #[cfg(unix)]
