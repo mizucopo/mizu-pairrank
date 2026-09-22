@@ -4,7 +4,7 @@
   "description": "mizu-pairrank",
   "private": true,
   "type": "module",
-  "author": "みず",
+  "author": "\u307f\u305a",
   "license": "UNLICENSED",
   "scripts": {
     "build": "tsc -p tsconfig.build.json && vite build",
