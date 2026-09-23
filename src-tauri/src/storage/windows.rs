@@ -20,11 +20,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_DISPOSITION_INFO, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -49,6 +48,7 @@ fn entry_name(name: &OsStr) -> io::Result<Vec<u16>> {
 
 /// The options are NT create options, not Win32 FILE_FLAG_* values. The
 /// returned handle always names the entry itself, including a reparse point.
+/// An empty name reopens the retained directory itself, without a path lookup.
 fn open_entry(
     directory: &Dir,
     wide: &[u16],
@@ -63,7 +63,11 @@ fn open_entry(
     let mut name = UNICODE_STRING {
         Length: length,
         MaximumLength: length,
-        Buffer: wide.as_ptr().cast_mut(),
+        Buffer: if wide.is_empty() {
+            null_mut()
+        } else {
+            wide.as_ptr().cast_mut()
+        },
     };
     let object = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
@@ -150,26 +154,18 @@ pub(super) fn create_private_directory_in(parent: &Dir, name: &OsStr) -> io::Res
 pub(super) fn directory_entries(directory: &Dir) -> io::Result<Vec<OsString>> {
     // A fresh file object has its own enumeration cursor. Duplicating the
     // original handle would share that cursor between concurrent scans.
-    // Reopen the object itself: the NT relative name "." is not accepted as
-    // a Win32 current-directory path and fails with ERROR_INVALID_NAME.
-    // SAFETY: directory owns a live file-system handle. ReOpenFile returns a
-    // separately owned handle to that object without resolving its pathname.
-    let handle = unsafe {
-        ReOpenFile(
-            directory.as_raw_handle(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            SHARING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        let error = io::Error::last_os_error();
-        #[cfg(test)]
-        eprintln!("[DEBUG-issue34] ReOpenFile failed: {error:?}");
-        return Err(error);
-    }
-    // SAFETY: a successful ReOpenFile transfers ownership of a valid handle.
-    let scan = unsafe { File::from_raw_handle(handle) };
+    // ReOpenFile rejects directories even with FILE_FLAG_BACKUP_SEMANTICS.
+    // An empty NT relative name reopens the retained directory itself; "."
+    // is not a valid NT entry name and the ambient path may have been replaced.
+    let scan = open_entry(
+        directory,
+        &[],
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARING,
+        FILE_OPEN,
+        FILE_ATTRIBUTE_DIRECTORY,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
     // u64 storage provides the alignment required by FILE_ID_BOTH_DIR_INFO.
     let mut buffer = vec![0_u64; 8192];
     let buffer_bytes = size_of_val(buffer.as_slice());
@@ -194,10 +190,6 @@ pub(super) fn directory_entries(directory: &Dir) -> io::Result<Vec<OsString>> {
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 return Ok(names);
             }
-            #[cfg(test)]
-            eprintln!(
-                "[DEBUG-issue34] GetFileInformationByHandleEx failed (restart={restart}): {error:?}"
-            );
             return Err(error);
         }
         restart = false;
