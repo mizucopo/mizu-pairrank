@@ -20,11 +20,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_DISPOSITION_INFO, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -49,6 +48,7 @@ fn entry_name(name: &OsStr) -> io::Result<Vec<u16>> {
 
 /// The options are NT create options, not Win32 FILE_FLAG_* values. The
 /// returned handle always names the entry itself, including a reparse point.
+/// An empty name reopens the retained directory itself, without a path lookup.
 fn open_entry(
     directory: &Dir,
     wide: &[u16],
@@ -63,7 +63,11 @@ fn open_entry(
     let mut name = UNICODE_STRING {
         Length: length,
         MaximumLength: length,
-        Buffer: wide.as_ptr().cast_mut(),
+        Buffer: if wide.is_empty() {
+            null_mut()
+        } else {
+            wide.as_ptr().cast_mut()
+        },
     };
     let object = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
@@ -150,23 +154,18 @@ pub(super) fn create_private_directory_in(parent: &Dir, name: &OsStr) -> io::Res
 pub(super) fn directory_entries(directory: &Dir) -> io::Result<Vec<OsString>> {
     // A fresh file object has its own enumeration cursor. Duplicating the
     // original handle would share that cursor between concurrent scans.
-    // Reopen the object itself: the NT relative name "." is not accepted as
-    // a Win32 current-directory path and fails with ERROR_INVALID_NAME.
-    // SAFETY: directory owns a live file-system handle. ReOpenFile returns a
-    // separately owned handle to that object without resolving its pathname.
-    let handle = unsafe {
-        ReOpenFile(
-            directory.as_raw_handle(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            SHARING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a successful ReOpenFile transfers ownership of a valid handle.
-    let scan = unsafe { File::from_raw_handle(handle) };
+    // ReOpenFile rejects directories even with FILE_FLAG_BACKUP_SEMANTICS.
+    // An empty NT relative name reopens the retained directory itself; "."
+    // is not a valid NT entry name and the ambient path may have been replaced.
+    let scan = open_entry(
+        directory,
+        &[],
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        SHARING,
+        FILE_OPEN,
+        FILE_ATTRIBUTE_DIRECTORY,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
     // u64 storage provides the alignment required by FILE_ID_BOTH_DIR_INFO.
     let mut buffer = vec![0_u64; 8192];
     let buffer_bytes = size_of_val(buffer.as_slice());
@@ -296,6 +295,79 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Barrier;
+
+    fn for_each_directory_handle(check: impl Fn(&Dir)) {
+        let temporary = tempfile::tempdir().unwrap();
+        let ambient =
+            Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+        check(&ambient);
+        let images = create_private_directory_in(&ambient, OsStr::new("images")).unwrap();
+        check(&images);
+    }
+
+    fn assert_directory_entries(directory: &Dir, expected: &[OsString]) {
+        let mut actual = directory_entries(directory).unwrap();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn enumeration_returns_empty_and_exact_unicode_entries() {
+        for_each_directory_handle(|directory| {
+            assert_directory_entries(directory, &[]);
+
+            let files = ["entry.png", "画像🖼️.png", "café.png"];
+            for name in files {
+                directory.write(name, b"image").unwrap();
+            }
+            directory.create_dir("子フォルダ").unwrap();
+            let mut expected: Vec<_> = files.into_iter().map(OsString::from).collect();
+            expected.push(OsString::from("子フォルダ"));
+            expected.sort();
+            assert_directory_entries(directory, &expected);
+        });
+    }
+
+    #[test]
+    fn enumeration_returns_all_batches_on_repeated_and_concurrent_scans() {
+        for_each_directory_handle(|directory| {
+            let mut expected: Vec<_> = (0..600)
+                .map(|index| OsString::from(format!("画像_{index:04}_{}.png", "あ".repeat(64))))
+                .collect();
+            // The names alone exceed one 64 KiB enumeration buffer, regardless
+            // of the native record headers and alignment between entries.
+            assert!(
+                expected
+                    .iter()
+                    .map(|name| name.encode_wide().count() * size_of::<u16>())
+                    .sum::<usize>()
+                    > 64 * 1024
+            );
+            for name in &expected {
+                directory.write(name, b"image").unwrap();
+            }
+            expected.sort();
+            for _ in 0..3 {
+                assert_directory_entries(directory, &expected);
+            }
+
+            const SCANNERS: usize = 4;
+            let barrier = Barrier::new(SCANNERS);
+            std::thread::scope(|scope| {
+                for _ in 0..SCANNERS {
+                    let expected = &expected;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..3 {
+                            assert_directory_entries(directory, expected);
+                        }
+                    });
+                }
+            });
+        });
+    }
 
     struct ReplacedParent {
         _temporary: tempfile::TempDir,
