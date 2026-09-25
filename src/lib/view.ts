@@ -57,13 +57,16 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
       s.bulkSettings?.errors?.[provider] === undefined,
   );
   const bulkDisabled = s.busy || !missing || !providers.length || s.bulkSettingsLoading;
-  const bulkHelp = s.bulkSettingsLoading
-    ? "検索設定を確認しています…"
-    : !s.bulkSettings
-      ? '検索設定を確認できませんでした。<button class="text-button" data-action="refresh-bulk-settings">再確認</button>'
-      : !providers.length
-        ? '一括登録には検索設定が必要です。<button class="text-button" data-view="settings">検索設定を開く</button>'
-        : "";
+  let bulkHelp = "";
+  if (s.bulkSettingsLoading) {
+    bulkHelp = "検索設定を確認しています…";
+  } else if (!s.bulkSettings) {
+    bulkHelp =
+      '検索設定を確認できませんでした。<button class="text-button" data-action="refresh-bulk-settings">再確認</button>';
+  } else if (!providers.length) {
+    bulkHelp =
+      '一括登録には検索設定が必要です。<button class="text-button" data-view="settings">検索設定を開く</button>';
+  }
   return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件${bulkHelp ? ` · ${bulkHelp}` : ""}</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div>${
     list.items.length === 0
       ? '<div class="empty compact"><span class="empty-symbol">＋</span><h3>最初の2項目を追加しましょう</h3><p>どちらが好きかを答えると、少しずつ順位が見えてきます。</p></div>'
