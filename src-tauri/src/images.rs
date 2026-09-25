@@ -12,7 +12,7 @@ use image::{ImageDecoder, ImageFormat, ImageReader};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use url::{Host, Url};
 use uuid::Uuid;
@@ -27,6 +27,10 @@ const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
 const MAX_ACTIVE_SEARCHES: usize = 2;
+
+fn valid_search_query(query: &str) -> bool {
+    !query.is_empty() && query.chars().count() <= 400 && query.split_whitespace().count() <= 50
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +58,19 @@ pub struct ImageCandidate {
     /// A decoded, bounded PNG data URL; the webview makes no remote image requests.
     pub preview_url: String,
     pub source_url: String,
+}
+
+enum RemoteImportError {
+    Candidate(String),
+    Storage(String),
+}
+
+impl RemoteImportError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Candidate(message) | Self::Storage(message) => message,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -652,10 +669,73 @@ impl ImageService {
         query: String,
     ) -> Result<Vec<ImageCandidate>, String> {
         let query = query.trim();
-        if query.is_empty() || query.chars().count() > 400 || query.split_whitespace().count() > 50
-        {
+        if !valid_search_query(query) {
             return Err("検索語は1〜400文字、50語以内で入力してください。".to_owned());
         }
+        let (seeds, _search) = self.search_seeds(provider, query).await?;
+        tokio::time::timeout(Duration::from_secs(90), self.prepare_candidates(seeds))
+            .await
+            .map_err(|_| {
+                "画像候補の取得がタイムアウトしました。検索語を変えて再試行してください。"
+                    .to_owned()
+            })?
+    }
+
+    /// Try original images in provider order without requiring the UI preview to load.
+    pub async fn auto_import(
+        &self,
+        provider: SearchProvider,
+        query: String,
+    ) -> Result<Option<ImageAsset>, String> {
+        let query = query.trim();
+        if !valid_search_query(query) {
+            return Ok(None);
+        }
+        let (seeds, _search) = self.search_seeds(provider, query).await?;
+        let mut seen = HashSet::new();
+        let page_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        for seed in seeds {
+            let (image_url, source_url) = if let Some(url) = seed.image_url {
+                (url, seed.source_url)
+            } else {
+                let page = match tokio::time::timeout_at(
+                    page_deadline,
+                    self.transport.fetch(&seed.source_url, MAX_PAGE_BYTES),
+                )
+                .await
+                {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(_)) => continue,
+                    Err(_) => break,
+                };
+                let Some(image_url) = representative_image(&page.bytes, &page.final_url) else {
+                    continue;
+                };
+                (image_url, page.final_url)
+            };
+            if !seen.insert(image_url.clone()) {
+                continue;
+            }
+            let candidate = ImageCandidate {
+                id: image_url,
+                title: seed.title,
+                preview_url: String::new(),
+                source_url,
+            };
+            match self.import_remote_classified(candidate).await {
+                Ok(image) => return Ok(Some(image)),
+                Err(RemoteImportError::Candidate(_)) => continue,
+                Err(RemoteImportError::Storage(message)) => return Err(message),
+            }
+        }
+        Ok(None)
+    }
+
+    async fn search_seeds(
+        &self,
+        provider: SearchProvider,
+        query: &str,
+    ) -> Result<(Vec<CandidateSeed>, OwnedSemaphorePermit), String> {
         // Keep completed previews bounded too: a dismissed invoke still runs natively.
         // Reject excess searches instead of retaining an unbounded queue of commands.
         let search =
@@ -671,12 +751,7 @@ impl ImageService {
             key?.ok_or_else(|| "選択した検索サービスのAPIキーを設定してください。".to_owned())?;
         let payload = self.transport.search(provider, &key, query).await?;
         let seeds = parse_search_response(provider, &payload)?;
-        tokio::time::timeout(Duration::from_secs(90), self.prepare_candidates(seeds))
-            .await
-            .map_err(|_| {
-                "画像候補の取得がタイムアウトしました。検索語を変えて再試行してください。"
-                    .to_owned()
-            })?
+        Ok((seeds, _search))
     }
 
     async fn prepare_candidates(
@@ -718,15 +793,32 @@ impl ImageService {
     }
 
     pub async fn import_remote(&self, candidate: ImageCandidate) -> Result<ImageAsset, String> {
-        validate_public_url(&candidate.id)?;
-        validate_public_url(&candidate.source_url)?;
+        self.import_remote_classified(candidate)
+            .await
+            .map_err(RemoteImportError::into_message)
+    }
+
+    async fn import_remote_classified(
+        &self,
+        candidate: ImageCandidate,
+    ) -> Result<ImageAsset, RemoteImportError> {
+        validate_public_url(&candidate.id).map_err(RemoteImportError::Candidate)?;
+        validate_public_url(&candidate.source_url).map_err(RemoteImportError::Candidate)?;
         let buffer_permit = self
             .buffer_slots
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-        let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
+            .map_err(|_| {
+                RemoteImportError::Storage(
+                    "画像処理を続けられません。アプリを再起動してください。".to_owned(),
+                )
+            })?;
+        let resource = self
+            .transport
+            .fetch(&candidate.id, MAX_IMAGE_BYTES)
+            .await
+            .map_err(RemoteImportError::Candidate)?;
         let app_data = self.app_data.clone();
         let directory = self.directory.clone();
         let directory_identity = self.directory_identity.clone();
@@ -737,19 +829,26 @@ impl ImageService {
             let _buffer_permit = buffer_permit;
             let _storage_lease = storage_lease;
             let bytes = resource.bytes;
-            let _permit = decode_gate
-                .lock()
-                .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-            verify_app_data(&app_data)?;
-            save_image(
+            let _permit = decode_gate.lock().map_err(|_| {
+                RemoteImportError::Storage(
+                    "画像処理を続けられません。アプリを再起動してください。".to_owned(),
+                )
+            })?;
+            verify_app_data(&app_data).map_err(RemoteImportError::Storage)?;
+            let normalized = normalize_image(&bytes, 1600).map_err(RemoteImportError::Candidate)?;
+            save_normalized_image_with(
                 &directory,
                 &directory_identity,
-                &bytes,
+                normalized,
                 Some(candidate.source_url),
+                |_| {},
             )
+            .map_err(RemoteImportError::Storage)
         })
         .await
-        .map_err(|_| "画像保存処理を完了できませんでした。".to_owned())?
+        .map_err(|_| {
+            RemoteImportError::Storage("画像保存処理を完了できませんでした。".to_owned())
+        })?
     }
 
     /// The path comes only from the native file chooser, not a webview capability.
@@ -1136,9 +1235,25 @@ fn save_image_with(
     expected_identity: &same_file::Handle,
     bytes: &[u8],
     source_url: Option<String>,
-    mut checkpoint: impl FnMut(bool),
+    checkpoint: impl FnMut(bool),
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
+    save_normalized_image_with(
+        directory,
+        expected_identity,
+        normalized,
+        source_url,
+        checkpoint,
+    )
+}
+
+fn save_normalized_image_with(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+    normalized: Vec<u8>,
+    source_url: Option<String>,
+    mut checkpoint: impl FnMut(bool),
+) -> Result<ImageAsset, String> {
     // All creation, synchronization and rollback stay relative to this open directory.
     let pinned = verified_image_directory(directory, expected_identity)
         .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())?;
@@ -2537,6 +2652,137 @@ mod tests {
             local_import_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
+    }
+
+    #[tokio::test]
+    async fn auto_import_uses_search_order_and_falls_back_after_full_image_failure() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first","properties":{"url":"https://example.com/first.png"}},
+            {"url":"https://example.com/second","properties":{"url":"https://example.com/second.png"}}
+        ]}"#;
+        let (directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first.png", b"invalid image".to_vec()),
+                resource("https://example.com/second.png", png(4, 3)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        let image = service
+            .auto_import(SearchProvider::Brave, "sample item".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.source_url.as_deref(),
+            Some("https://example.com/second")
+        );
+        assert!(directory.path().join(&image.path).is_file());
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            [
+                "https://example.com/first.png",
+                "https://example.com/second.png"
+            ]
+        );
+        assert_eq!(
+            *transport.searches.lock().unwrap(),
+            [(SearchProvider::Brave, "sample item".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_search_returns_no_candidates_for_invalid_name_and_propagates_search_failure() {
+        let (_directory, service, transport) = service(Err("quota reached".into()), vec![]);
+        assert!(
+            service
+                .auto_import(SearchProvider::Brave, " ".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(transport.searches.lock().unwrap().is_empty());
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        assert_eq!(
+            service
+                .auto_import(SearchProvider::Brave, "valid".into())
+                .await
+                .unwrap_err(),
+            "quota reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_ollama_skips_pages_without_an_image() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first"},
+            {"url":"https://example.com/second"}
+        ]}"#;
+        let (_directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first", b"<html></html>".to_vec()),
+                resource(
+                    "https://example.com/second",
+                    br#"<meta property="og:image" content="/image.png">"#.to_vec(),
+                ),
+                resource("https://example.com/image.png", png(3, 3)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Ollama, "test-key")
+            .unwrap();
+        let image = service
+            .auto_import(SearchProvider::Ollama, "item".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.source_url.as_deref(),
+            Some("https://example.com/second")
+        );
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            [
+                "https://example.com/first",
+                "https://example.com/second",
+                "https://example.com/image.png"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_import_stops_on_persistent_image_processing_failure() {
+        let (_directory, service, _) = service(
+            Ok(br#"{"results":[{"url":"https://example.com/page","properties":{"url":"https://example.com/image.png"}}]}"#.to_vec()),
+            vec![resource("https://example.com/image.png", png(2, 2))],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        let gate = service.decode_gate.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = gate.lock().unwrap();
+                panic!("poison image processing lock");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            service
+                .auto_import(SearchProvider::Brave, "image".into())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

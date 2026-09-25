@@ -71,6 +71,7 @@ function setup(
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
+    autoRegisterImage: vi.fn<AppApi["autoRegisterImage"]>().mockResolvedValue("skipped"),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(state),
     setRemoteImage: vi.fn<AppApi["setRemoteImage"]>().mockResolvedValue(state),
     removeImage: vi.fn<AppApi["removeImage"]>().mockResolvedValue(state),
@@ -114,6 +115,173 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it.each([
+    [false, false, true, null, false],
+    [true, false, false, "brave", false],
+    [false, true, false, "ollama", false],
+    [true, true, false, null, true],
+  ] as const)(
+    "offers bulk registration for Brave=%s and Ollama=%s",
+    async (braveConfigured, ollamaConfigured, disabled, selected, chooseProvider) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      api.searchSettings.mockResolvedValueOnce({
+        braveConfigured,
+        ollamaConfigured,
+        defaultProvider: "brave",
+      });
+      await controller.refreshBulkSettings();
+      const open = button(root, '[data-action="bulk-images"]');
+      expect(open.disabled).toBe(disabled);
+      if (disabled) return;
+      await click(root, controller, '[data-action="bulk-images"]');
+      expect(root.textContent).toContain("画像未登録 2 件");
+      expect(controller.state.bulkProvider).toBe(selected);
+      const selector = root.querySelector<HTMLSelectElement>("#bulk-provider");
+      expect(Boolean(selector)).toBe(chooseProvider);
+      if (selector) {
+        expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(true);
+        selector.value = "ollama";
+        selector.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(controller.state.bulkProvider).toBe("ollama");
+        expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+      } else expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+    },
+  );
+
+  it("refreshes bulk eligibility when returning from search settings", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await controller.refreshBulkSettings();
+    expect(button(root, '[data-action="bulk-images"]').disabled).toBe(true);
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: false,
+      ollamaConfigured: true,
+      defaultProvider: "ollama",
+    });
+    await controller.navigate("settings");
+    await controller.navigate("items");
+    await vi.waitFor(() =>
+      expect(button(root, '[data-action="bulk-images"]').disabled).toBe(false),
+    );
+    await click(root, controller, '[data-action="bulk-images"]');
+    expect(controller.state.bulkProvider).toBe("ollama");
+  });
+
+  it("disables bulk registration when credential state cannot be read", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    api.searchSettings.mockRejectedValueOnce(new Error("keyring unavailable"));
+    await controller.refreshBulkSettings();
+    expect(button(root, '[data-action="bulk-images"]').disabled).toBe(true);
+    expect(button(root, '[data-action="refresh-bulk-settings"]').disabled).toBe(false);
+  });
+
+  it("processes only missing images and reloads the list after registration", async () => {
+    const { root, controller, api, state } = setup();
+    api.getList.mockResolvedValueOnce(withLocalImage(state));
+    await controller.initialize();
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.refreshBulkSettings();
+    const updated = {
+      ...withLocalImage(state),
+      revision: state.revision + 1,
+      items: state.items.map((item) => ({
+        ...item,
+        image: { path: `/images/${item.id}.png`, sourceUrl: "https://example.com" },
+      })),
+    };
+    api.autoRegisterImage.mockResolvedValueOnce("registered");
+    api.getList.mockResolvedValueOnce(updated);
+    await click(root, controller, '[data-action="bulk-images"]');
+    expect(root.textContent).toContain("画像未登録 1 件");
+    await click(root, controller, '[data-action="start-bulk-images"]');
+    expect(api.autoRegisterImage).toHaveBeenCalledExactlyOnceWith(1, 11, "brave");
+    expect(controller.state.active).toEqual(updated);
+    expect(root.textContent).toContain("1 件を登録、0 件を見送り");
+    await click(root, controller, '[data-action="close-modal"]');
+    expect(root.textContent).toContain("1 件を登録、0 件を見送り");
+  });
+
+  it("stops after the active item and keeps its partial result", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.refreshBulkSettings();
+    let finish: (outcome: "registered") => void = () => {};
+    api.autoRegisterImage.mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    api.getList.mockResolvedValueOnce(withLocalImage(state));
+    await click(root, controller, '[data-action="bulk-images"]');
+    button(root, '[data-action="start-bulk-images"]').click();
+    await vi.waitFor(() => expect(api.autoRegisterImage).toHaveBeenCalledOnce());
+    await controller.runBulkImages();
+    expect(api.autoRegisterImage).toHaveBeenCalledOnce();
+    expect(button(root, '[data-action="close-modal"]').disabled).toBe(true);
+    button(root, '[data-action="stop-bulk-images"]').click();
+    expect(controller.state.bulkRun?.stopping).toBe(true);
+    finish("registered");
+    await settle(controller);
+    expect(api.autoRegisterImage).toHaveBeenCalledOnce();
+    expect(controller.state.bulkRun).toMatchObject({
+      done: 1,
+      total: 2,
+      registered: 1,
+      stopped: true,
+    });
+    expect(controller.state.active?.items[0]?.image).not.toBeNull();
+    expect(root.textContent).toContain("1 / 2 件を処理");
+  });
+
+  it("shows partial counts and reloads after a search service error", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.refreshBulkSettings();
+    api.autoRegisterImage
+      .mockResolvedValueOnce("registered")
+      .mockRejectedValueOnce(new Error("API利用上限"));
+    api.getList.mockResolvedValueOnce(withLocalImage(state));
+    await click(root, controller, '[data-action="bulk-images"]');
+    await click(root, controller, '[data-action="start-bulk-images"]');
+    expect(api.autoRegisterImage).toHaveBeenCalledTimes(2);
+    expect(controller.state.bulkRun).toMatchObject({ done: 1, registered: 1 });
+    expect(root.textContent).toContain("1 件を登録、0 件を見送り");
+    expect(root.textContent).toContain("API利用上限");
+    await click(root, controller, '[data-action="close-modal"]');
+    expect(root.textContent).toContain("API利用上限");
+  });
+
+  it("counts unavailable images as skipped and continues with the next item", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.refreshBulkSettings();
+    api.autoRegisterImage.mockResolvedValueOnce("unavailable").mockResolvedValueOnce("skipped");
+    await click(root, controller, '[data-action="bulk-images"]');
+    await click(root, controller, '[data-action="start-bulk-images"]');
+    expect(api.autoRegisterImage).toHaveBeenNthCalledWith(1, 1, 10, "brave");
+    expect(api.autoRegisterImage).toHaveBeenNthCalledWith(2, 1, 11, "brave");
+    expect(controller.state.bulkRun).toMatchObject({ done: 2, registered: 0, skipped: 2 });
+  });
+
   it("loads managed image references through their protocol and preserves legacy absolute images", async () => {
     const { root, controller, api, state } = setup(
       (path, protocol) => `${protocol}://localhost/${encodeURIComponent(path)}`,

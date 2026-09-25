@@ -24,6 +24,8 @@ export const api: AppApi = {
   searchSettings: () => invoke("search_settings"),
   setApiKey: (provider, key) => invoke("set_api_key", { provider, key }),
   searchImages: (provider, query) => invoke("search_images", { provider, query }),
+  autoRegisterImage: (listId, itemId, provider) =>
+    invoke("auto_register_image", { listId, itemId, provider }),
   setLocalImage: (listId, itemId) => invoke("set_local_image", { listId, itemId }),
   setRemoteImage: (listId, itemId, candidate) =>
     invoke("set_remote_image", { listId, itemId, candidate }),

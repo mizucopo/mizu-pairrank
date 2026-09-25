@@ -18,7 +18,17 @@ export type Modal =
   | { kind: "rename-item"; itemId: number }
   | { kind: "delete-item"; itemId: number }
   | { kind: "image"; itemId: number }
+  | { kind: "bulk-image" }
   | null;
+export type BulkImageRun = {
+  total: number;
+  done: number;
+  registered: number;
+  skipped: number;
+  stopping: boolean;
+  stopped: boolean;
+  running: boolean;
+};
 export type AppState = {
   lists: ListSummary[];
   active: ListState | null;
@@ -31,6 +41,10 @@ export type AppState = {
   notice: string;
   modal: Modal;
   settings: SearchSettings | null;
+  bulkSettings: SearchSettings | null;
+  bulkSettingsLoading: boolean;
+  bulkProvider: SearchProvider | null;
+  bulkRun: BulkImageRun | null;
   candidates: ImageCandidate[];
   searched: boolean;
   readPending: ReadKind | null;
@@ -65,6 +79,10 @@ export class AppController {
     notice: "",
     modal: null,
     settings: null,
+    bulkSettings: null,
+    bulkSettingsLoading: false,
+    bulkProvider: null,
+    bulkRun: null,
     candidates: [],
     searched: false,
     readPending: null,
@@ -74,6 +92,7 @@ export class AppController {
 
   private readRequest: symbol | null = null;
   private settingsRead: Promise<SearchSettings> | null = null;
+  private bulkSettingsRequest: symbol | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -131,6 +150,7 @@ export class AppController {
   }
 
   async selectList(id: number): Promise<void> {
+    const wasSettings = this.state.view === "settings";
     this.cancelRead("settings");
     await this.perform(async () => {
       const list = await this.api
@@ -141,12 +161,17 @@ export class AppController {
       this.state.modal = null;
       this.state.view = list.convergence.converged ? "ranking" : "items";
     });
+    if (wasSettings && this.state.view === "items") void this.refreshBulkSettings();
   }
 
   async navigate(view: View): Promise<void> {
     if (view === "settings" && this.state.readPending === "settings") return;
     this.cancelRead("settings");
     if (this.state.busy) return;
+    if (view === "settings") {
+      this.bulkSettingsRequest = null;
+      this.state.bulkSettingsLoading = false;
+    }
     if (view === "compare") {
       await this.startComparison();
       return;
@@ -155,7 +180,128 @@ export class AppController {
     this.state.modal = null;
     this.state.error = "";
     if (view === "settings") await this.loadSettings("settings");
-    else this.changed();
+    else {
+      this.changed();
+      if (view === "items") void this.refreshBulkSettings();
+    }
+  }
+
+  availableBulkProviders(): SearchProvider[] {
+    const settings = this.state.bulkSettings;
+    if (!settings) return [];
+    return (["brave", "ollama"] as const).filter(
+      (provider) =>
+        (provider === "brave" ? settings.braveConfigured : settings.ollamaConfigured) &&
+        settings.errors?.[provider] === undefined,
+    );
+  }
+
+  async refreshBulkSettings(): Promise<void> {
+    const request = Symbol();
+    this.bulkSettingsRequest = request;
+    this.state.bulkSettings = null;
+    this.state.bulkSettingsLoading = true;
+    this.changed();
+    try {
+      if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+      if (this.bulkSettingsRequest !== request) return;
+      const reading = this.api.searchSettings();
+      this.settingsRead = reading;
+      try {
+        const settings = await reading;
+        if (this.bulkSettingsRequest === request) this.state.bulkSettings = settings;
+      } finally {
+        if (this.settingsRead === reading) this.settingsRead = null;
+      }
+    } catch {
+      // An unknown credential status must keep bulk registration disabled.
+    } finally {
+      if (this.bulkSettingsRequest === request) {
+        this.state.bulkSettingsLoading = false;
+        this.changed();
+      }
+    }
+  }
+
+  openBulkImages(): void {
+    if (this.state.busy || this.state.view !== "items" || !this.state.active) return;
+    const missing = this.state.active.items.filter((item) => !item.image);
+    const providers = this.availableBulkProviders();
+    if (!missing.length || !providers.length || this.state.bulkSettingsLoading) return;
+    this.state.bulkProvider = providers.length === 1 ? providers[0]! : null;
+    this.state.bulkRun = null;
+    this.state.error = "";
+    this.state.modal = { kind: "bulk-image" };
+    this.changed();
+  }
+
+  stopBulkImages(): void {
+    const run = this.state.bulkRun;
+    if (!run?.running || run.stopping) return;
+    run.stopping = true;
+    this.changed();
+  }
+
+  async runBulkImages(): Promise<void> {
+    const list = this.state.active;
+    const provider = this.state.bulkProvider;
+    if (
+      this.state.busy ||
+      !list ||
+      this.state.modal?.kind !== "bulk-image" ||
+      !provider ||
+      !this.availableBulkProviders().includes(provider)
+    )
+      return;
+    const itemIds = list.items.filter((item) => !item.image).map((item) => item.id);
+    if (!itemIds.length) return;
+    const run: BulkImageRun = {
+      total: itemIds.length,
+      done: 0,
+      registered: 0,
+      skipped: 0,
+      stopping: false,
+      stopped: false,
+      running: true,
+    };
+    this.state.bulkRun = run;
+    this.state.busy = true;
+    this.state.error = "";
+    this.state.notice = "";
+    this.changed();
+    try {
+      for (const itemId of itemIds) {
+        if (run.stopping) break;
+        const outcome = await this.api.autoRegisterImage(list.id, itemId, provider);
+        if (outcome !== "registered" && outcome !== "skipped" && outcome !== "unavailable")
+          throw new Error("画像登録の結果を確認できませんでした。");
+        run.done += 1;
+        if (outcome === "registered") run.registered += 1;
+        else run.skipped += 1;
+        this.changed();
+      }
+    } catch (error) {
+      this.state.error = errorMessage(error);
+    } finally {
+      run.stopped = run.stopping && run.done < run.total;
+      run.running = false;
+      try {
+        const latest = await this.api
+          .getList(list.id)
+          .catch((error: unknown) => this.handleListError(list.id, error));
+        await this.acceptList(latest);
+      } catch (error) {
+        this.state.error = [
+          this.state.error,
+          `リストを再取得できませんでした: ${errorMessage(error)}`,
+        ]
+          .filter(Boolean)
+          .join(" ");
+      }
+      this.state.notice = `画像の一括登録${run.stopped ? "を停止" : this.state.error ? "が中断" : "が完了"}しました。${run.done} / ${run.total} 件を処理し、${run.registered} 件を登録、${run.skipped} 件を見送りました。`;
+      this.state.busy = false;
+      this.changed();
+    }
   }
 
   private async loadSettings(
@@ -227,11 +373,13 @@ export class AppController {
 
   closeModal(): void {
     if (this.state.busy && this.state.readPending !== "image") return;
+    const wasBulkImages = this.state.modal?.kind === "bulk-image";
     const reloadSettings =
       this.state.modal !== null && this.state.view === "settings" && this.state.settings === null;
     this.cancelRead("image");
     this.state.modal = null;
-    this.state.error = "";
+    this.state.bulkRun = null;
+    if (!wasBulkImages) this.state.error = "";
     this.changed();
     if (reloadSettings) void this.navigate("settings");
   }
@@ -270,6 +418,7 @@ export class AppController {
 
   async saveName(): Promise<void> {
     const modal = this.state.modal;
+    const creatingList = modal?.kind === "create-list";
     const list = this.state.active;
     const name = this.state.drafts.name.trim();
     if (
@@ -304,6 +453,13 @@ export class AppController {
       this.state.view = "items";
       await this.acceptList(result);
     });
+    if (
+      creatingList &&
+      this.state.modal === null &&
+      this.state.active &&
+      this.state.view === "items"
+    )
+      void this.refreshBulkSettings();
   }
 
   async confirmDelete(): Promise<void> {

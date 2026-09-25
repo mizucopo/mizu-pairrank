@@ -74,6 +74,7 @@ function backend(first = list(), second = list(2)) {
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
+    autoRegisterImage: vi.fn<AppApi["autoRegisterImage"]>().mockResolvedValue("skipped"),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(first),
     setRemoteImage: vi.fn<AppApi["setRemoteImage"]>().mockResolvedValue(first),
     removeImage: vi.fn<AppApi["removeImage"]>().mockResolvedValue(first),
