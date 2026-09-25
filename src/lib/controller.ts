@@ -150,7 +150,7 @@ export class AppController {
   }
 
   async selectList(id: number): Promise<void> {
-    const wasSettings = this.state.view === "settings";
+    let selected = false;
     this.cancelRead("settings");
     await this.perform(async () => {
       const list = await this.api
@@ -160,8 +160,9 @@ export class AppController {
       this.acceptCommittedList(list);
       this.state.modal = null;
       this.state.view = list.convergence.converged ? "ranking" : "items";
+      selected = true;
     });
-    if (wasSettings && this.state.view === "items") void this.refreshBulkSettings();
+    if (selected && this.state.view === "items") void this.refreshBulkSettings();
   }
 
   async navigate(view: View): Promise<void> {

@@ -934,6 +934,26 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.lists).toHaveLength(2);
   });
 
+  it("loads bulk search eligibility when a sidebar selection enters items from ranking", async () => {
+    const settled = {
+      ...list(),
+      convergence: { ...list().convergence, converged: true },
+    };
+    const api = backend(settled, list(2));
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.view).toBe("ranking");
+
+    await controller.selectList(2);
+    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+  });
+
   it.each(["restart", "settled answer"] as const)(
     "recovers when a successful %s is followed by a sidebar refresh confirming list deletion",
     async (operation) => {

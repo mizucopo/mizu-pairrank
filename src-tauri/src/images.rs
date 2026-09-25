@@ -27,6 +27,7 @@ const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
 const MAX_ACTIVE_SEARCHES: usize = 2;
+const AUTO_IMPORT_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn valid_search_query(query: &str) -> bool {
     !query.is_empty() && query.chars().count() <= 400 && query.split_whitespace().count() <= 50
@@ -63,12 +64,14 @@ pub struct ImageCandidate {
 enum RemoteImportError {
     Candidate(String),
     Storage(String),
+    Deadline,
 }
 
 impl RemoteImportError {
     fn into_message(self) -> String {
         match self {
             Self::Candidate(message) | Self::Storage(message) => message,
+            Self::Deadline => "画像の取得がタイムアウトしました。".to_owned(),
         }
     }
 }
@@ -687,19 +690,43 @@ impl ImageService {
         provider: SearchProvider,
         query: String,
     ) -> Result<Option<ImageAsset>, String> {
+        self.auto_import_until(
+            provider,
+            query,
+            tokio::time::Instant::now() + AUTO_IMPORT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn auto_import_until(
+        &self,
+        provider: SearchProvider,
+        query: String,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<ImageAsset>, String> {
         let query = query.trim();
         if !valid_search_query(query) {
             return Ok(None);
         }
-        let (seeds, _search) = self.search_seeds(provider, query).await?;
+        // Search and candidate downloads share one deadline. Never time out the
+        // blocking decode/save worker: a completed save must return its path for
+        // DB association or cleanup by the caller.
+        let (seeds, _search) =
+            tokio::time::timeout_at(deadline, self.search_seeds(provider, query))
+                .await
+                .map_err(|_| {
+                    "画像検索がタイムアウトしました。時間をおいて再試行してください。".to_owned()
+                })??;
         let mut seen = HashSet::new();
-        let page_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         for seed in seeds {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             let (image_url, source_url) = if let Some(url) = seed.image_url {
                 (url, seed.source_url)
             } else {
                 let page = match tokio::time::timeout_at(
-                    page_deadline,
+                    deadline,
                     self.transport.fetch(&seed.source_url, MAX_PAGE_BYTES),
                 )
                 .await
@@ -722,10 +749,14 @@ impl ImageService {
                 preview_url: String::new(),
                 source_url,
             };
-            match self.import_remote_classified(candidate).await {
+            match self
+                .import_remote_classified(candidate, Some(deadline))
+                .await
+            {
                 Ok(image) => return Ok(Some(image)),
                 Err(RemoteImportError::Candidate(_)) => continue,
                 Err(RemoteImportError::Storage(message)) => return Err(message),
+                Err(RemoteImportError::Deadline) => break,
             }
         }
         Ok(None)
@@ -793,7 +824,7 @@ impl ImageService {
     }
 
     pub async fn import_remote(&self, candidate: ImageCandidate) -> Result<ImageAsset, String> {
-        self.import_remote_classified(candidate)
+        self.import_remote_classified(candidate, None)
             .await
             .map_err(RemoteImportError::into_message)
     }
@@ -801,24 +832,38 @@ impl ImageService {
     async fn import_remote_classified(
         &self,
         candidate: ImageCandidate,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ImageAsset, RemoteImportError> {
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(RemoteImportError::Deadline);
+        }
         validate_public_url(&candidate.id).map_err(RemoteImportError::Candidate)?;
         validate_public_url(&candidate.source_url).map_err(RemoteImportError::Candidate)?;
-        let buffer_permit = self
-            .buffer_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                RemoteImportError::Storage(
-                    "画像処理を続けられません。アプリを再起動してください。".to_owned(),
-                )
-            })?;
-        let resource = self
-            .transport
-            .fetch(&candidate.id, MAX_IMAGE_BYTES)
-            .await
-            .map_err(RemoteImportError::Candidate)?;
+        let acquire = self.buffer_slots.clone().acquire_owned();
+        let buffer_permit = if let Some(at) = deadline {
+            tokio::time::timeout_at(at, acquire)
+                .await
+                .map_err(|_| RemoteImportError::Deadline)?
+        } else {
+            acquire.await
+        }
+        .map_err(|_| {
+            RemoteImportError::Storage(
+                "画像処理を続けられません。アプリを再起動してください。".to_owned(),
+            )
+        })?;
+        let fetch = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES);
+        let resource = if let Some(at) = deadline {
+            tokio::time::timeout_at(at, fetch)
+                .await
+                .map_err(|_| RemoteImportError::Deadline)?
+        } else {
+            fetch.await
+        }
+        .map_err(RemoteImportError::Candidate)?;
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(RemoteImportError::Deadline);
+        }
         let app_data = self.app_data.clone();
         let directory = self.directory.clone();
         let directory_identity = self.directory_identity.clone();
@@ -2572,6 +2617,8 @@ mod tests {
         resources: HashMap<String, Resource>,
         searches: Mutex<Vec<(SearchProvider, String)>>,
         fetches: Mutex<Vec<String>>,
+        fetch_delay: Mutex<Duration>,
+        blocking_fetch_delay: Mutex<Duration>,
     }
 
     impl ImageTransport for MockTransport {
@@ -2591,6 +2638,14 @@ mod tests {
         fn fetch<'a>(&'a self, url: &'a str, limit: usize) -> NetworkFuture<'a, Resource> {
             Box::pin(async move {
                 self.fetches.lock().unwrap().push(url.to_owned());
+                let delay = *self.fetch_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let blocking_delay = *self.blocking_fetch_delay.lock().unwrap();
+                if !blocking_delay.is_zero() {
+                    std::thread::sleep(blocking_delay);
+                }
                 validate_public_url(url)?;
                 match self.resources.get(url) {
                     Some(resource) if resource.bytes.len() <= limit => Ok(resource.clone()),
@@ -2627,6 +2682,8 @@ mod tests {
             resources: resources.into_iter().collect(),
             searches: Mutex::default(),
             fetches: Mutex::default(),
+            fetch_delay: Mutex::default(),
+            blocking_fetch_delay: Mutex::default(),
         });
         let service = ImageService {
             app_data: Arc::new(
@@ -2692,6 +2749,80 @@ mod tests {
             *transport.searches.lock().unwrap(),
             [(SearchProvider::Brave, "sample item".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn auto_import_deadline_stops_slow_ranked_fetches_before_saving() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first","properties":{"url":"https://example.com/first.png"}},
+            {"url":"https://example.com/second","properties":{"url":"https://example.com/second.png"}}
+        ]}"#;
+        let (directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first.png", png(2, 2)),
+                resource("https://example.com/second.png", png(2, 2)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        *transport.fetch_delay.lock().unwrap() = Duration::from_millis(200);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.auto_import_until(
+                SearchProvider::Brave,
+                "item".into(),
+                tokio::time::Instant::now() + Duration::from_millis(30),
+            ),
+        )
+        .await
+        .expect("the item deadline must end the slow fetch")
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            ["https://example.com/first.png"]
+        );
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("png"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn auto_import_does_not_start_save_when_fetch_finishes_after_deadline() {
+        let (directory, service, transport) = service(
+            Ok(br#"{"results":[]}"#.to_vec()),
+            vec![resource("https://example.com/image.png", png(2, 2))],
+        );
+        // An uncooperative fetch can return a complete response after its
+        // deadline without yielding to timeout_at. Check again before saving.
+        *transport.blocking_fetch_delay.lock().unwrap() = Duration::from_millis(50);
+        let candidate = ImageCandidate {
+            id: "https://example.com/image.png".into(),
+            title: "Image".into(),
+            preview_url: String::new(),
+            source_url: "https://example.com/page".into(),
+        };
+        let result = service
+            .import_remote_classified(
+                candidate,
+                Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+            )
+            .await;
+        assert!(matches!(result, Err(RemoteImportError::Deadline)));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("png"))
+        }));
     }
 
     #[tokio::test]
