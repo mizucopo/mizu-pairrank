@@ -1,16 +1,13 @@
-# Triage labels
+# Issue の分類ラベル
 
-The engineering skills use five canonical triage roles. The same strings are
-used as GitHub labels by default.
+スキルが次の分類を指定したら、同じ名前の GitHub ラベルを付けます。
 
-| Canonical role    | GitHub label      | Meaning                                           |
-| ----------------- | ----------------- | ------------------------------------------------- |
-| `needs-triage`    | `needs-triage`    | Maintainer review and classification are required |
-| `needs-info`      | `needs-info`      | More information is required from the reporter    |
-| `ready-for-agent` | `ready-for-agent` | An agent can implement the fully specified issue  |
-| `ready-for-human` | `ready-for-human` | Human judgment or implementation is required      |
-| `wontfix`         | `wontfix`         | The issue will not be actioned                    |
+| ラベル | 意味 |
+| --- | --- |
+| `needs-triage` | 担当者による確認と分類が必要 |
+| `needs-info` | 報告者から追加情報が必要 |
+| `ready-for-agent` | 内容が揃い、エージェントが実装できる |
+| `ready-for-human` | 人の判断または実装が必要 |
+| `wontfix` | 対応しない |
 
-When a skill refers to a canonical triage role, apply the corresponding GitHub
-label from this table. Repositories that use different labels should update the
-mapping while preserving the canonical roles.
+別のラベルを使うリポジトリでは、5つの分類を維持して対応表を変更します。
