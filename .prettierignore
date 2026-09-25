@@ -1,7 +1,6 @@
 .copier-answers.yml
 coverage
 dist
-docs/agents/triage-labels.md
 node_modules
 package.json
 src-tauri/gen

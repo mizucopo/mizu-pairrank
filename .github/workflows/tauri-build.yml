@@ -20,6 +20,7 @@ jobs:
       needs_build: ${{ steps.decision.outputs.needs_build }}
       zip_prefix: ${{ steps.metadata.outputs.zip_prefix }}
       version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
       tag_exists: ${{ steps.release-state.outputs.tag_exists }}
     steps:
       - name: Checkout release commit
@@ -133,6 +134,11 @@ jobs:
           fi
 
           printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            echo 'is_prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'is_prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Prepare release asset names
         id: metadata
@@ -474,18 +480,75 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.preflight.outputs.version }}
           ZIP_PREFIX: ${{ needs.preflight.outputs.zip_prefix }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
         run: |
+          set -euo pipefail
+
           artifact_dir="$RUNNER_TEMP/release-assets"
-          gh release create "$TAG" \
-            "$artifact_dir/$ZIP_PREFIX-windows-x64.zip" \
-            "$artifact_dir/$ZIP_PREFIX-windows-arm64.zip" \
-            "$artifact_dir/$ZIP_PREFIX-macos-arm64.zip" \
-            --verify-tag \
-            --latest=false \
-            --title "Tauri Release $TAG" \
-            --notes "Tauri application ZIPs for Windows x64, Windows ARM64, and macOS ARM64."
+          title="Tauri Release $TAG"
+          notes="Tauri application ZIPs for Windows x64, Windows ARM64, and macOS ARM64."
+          assets=(
+            "$artifact_dir/$ZIP_PREFIX-windows-x64.zip"
+            "$artifact_dir/$ZIP_PREFIX-windows-arm64.zip"
+            "$artifact_dir/$ZIP_PREFIX-macos-arm64.zip"
+          )
+          release_flags=(--latest=false)
+          case "$IS_PRERELEASE" in
+            true) release_flags+=(--prerelease) ;;
+            false) ;;
+            *) echo "::error::Invalid prerelease state."; exit 1 ;;
+          esac
+
+          lookup_release() {
+            gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -c --arg tag "$TAG" \
+                '[.[][] | select(.tag_name == $tag)] | if length == 0 then null elif length == 1 then .[0] else error("Duplicate releases for tag") end'
+          }
+
+          release="$(lookup_release)"
+          if [ "$release" = null ]; then
+            gh release create "$TAG" "${assets[@]}" \
+              --verify-tag \
+              "${release_flags[@]}" \
+              --title "$title" \
+              --notes "$notes"
+          else
+            if ! jq -e \
+              --arg title "$title" \
+              --arg notes "$notes" \
+              --argjson prerelease "$IS_PRERELEASE" \
+              '.draft == true and .name == $title and .body == $notes and .prerelease == $prerelease' \
+              <<< "$release" > /dev/null; then
+              echo "::error::Release $TAG already exists and is not a matching workflow draft."
+              exit 1
+            fi
+
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            release="$(lookup_release)"
+            if [ "$(jq -r '.draft' <<< "$release")" != true ]; then
+              echo "::error::Release $TAG changed while uploading draft assets."
+              exit 1
+            fi
+            for asset in "${assets[@]}"; do
+              if ! jq -e --arg name "${asset##*/}" \
+                'any(.assets[]?; .name == $name and .state == "uploaded" and .size > 0)' \
+                <<< "$release" > /dev/null; then
+                echo "::error::Draft release $TAG is missing a complete asset: ${asset##*/}"
+                exit 1
+              fi
+            done
+
+            release_id="$(jq -r '.id' <<< "$release")"
+            if [ "$(gh api --method PATCH \
+              "/repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false -f make_latest=false --jq '.draft')" != false ]; then
+              echo "::error::Could not publish draft release $TAG."
+              exit 1
+            fi
+          fi
 
       - name: Record latest release
+        if: needs.preflight.outputs.is_prerelease != 'true'
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.version }}
         run: bash .github/scripts/authorize-release-latest.sh record
@@ -493,7 +556,8 @@ jobs:
   promote-latest:
     permissions:
       contents: write
-    needs: publish
+    needs: [preflight, publish]
+    if: needs.preflight.outputs.is_prerelease != 'true'
     concurrency:
       group: release-latest
       cancel-in-progress: false
