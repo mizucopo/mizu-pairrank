@@ -185,6 +185,10 @@ export function mountApp(
       controller.state.searched = false;
       controller.state.error = "";
       render();
+    } else if (target instanceof HTMLSelectElement && target.id === "bulk-provider") {
+      controller.state.bulkProvider =
+        target.value === "brave" || target.value === "ollama" ? target.value : null;
+      render();
     }
   });
   root.addEventListener("submit", (event) => {
@@ -255,6 +259,20 @@ export function mountApp(
       case "image":
         void openModal({ kind: "image", itemId: id }, button);
         break;
+      case "bulk-images":
+        modalOpener = rememberButton(button);
+        restoreModalFocus = false;
+        controller.openBulkImages();
+        break;
+      case "refresh-bulk-settings":
+        void controller.refreshBulkSettings();
+        break;
+      case "start-bulk-images":
+        void controller.runBulkImages();
+        break;
+      case "stop-bulk-images":
+        controller.stopBulkImages();
+        break;
       case "close-modal":
         controller.closeModal();
         break;
@@ -307,8 +325,13 @@ export function mountApp(
 }
 const root = document.querySelector<HTMLElement>("#app");
 if (root) {
-  if (isTauri()) void mountApp(root, api).initialize();
-  else
+  if (isTauri()) {
+    const controller = mountApp(root, api);
+    void controller.initialize().then(() => {
+      if (controller.state.initialized && controller.state.view === "items")
+        void controller.refreshBulkSettings();
+    });
+  } else
     root.innerHTML =
       '<main class="startup"><h1>pairrank</h1><p>デスクトップアプリで起動してください。</p><code>npm run tauri dev</code></main>';
 }

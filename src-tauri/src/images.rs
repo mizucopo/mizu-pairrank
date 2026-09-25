@@ -12,7 +12,7 @@ use image::{ImageDecoder, ImageFormat, ImageReader};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use url::{Host, Url};
 use uuid::Uuid;
@@ -27,6 +27,12 @@ const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
 const MAX_ACTIVE_SEARCHES: usize = 2;
+const AUTO_IMPORT_TIMEOUT: Duration = Duration::from_secs(90);
+const AUTO_DNS_WAIT: Duration = Duration::from_secs(5);
+
+fn valid_search_query(query: &str) -> bool {
+    !query.is_empty() && query.chars().count() <= 400 && query.split_whitespace().count() <= 50
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +62,42 @@ pub struct ImageCandidate {
     pub source_url: String,
 }
 
+enum RemoteImportError {
+    Candidate(String),
+    Storage(String),
+    Capacity(String),
+    Deadline,
+}
+
+impl RemoteImportError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Candidate(message) | Self::Storage(message) | Self::Capacity(message) => message,
+            Self::Deadline => "画像の取得がタイムアウトしました。".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FetchError {
+    Candidate(String),
+    Capacity(String),
+}
+
+impl FetchError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Candidate(message) | Self::Capacity(message) => message,
+        }
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        Self::Candidate(message)
+    }
+}
+
 #[derive(Clone)]
 struct Resource {
     bytes: Vec<u8>,
@@ -63,6 +105,7 @@ struct Resource {
 }
 
 type NetworkFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+type AutoFetchFuture<'a> = Pin<Box<dyn Future<Output = Result<Resource, FetchError>> + Send + 'a>>;
 
 trait ImageTransport: Send + Sync {
     fn search<'a>(
@@ -72,6 +115,14 @@ trait ImageTransport: Send + Sync {
         query: &'a str,
     ) -> NetworkFuture<'a, Vec<u8>>;
     fn fetch<'a>(&'a self, url: &'a str, limit: usize) -> NetworkFuture<'a, Resource>;
+    fn fetch_auto<'a>(
+        &'a self,
+        url: &'a str,
+        limit: usize,
+        _deadline: tokio::time::Instant,
+    ) -> AutoFetchFuture<'a> {
+        Box::pin(async move { self.fetch(url, limit).await.map_err(FetchError::Candidate) })
+    }
 }
 
 struct HttpTransport;
@@ -100,47 +151,70 @@ impl ImageTransport for HttpTransport {
 
     fn fetch<'a>(&'a self, url: &'a str, limit: usize) -> NetworkFuture<'a, Resource> {
         Box::pin(async move {
-            let mut current = validate_public_url(url)?;
-            for redirect_count in 0..=MAX_REDIRECTS {
-                let host = current
-                    .host_str()
-                    .ok_or_else(|| "画像URLにホスト名がありません。".to_owned())?;
-                let port = current.port_or_known_default().unwrap_or(443);
-                let addresses = resolve_public_addresses(&current, port).await?;
-                // Pin the already validated resolution, avoiding a second DNS lookup and
-                // DNS rebinding. Proxies are disabled because they would resolve separately.
-                let client = client_builder()
-                    .resolve_to_addrs(host, &addresses)
-                    .build()
-                    .map_err(|_| "画像接続を準備できませんでした。".to_owned())?;
-                let response = client
-                    .get(current.clone())
-                    .send()
-                    .await
-                    .map_err(|_| "画像または検索元ページを取得できませんでした。".to_owned())?;
-                if response.status().is_redirection() {
-                    if redirect_count == MAX_REDIRECTS {
-                        return Err("画像URLのリダイレクト回数が上限を超えました。".to_owned());
-                    }
-                    let location = response
-                        .headers()
-                        .get(reqwest::header::LOCATION)
-                        .and_then(|value| value.to_str().ok())
-                        .ok_or_else(|| "リダイレクト先のURLを読み取れませんでした。".to_owned())?;
-                    current = redirected_url(&current, location)?;
-                    continue;
-                }
-                if !response.status().is_success() {
-                    return Err("画像または検索元ページのサーバーが取得を拒否しました。".to_owned());
-                }
-                return Ok(Resource {
-                    bytes: read_response(response, limit).await?,
-                    final_url: current.to_string(),
-                });
-            }
-            unreachable!("redirect loop returns after its bounded final iteration")
+            fetch_http(url, limit, None)
+                .await
+                .map_err(FetchError::into_message)
         })
     }
+
+    fn fetch_auto<'a>(
+        &'a self,
+        url: &'a str,
+        limit: usize,
+        deadline: tokio::time::Instant,
+    ) -> AutoFetchFuture<'a> {
+        Box::pin(fetch_http(url, limit, Some(deadline)))
+    }
+}
+
+async fn fetch_http(
+    url: &str,
+    limit: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Resource, FetchError> {
+    let mut current = validate_public_url(url)?;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let host = current
+            .host_str()
+            .ok_or_else(|| "画像URLにホスト名がありません。".to_owned())?;
+        let port = current.port_or_known_default().unwrap_or(443);
+        let addresses = resolve_public_addresses(&current, port, deadline).await?;
+        // Pin the already validated resolution, avoiding a second DNS lookup and
+        // DNS rebinding. Proxies are disabled because they would resolve separately.
+        let client = client_builder()
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| "画像接続を準備できませんでした。".to_owned())?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|_| "画像または検索元ページを取得できませんでした。".to_owned())?;
+        if response.status().is_redirection() {
+            if redirect_count == MAX_REDIRECTS {
+                return Err("画像URLのリダイレクト回数が上限を超えました。"
+                    .to_owned()
+                    .into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "リダイレクト先のURLを読み取れませんでした。".to_owned())?;
+            current = redirected_url(&current, location)?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err("画像または検索元ページのサーバーが取得を拒否しました。"
+                .to_owned()
+                .into());
+        }
+        return Ok(Resource {
+            bytes: read_response(response, limit).await?,
+            final_url: current.to_string(),
+        });
+    }
+    unreachable!("redirect loop returns after its bounded final iteration")
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
@@ -257,11 +331,15 @@ fn private_network_error() -> String {
     "ローカル・プライベートネットワークのURLは取得できません。".to_owned()
 }
 
-async fn resolve_public_addresses(url: &Url, port: u16) -> Result<Vec<SocketAddr>, String> {
+async fn resolve_public_addresses(
+    url: &Url,
+    port: u16,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Vec<SocketAddr>, FetchError> {
     use std::net::ToSocketAddrs;
     static SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(Semaphore::new(SEARCH_PARALLELISM)));
-    resolve_public_addresses_with(url, port, SLOTS.clone(), |host, port| {
+    resolve_public_addresses_with_policy(url, port, SLOTS.clone(), deadline, |host, port| {
         (host.as_str(), port)
             .to_socket_addrs()
             .map(Iterator::collect)
@@ -269,19 +347,43 @@ async fn resolve_public_addresses(url: &Url, port: u16) -> Result<Vec<SocketAddr
     .await
 }
 
+#[cfg(test)]
 async fn resolve_public_addresses_with(
     url: &Url,
     port: u16,
     slots: Arc<Semaphore>,
     lookup: impl FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 ) -> Result<Vec<SocketAddr>, String> {
+    resolve_public_addresses_with_policy(url, port, slots, None, lookup)
+        .await
+        .map_err(FetchError::into_message)
+}
+
+async fn resolve_public_addresses_with_policy(
+    url: &Url,
+    port: u16,
+    slots: Arc<Semaphore>,
+    deadline: Option<tokio::time::Instant>,
+    lookup: impl FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> Result<Vec<SocketAddr>, FetchError> {
     let addresses: Vec<_> = match url.host() {
         Some(Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), port)],
         Some(Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), port)],
         Some(Host::Domain(host)) => {
-            let permit = slots.try_acquire_owned().map_err(|_| {
-                "画像URLの名前解決が実行中です。少し待ってから再試行してください。".to_owned()
-            })?;
+            let busy = || {
+                FetchError::Capacity(
+                    "画像URLの名前解決が実行中です。少し待ってから再試行してください。".to_owned(),
+                )
+            };
+            let permit = if let Some(deadline) = deadline {
+                let wait_until = deadline.min(tokio::time::Instant::now() + AUTO_DNS_WAIT);
+                tokio::time::timeout_at(wait_until, slots.acquire_owned())
+                    .await
+                    .map_err(|_| busy())?
+                    .map_err(|_| busy())?
+            } else {
+                slots.try_acquire_owned().map_err(|_| busy())?
+            };
             let host = host.to_owned();
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -295,10 +397,10 @@ async fn resolve_public_addresses_with(
             .map_err(|_| "画像URLの名前解決に失敗しました。".to_owned())?
             .map_err(|_| "画像URLの名前解決に失敗しました。".to_owned())?
         }
-        None => return Err("画像URLにホスト名がありません。".to_owned()),
+        None => return Err("画像URLにホスト名がありません。".to_owned().into()),
     };
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
-        return Err(private_network_error());
+        return Err(private_network_error().into());
     }
     Ok(addresses)
 }
@@ -652,10 +754,105 @@ impl ImageService {
         query: String,
     ) -> Result<Vec<ImageCandidate>, String> {
         let query = query.trim();
-        if query.is_empty() || query.chars().count() > 400 || query.split_whitespace().count() > 50
-        {
+        if !valid_search_query(query) {
             return Err("検索語は1〜400文字、50語以内で入力してください。".to_owned());
         }
+        let (seeds, _search) = self.search_seeds(provider, query).await?;
+        tokio::time::timeout(Duration::from_secs(90), self.prepare_candidates(seeds))
+            .await
+            .map_err(|_| {
+                "画像候補の取得がタイムアウトしました。検索語を変えて再試行してください。"
+                    .to_owned()
+            })?
+    }
+
+    /// Try original images in provider order without requiring the UI preview to load.
+    pub async fn auto_import(
+        &self,
+        provider: SearchProvider,
+        query: String,
+    ) -> Result<Option<ImageAsset>, String> {
+        self.auto_import_until(
+            provider,
+            query,
+            tokio::time::Instant::now() + AUTO_IMPORT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn auto_import_until(
+        &self,
+        provider: SearchProvider,
+        query: String,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<ImageAsset>, String> {
+        let query = query.trim();
+        if !valid_search_query(query) {
+            return Ok(None);
+        }
+        // Search and candidate downloads share one deadline. Never time out the
+        // blocking decode/save worker: a completed save must return its path for
+        // DB association or cleanup by the caller.
+        let (seeds, _search) =
+            tokio::time::timeout_at(deadline, self.search_seeds(provider, query))
+                .await
+                .map_err(|_| {
+                    "画像検索がタイムアウトしました。時間をおいて再試行してください。".to_owned()
+                })??;
+        let mut seen = HashSet::new();
+        for seed in seeds {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let (image_url, source_url) = if let Some(url) = seed.image_url {
+                (url, seed.source_url)
+            } else {
+                let page = match tokio::time::timeout_at(
+                    deadline,
+                    self.transport
+                        .fetch_auto(&seed.source_url, MAX_PAGE_BYTES, deadline),
+                )
+                .await
+                {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(FetchError::Candidate(_))) => continue,
+                    Ok(Err(FetchError::Capacity(message))) => return Err(message),
+                    Err(_) => break,
+                };
+                let Some(image_url) = representative_image(&page.bytes, &page.final_url) else {
+                    continue;
+                };
+                (image_url, page.final_url)
+            };
+            if !seen.insert(image_url.clone()) {
+                continue;
+            }
+            let candidate = ImageCandidate {
+                id: image_url,
+                title: seed.title,
+                preview_url: String::new(),
+                source_url,
+            };
+            match self
+                .import_remote_classified(candidate, Some(deadline))
+                .await
+            {
+                Ok(image) => return Ok(Some(image)),
+                Err(RemoteImportError::Candidate(_)) => continue,
+                Err(RemoteImportError::Storage(message) | RemoteImportError::Capacity(message)) => {
+                    return Err(message);
+                }
+                Err(RemoteImportError::Deadline) => break,
+            }
+        }
+        Ok(None)
+    }
+
+    async fn search_seeds(
+        &self,
+        provider: SearchProvider,
+        query: &str,
+    ) -> Result<(Vec<CandidateSeed>, OwnedSemaphorePermit), String> {
         // Keep completed previews bounded too: a dismissed invoke still runs natively.
         // Reject excess searches instead of retaining an unbounded queue of commands.
         let search =
@@ -671,12 +868,7 @@ impl ImageService {
             key?.ok_or_else(|| "選択した検索サービスのAPIキーを設定してください。".to_owned())?;
         let payload = self.transport.search(provider, &key, query).await?;
         let seeds = parse_search_response(provider, &payload)?;
-        tokio::time::timeout(Duration::from_secs(90), self.prepare_candidates(seeds))
-            .await
-            .map_err(|_| {
-                "画像候補の取得がタイムアウトしました。検索語を変えて再試行してください。"
-                    .to_owned()
-            })?
+        Ok((seeds, _search))
     }
 
     async fn prepare_candidates(
@@ -718,15 +910,60 @@ impl ImageService {
     }
 
     pub async fn import_remote(&self, candidate: ImageCandidate) -> Result<ImageAsset, String> {
-        validate_public_url(&candidate.id)?;
-        validate_public_url(&candidate.source_url)?;
-        let buffer_permit = self
-            .buffer_slots
-            .clone()
-            .acquire_owned()
+        self.import_remote_classified(candidate, None)
             .await
-            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-        let resource = self.transport.fetch(&candidate.id, MAX_IMAGE_BYTES).await?;
+            .map_err(RemoteImportError::into_message)
+    }
+
+    async fn import_remote_classified(
+        &self,
+        candidate: ImageCandidate,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ImageAsset, RemoteImportError> {
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(RemoteImportError::Deadline);
+        }
+        validate_public_url(&candidate.id).map_err(RemoteImportError::Candidate)?;
+        validate_public_url(&candidate.source_url).map_err(RemoteImportError::Candidate)?;
+        let acquire = self.buffer_slots.clone().acquire_owned();
+        let buffer_permit = if let Some(at) = deadline {
+            tokio::time::timeout_at(at, acquire)
+                .await
+                .map_err(|_| RemoteImportError::Deadline)?
+        } else {
+            acquire.await
+        }
+        .map_err(|_| {
+            RemoteImportError::Storage(
+                "画像処理を続けられません。アプリを再起動してください。".to_owned(),
+            )
+        })?;
+        let resource = if let Some(at) = deadline {
+            tokio::time::timeout_at(
+                at,
+                self.transport
+                    .fetch_auto(&candidate.id, MAX_IMAGE_BYTES, at),
+            )
+            .await
+            .map_err(|_| RemoteImportError::Deadline)?
+        } else {
+            self.transport
+                .fetch(&candidate.id, MAX_IMAGE_BYTES)
+                .await
+                .map_err(FetchError::Candidate)
+        };
+        let resource = match resource {
+            Ok(resource) => resource,
+            Err(FetchError::Candidate(message)) => {
+                return Err(RemoteImportError::Candidate(message));
+            }
+            Err(FetchError::Capacity(message)) => {
+                return Err(RemoteImportError::Capacity(message));
+            }
+        };
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(RemoteImportError::Deadline);
+        }
         let app_data = self.app_data.clone();
         let directory = self.directory.clone();
         let directory_identity = self.directory_identity.clone();
@@ -737,19 +974,26 @@ impl ImageService {
             let _buffer_permit = buffer_permit;
             let _storage_lease = storage_lease;
             let bytes = resource.bytes;
-            let _permit = decode_gate
-                .lock()
-                .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-            verify_app_data(&app_data)?;
-            save_image(
+            let _permit = decode_gate.lock().map_err(|_| {
+                RemoteImportError::Storage(
+                    "画像処理を続けられません。アプリを再起動してください。".to_owned(),
+                )
+            })?;
+            verify_app_data(&app_data).map_err(RemoteImportError::Storage)?;
+            let normalized = normalize_image(&bytes, 1600).map_err(RemoteImportError::Candidate)?;
+            save_normalized_image_with(
                 &directory,
                 &directory_identity,
-                &bytes,
+                normalized,
                 Some(candidate.source_url),
+                |_| {},
             )
+            .map_err(RemoteImportError::Storage)
         })
         .await
-        .map_err(|_| "画像保存処理を完了できませんでした。".to_owned())?
+        .map_err(|_| {
+            RemoteImportError::Storage("画像保存処理を完了できませんでした。".to_owned())
+        })?
     }
 
     /// The path comes only from the native file chooser, not a webview capability.
@@ -1136,9 +1380,25 @@ fn save_image_with(
     expected_identity: &same_file::Handle,
     bytes: &[u8],
     source_url: Option<String>,
-    mut checkpoint: impl FnMut(bool),
+    checkpoint: impl FnMut(bool),
 ) -> Result<ImageAsset, String> {
     let normalized = normalize_image(bytes, 1600)?;
+    save_normalized_image_with(
+        directory,
+        expected_identity,
+        normalized,
+        source_url,
+        checkpoint,
+    )
+}
+
+fn save_normalized_image_with(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+    normalized: Vec<u8>,
+    source_url: Option<String>,
+    mut checkpoint: impl FnMut(bool),
+) -> Result<ImageAsset, String> {
     // All creation, synchronization and rollback stay relative to this open directory.
     let pinned = verified_image_directory(directory, expected_identity)
         .map_err(|_| "画像の保存先が変更されています。アプリを再起動してください。".to_owned())?;
@@ -1271,6 +1531,60 @@ mod tests {
             .unwrap();
             assert_eq!(addresses, vec![public]);
         }
+    }
+
+    #[tokio::test]
+    async fn auto_dns_waits_for_a_busy_slot_and_uses_it_once_released() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.unwrap();
+        let url = Url::parse("https://example.com/image.png").unwrap();
+        let public = SocketAddr::from(([8, 8, 8, 8], 443));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let count = lookups.clone();
+        let lookup = resolve_public_addresses_with_policy(
+            &url,
+            443,
+            slots,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![public])
+            },
+        );
+        tokio::pin!(lookup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut lookup)
+                .await
+                .is_err()
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), lookup)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![public]
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_dns_reports_capacity_when_no_slot_becomes_available() {
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.clone().acquire_owned().await.unwrap();
+        let url = Url::parse("https://example.com/image.png").unwrap();
+        let result = resolve_public_addresses_with_policy(
+            &url,
+            443,
+            slots,
+            Some(tokio::time::Instant::now() + Duration::from_millis(30)),
+            |_, _| panic!("lookup must not start without a DNS slot"),
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::Capacity(_))));
     }
 
     #[cfg(unix)]
@@ -2457,6 +2771,8 @@ mod tests {
         resources: HashMap<String, Resource>,
         searches: Mutex<Vec<(SearchProvider, String)>>,
         fetches: Mutex<Vec<String>>,
+        fetch_delay: Mutex<Duration>,
+        blocking_fetch_delay: Mutex<Duration>,
     }
 
     impl ImageTransport for MockTransport {
@@ -2476,6 +2792,14 @@ mod tests {
         fn fetch<'a>(&'a self, url: &'a str, limit: usize) -> NetworkFuture<'a, Resource> {
             Box::pin(async move {
                 self.fetches.lock().unwrap().push(url.to_owned());
+                let delay = *self.fetch_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let blocking_delay = *self.blocking_fetch_delay.lock().unwrap();
+                if !blocking_delay.is_zero() {
+                    std::thread::sleep(blocking_delay);
+                }
                 validate_public_url(url)?;
                 match self.resources.get(url) {
                     Some(resource) if resource.bytes.len() <= limit => Ok(resource.clone()),
@@ -2512,6 +2836,8 @@ mod tests {
             resources: resources.into_iter().collect(),
             searches: Mutex::default(),
             fetches: Mutex::default(),
+            fetch_delay: Mutex::default(),
+            blocking_fetch_delay: Mutex::default(),
         });
         let service = ImageService {
             app_data: Arc::new(
@@ -2537,6 +2863,265 @@ mod tests {
             local_import_slots: Arc::new(Semaphore::new(1)),
         };
         (directory, service, transport)
+    }
+
+    #[tokio::test]
+    async fn auto_import_uses_search_order_and_falls_back_after_full_image_failure() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first","properties":{"url":"https://example.com/first.png"}},
+            {"url":"https://example.com/second","properties":{"url":"https://example.com/second.png"}}
+        ]}"#;
+        let (directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first.png", b"invalid image".to_vec()),
+                resource("https://example.com/second.png", png(4, 3)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        let image = service
+            .auto_import(SearchProvider::Brave, "sample item".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.source_url.as_deref(),
+            Some("https://example.com/second")
+        );
+        assert!(directory.path().join(&image.path).is_file());
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            [
+                "https://example.com/first.png",
+                "https://example.com/second.png"
+            ]
+        );
+        assert_eq!(
+            *transport.searches.lock().unwrap(),
+            [(SearchProvider::Brave, "sample item".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_import_deadline_stops_slow_ranked_fetches_before_saving() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first","properties":{"url":"https://example.com/first.png"}},
+            {"url":"https://example.com/second","properties":{"url":"https://example.com/second.png"}}
+        ]}"#;
+        let (directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first.png", png(2, 2)),
+                resource("https://example.com/second.png", png(2, 2)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        *transport.fetch_delay.lock().unwrap() = Duration::from_millis(200);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.auto_import_until(
+                SearchProvider::Brave,
+                "item".into(),
+                tokio::time::Instant::now() + Duration::from_millis(30),
+            ),
+        )
+        .await
+        .expect("the item deadline must end the slow fetch")
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            ["https://example.com/first.png"]
+        );
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("png"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn auto_import_does_not_start_save_when_fetch_finishes_after_deadline() {
+        let (directory, service, transport) = service(
+            Ok(br#"{"results":[]}"#.to_vec()),
+            vec![resource("https://example.com/image.png", png(2, 2))],
+        );
+        // An uncooperative fetch can return a complete response after its
+        // deadline without yielding to timeout_at. Check again before saving.
+        *transport.blocking_fetch_delay.lock().unwrap() = Duration::from_millis(50);
+        let candidate = ImageCandidate {
+            id: "https://example.com/image.png".into(),
+            title: "Image".into(),
+            preview_url: String::new(),
+            source_url: "https://example.com/page".into(),
+        };
+        let result = service
+            .import_remote_classified(
+                candidate,
+                Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+            )
+            .await;
+        assert!(matches!(result, Err(RemoteImportError::Deadline)));
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == std::ffi::OsStr::new("png"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn auto_search_returns_no_candidates_for_invalid_name_and_propagates_search_failure() {
+        let (_directory, service, transport) = service(Err("quota reached".into()), vec![]);
+        assert!(
+            service
+                .auto_import(SearchProvider::Brave, " ".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(transport.searches.lock().unwrap().is_empty());
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        assert_eq!(
+            service
+                .auto_import(SearchProvider::Brave, "valid".into())
+                .await
+                .unwrap_err(),
+            "quota reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_ollama_skips_pages_without_an_image() {
+        let response = br#"{"results":[
+            {"url":"https://example.com/first"},
+            {"url":"https://example.com/second"}
+        ]}"#;
+        let (_directory, service, transport) = service(
+            Ok(response.to_vec()),
+            vec![
+                resource("https://example.com/first", b"<html></html>".to_vec()),
+                resource(
+                    "https://example.com/second",
+                    br#"<meta property="og:image" content="/image.png">"#.to_vec(),
+                ),
+                resource("https://example.com/image.png", png(3, 3)),
+            ],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Ollama, "test-key")
+            .unwrap();
+        let image = service
+            .auto_import(SearchProvider::Ollama, "item".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.source_url.as_deref(),
+            Some("https://example.com/second")
+        );
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            [
+                "https://example.com/first",
+                "https://example.com/second",
+                "https://example.com/image.png"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_import_stops_on_persistent_image_processing_failure() {
+        let (_directory, service, _) = service(
+            Ok(br#"{"results":[{"url":"https://example.com/page","properties":{"url":"https://example.com/image.png"}}]}"#.to_vec()),
+            vec![resource("https://example.com/image.png", png(2, 2))],
+        );
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        let gate = service.decode_gate.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = gate.lock().unwrap();
+                panic!("poison image processing lock");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            service
+                .auto_import(SearchProvider::Brave, "image".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_import_stops_instead_of_skipping_candidates_on_dns_capacity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BusyTransport(Arc<AtomicUsize>);
+        impl ImageTransport for BusyTransport {
+            fn search<'a>(
+                &'a self,
+                _: SearchProvider,
+                _: &'a str,
+                _: &'a str,
+            ) -> NetworkFuture<'a, Vec<u8>> {
+                Box::pin(async {
+                    Ok(br#"{"results":[
+                        {"url":"https://example.com/one","properties":{"url":"https://example.com/one.png"}},
+                        {"url":"https://example.com/two","properties":{"url":"https://example.com/two.png"}}
+                    ]}"#.to_vec())
+                })
+            }
+
+            fn fetch<'a>(&'a self, _: &'a str, _: usize) -> NetworkFuture<'a, Resource> {
+                Box::pin(async { panic!("auto import must use capacity-aware fetch") })
+            }
+
+            fn fetch_auto<'a>(
+                &'a self,
+                _: &'a str,
+                _: usize,
+                _: tokio::time::Instant,
+            ) -> AutoFetchFuture<'a> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(FetchError::Capacity(
+                        "画像URLの名前解決が実行中です。".into(),
+                    ))
+                })
+            }
+        }
+
+        let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        service.transport = Arc::new(BusyTransport(fetches.clone()));
+        service
+            .credentials
+            .set(SearchProvider::Brave, "test-key")
+            .unwrap();
+        let error = service
+            .auto_import(SearchProvider::Brave, "item".into())
+            .await
+            .unwrap_err();
+        assert!(error.contains("名前解決が実行中"));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

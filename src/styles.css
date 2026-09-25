@@ -372,6 +372,17 @@ small,
   padding: 0;
   list-style: none;
 }
+.item-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.bulk-progress {
+  margin: 18px 0;
+}
+.bulk-progress progress {
+  width: 100%;
+}
 .item-row,
 .rank-row {
   display: flex;

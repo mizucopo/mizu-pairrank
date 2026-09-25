@@ -262,6 +262,65 @@ impl Database {
         })
     }
 
+    pub fn unregistered_item_name(
+        &self,
+        list_id: i64,
+        item_id: i64,
+    ) -> Result<Option<String>, String> {
+        let transaction = self.read_transaction()?;
+        ensure_supported_model(&transaction, list_id)?;
+        transaction
+            .query_row(
+                "SELECT name FROM items WHERE id = ?1 AND list_id = ?2 AND deleted = 0 AND image_path IS NULL",
+                params![item_id, list_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn set_image_if_missing(
+        &mut self,
+        list_id: i64,
+        item_id: i64,
+        expected_name: String,
+        image: ImageAsset,
+    ) -> Result<ImageChange<bool>, String> {
+        let transaction = self.write_transaction()?;
+        ensure_supported_model(&transaction, list_id)?;
+        let changed = transaction
+            .execute(
+                "UPDATE items SET image_path = ?1, image_source_url = ?2
+                 WHERE id = ?3 AND list_id = ?4 AND deleted = 0
+                   AND image_path IS NULL AND name = ?5",
+                params![
+                    image.path,
+                    image.source_url,
+                    item_id,
+                    list_id,
+                    expected_name,
+                ],
+            )
+            .map_err(db_error)?;
+        if changed == 1 {
+            transaction
+                .execute(
+                    "UPDATE lists SET revision = revision + 1 WHERE id = ?1",
+                    [list_id],
+                )
+                .map_err(db_error)?;
+            transaction.commit().map_err(db_error)?;
+        }
+        Ok(ImageChange {
+            value: changed == 1,
+            cleanup_paths: if changed == 1 {
+                Vec::new()
+            } else {
+                vec![image.path]
+            },
+        })
+    }
+
     pub fn image_paths(&self) -> Result<HashSet<String>, String> {
         let transaction = self.read_transaction()?;
         transaction
@@ -2297,5 +2356,74 @@ mod tests {
         let next = reader.list_summaries().unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].id, first.id);
+    }
+
+    #[test]
+    fn conditional_image_registration_preserves_concurrent_changes_without_revision_bumps() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let list = database.create_list("Images".into()).unwrap();
+        let list = database
+            .add_items(list.id, vec!["One".into(), "Two".into(), "Three".into()])
+            .unwrap();
+        let [first, second, third] = [list.items[0].id, list.items[1].id, list.items[2].id];
+        assert_eq!(
+            database.unregistered_item_name(list.id, first).unwrap(),
+            Some("One".into())
+        );
+        let manual = ImageAsset {
+            path: "manual.png".into(),
+            source_url: None,
+        };
+        let state = database
+            .set_image(list.id, first, Some(manual.clone()))
+            .unwrap()
+            .value;
+        assert_eq!(
+            database.unregistered_item_name(list.id, first).unwrap(),
+            None
+        );
+        let attempted = ImageAsset {
+            path: "auto.png".into(),
+            source_url: Some("https://example.com/auto".into()),
+        };
+        let change = database
+            .set_image_if_missing(list.id, first, "One".into(), attempted.clone())
+            .unwrap();
+        assert!(!change.value);
+        assert_eq!(change.cleanup_paths, ["auto.png"]);
+        assert_eq!(database.get_list(list.id).unwrap().revision, state.revision);
+        assert_eq!(
+            database.get_list(list.id).unwrap().items[0]
+                .image
+                .as_ref()
+                .unwrap()
+                .path,
+            manual.path
+        );
+
+        let state = database
+            .rename_item(list.id, second, "Renamed".into())
+            .unwrap();
+        let change = database
+            .set_image_if_missing(list.id, second, "Two".into(), attempted.clone())
+            .unwrap();
+        assert!(!change.value);
+        assert_eq!(database.get_list(list.id).unwrap().revision, state.revision);
+        let change = database
+            .set_image_if_missing(list.id, second, "Renamed".into(), attempted.clone())
+            .unwrap();
+        assert!(change.value);
+        assert!(change.cleanup_paths.is_empty());
+        assert_eq!(
+            database.get_list(list.id).unwrap().revision,
+            state.revision + 1
+        );
+
+        let state = database.delete_item(list.id, third).unwrap().value;
+        let change = database
+            .set_image_if_missing(list.id, third, "Three".into(), attempted)
+            .unwrap();
+        assert!(!change.value);
+        assert_eq!(database.get_list(list.id).unwrap().revision, state.revision);
     }
 }
