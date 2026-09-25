@@ -954,6 +954,29 @@ describe("comparison state and persistence boundaries", () => {
     await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
   });
 
+  it("loads bulk search eligibility when renaming a converged list enters items", async () => {
+    const settled = {
+      ...list(),
+      convergence: { ...list().convergence, converged: true },
+    };
+    const api = backend(settled);
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    api.renameList.mockResolvedValue({ ...settled, name: "改名後" });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.view).toBe("ranking");
+
+    await controller.openModal({ kind: "rename-list" });
+    controller.state.drafts.name = "改名後";
+    await controller.saveName();
+    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+  });
+
   it.each(["restart", "settled answer"] as const)(
     "recovers when a successful %s is followed by a sidebar refresh confirming list deletion",
     async (operation) => {

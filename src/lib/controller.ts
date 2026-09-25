@@ -419,7 +419,6 @@ export class AppController {
 
   async saveName(): Promise<void> {
     const modal = this.state.modal;
-    const creatingList = modal?.kind === "create-list";
     const list = this.state.active;
     const name = this.state.drafts.name.trim();
     if (
@@ -454,12 +453,7 @@ export class AppController {
       this.state.view = "items";
       await this.acceptList(result);
     });
-    if (
-      creatingList &&
-      this.state.modal === null &&
-      this.state.active &&
-      this.state.view === "items"
-    )
+    if (this.state.modal === null && this.state.active && this.state.view === "items")
       void this.refreshBulkSettings();
   }
 
