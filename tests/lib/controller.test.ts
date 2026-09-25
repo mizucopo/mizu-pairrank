@@ -977,6 +977,78 @@ describe("comparison state and persistence boundaries", () => {
     await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
   });
 
+  it("loads bulk search eligibility when deleting a converged list enters items", async () => {
+    const settled = {
+      ...list(),
+      convergence: { ...list().convergence, converged: true },
+    };
+    const remaining = list(2);
+    const api = backend(settled, remaining);
+    api.listSummaries.mockResolvedValueOnce([summary(settled), summary(remaining)]);
+    api.listSummaries.mockResolvedValue([summary(remaining)]);
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.view).toBe("ranking");
+
+    await controller.openModal({ kind: "delete-list" });
+    await controller.confirmDelete();
+    expect(controller.state.active).toEqual(remaining);
+    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+  });
+
+  it("loads bulk search eligibility when comparison returns to items", async () => {
+    const settled = {
+      ...list(),
+      convergence: { ...list().convergence, converged: true },
+    };
+    const api = backend(settled);
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.view).toBe("ranking");
+
+    api.resumeList.mockResolvedValue({ ...settled, items: settled.items.slice(0, 1) });
+    api.nextPair.mockResolvedValue(null);
+    await controller.startComparison();
+    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+  });
+
+  it("loads bulk search eligibility when a deleted ranking list is replaced", async () => {
+    const settled = {
+      ...list(),
+      convergence: { ...list().convergence, converged: true },
+    };
+    const remaining = list(2);
+    const api = backend(settled, remaining);
+    api.listSummaries.mockResolvedValueOnce([summary(settled), summary(remaining)]);
+    api.listSummaries.mockResolvedValue([summary(remaining)]);
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.view).toBe("ranking");
+
+    api.resumeList.mockRejectedValueOnce("リストが見つかりません。");
+    await controller.startComparison();
+    expect(controller.state.active).toEqual(remaining);
+    expect(controller.state.view).toBe("items");
+    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+  });
+
   it.each(["restart", "settled answer"] as const)(
     "recovers when a successful %s is followed by a sidebar refresh confirming list deletion",
     async (operation) => {

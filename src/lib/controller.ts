@@ -481,6 +481,8 @@ export class AppController {
       }
       this.state.view = "items";
     });
+    if (this.state.modal === null && this.state.active && this.state.view === "items")
+      void this.refreshBulkSettings();
   }
 
   async addItems(): Promise<void> {
@@ -524,6 +526,8 @@ export class AppController {
       }
       throw new Error(comparisonRetryMessage);
     });
+    if (this.state.active && this.state.view === "items" && !this.state.bulkSettingsLoading)
+      void this.refreshBulkSettings();
   }
 
   private async handleListError(listId: number, error: unknown): Promise<never> {
@@ -543,6 +547,7 @@ export class AppController {
       this.state.view = "items";
       this.state.active = await this.loadFirstAvailableList();
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
+      if (this.state.active && this.state.view === "items") void this.refreshBulkSettings();
     }
     throw error;
   }
