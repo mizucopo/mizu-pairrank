@@ -174,6 +174,10 @@ export function mountApp(
   root.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+    if (target instanceof HTMLInputElement && target.hasAttribute("data-tag-draft")) {
+      controller.state.tagDraft = target.value;
+      return;
+    }
     const field = target.dataset.draft;
     if (draftField(field)) controller.state.drafts[field] = target.value;
   });
@@ -189,6 +193,10 @@ export function mountApp(
       controller.state.bulkProvider =
         target.value === "brave" || target.value === "ollama" ? target.value : null;
       render();
+    } else if (target instanceof HTMLSelectElement && target.id === "ranking-tag") {
+      controller.selectTag(target.value === "" ? null : Number(target.value));
+    } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
+      void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     }
   });
   root.addEventListener("submit", (event) => {
@@ -207,6 +215,9 @@ export function mountApp(
         break;
       case "save-name":
         void controller.saveName();
+        break;
+      case "save-tag":
+        void controller.saveTag();
         break;
       case "search-images":
         void controller.searchImages();
@@ -258,6 +269,27 @@ export function mountApp(
         break;
       case "image":
         void openModal({ kind: "image", itemId: id }, button);
+        break;
+      case "tags":
+        void openModal({ kind: "tags", itemId: id }, button);
+        break;
+      case "manage-tags":
+        void openModal({ kind: "tags" }, button);
+        break;
+      case "edit-tag":
+        controller.editTag(id);
+        break;
+      case "cancel-tag-edit":
+        controller.editTag(null);
+        break;
+      case "delete-tag":
+        controller.deleteTagPrompt(id);
+        break;
+      case "cancel-tag-delete":
+        controller.deleteTagPrompt(null);
+        break;
+      case "confirm-tag-delete":
+        void controller.confirmTagDelete();
         break;
       case "bulk-images":
         modalOpener = rememberButton(button);

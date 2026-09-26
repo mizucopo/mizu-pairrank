@@ -74,10 +74,17 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
           .sort((a, b) => a.id - b.id)
           .map(
             (item) =>
-              `<article class="item-row">${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較 ${item.comparisonCount === 0 ? '· <span class="new-badge">未評価</span>' : ""}</small></div><div class="item-actions"><button class="secondary small" data-action="image" data-id="${item.id}"${disabled(s)}>画像</button><button class="text-button small" data-action="rename-item" data-id="${item.id}"${disabled(s)}>名前</button><button class="text-button small danger-text" data-action="delete-item" data-id="${item.id}"${disabled(s)}>削除</button></div></article>`,
+              `<article class="item-row">${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較 ${item.comparisonCount === 0 ? '· <span class="new-badge">未評価</span>' : ""}</small>${
+                item.tagIds.length
+                  ? `<div class="tag-chips">${list.tags
+                      .filter((tag) => item.tagIds.includes(tag.id))
+                      .map((tag) => `<span class="tag-chip">${e(tag.name)}</span>`)
+                      .join("")}</div>`
+                  : ""
+              }</div><div class="item-actions"><button class="secondary small" data-action="image" data-id="${item.id}"${disabled(s)}>画像</button><button class="text-button small" data-action="tags" data-id="${item.id}" aria-label="${e(item.name)} のタグ"${disabled(s)}>タグ</button><button class="text-button small" data-action="rename-item" data-id="${item.id}"${disabled(s)}>名前</button><button class="text-button small danger-text" data-action="delete-item" data-id="${item.id}"${disabled(s)}>削除</button></div></article>`,
           )
           .join("")}</div>`
-  }</section>`;
+  }</section><section class="tag-management"><div class="section-heading"><div><h2>タグ管理 <span class="count">${list.tags.length}</span></h2><p class="muted">タグはこのリストの項目に付けられます。項目には複数のタグを付けられます。</p></div><button class="secondary" data-action="manage-tags"${disabled(s)}>タグを管理</button></div>${list.tags.length ? `<div class="tag-summary">${list.tags.map((tag) => `<span class="tag-chip">${e(tag.name)} <small>${list.items.filter((item) => item.tagIds.includes(tag.id)).length} 件</small></span>`).join("")}</div>` : '<p class="muted">タグはまだありません。</p>'}</section>`;
 }
 function comparisonView(s: AppState, assetUrl: (path: string) => string): string {
   const pair = s.pair;
@@ -100,7 +107,11 @@ function comparisonView(s: AppState, assetUrl: (path: string) => string): string
 function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
-  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div>${list.items.length ? `<ol class="ranking-list">${list.items.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}</section>${progress(s)}`;
+  const visible =
+    s.selectedTagId === null
+      ? list.items
+      : list.items.filter((item) => item.tagIds.includes(s.selectedTagId!));
+  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div><div class="ranking-filter"><label for="ranking-tag">表示するタグ</label><select id="ranking-tag" data-focus="ranking-tag"${disabled(s)}><option value=""${s.selectedTagId === null ? " selected" : ""}>すべて</option>${list.tags.map((tag) => `<option value="${tag.id}"${s.selectedTagId === tag.id ? " selected" : ""}>${e(tag.name)}</option>`).join("")}</select></div>${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagId !== null ? '<div class="empty compact"><p>このタグが付いた項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
   return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header><section class="settings-grid">${(
@@ -153,6 +164,28 @@ function modalView(s: AppState): string {
       ? `<div class="bulk-progress" role="status"><p>${run.done} / ${run.total} 件を処理 · 登録 ${run.registered} 件 · 見送り ${run.skipped} 件</p><progress max="${run.total}" value="${run.done}" aria-label="画像登録の進捗"></progress>${run.running ? `<p class="muted">${run.stopping ? "現在の項目が終わり次第停止します…" : "画像を検索して登録しています…"}</p>` : `<p>${run.stopped ? "停止しました。" : s.error ? "途中で停止しました。" : "一括処理が完了しました。"}</p>`}</div>`
       : "";
     body = `<p>開いているリストの画像未登録 ${run?.total ?? missing} 件を処理します。各サービスの料金・利用制限が適用されます。</p>${run ? "" : providerChoice}${summary}<div class="form-actions">${run?.running ? `<button type="button" class="secondary" data-action="stop-bulk-images"${run.stopping ? " disabled" : ""}>${run.stopping ? "停止待ち" : "停止"}</button>` : run ? '<button type="button" class="secondary" data-action="close-modal">閉じる</button>' : `<button type="button" data-action="start-bulk-images"${s.bulkProvider ? "" : " disabled"}>一括登録を開始</button><button type="button" class="secondary" data-action="close-modal">キャンセル</button>`}</div>`;
+  } else if (modal.kind === "tags") {
+    title = modal.itemId === undefined ? "タグを管理" : `${item?.name ?? "項目"} のタグ`;
+    const tags = s.active?.tags ?? [];
+    body = `${modal.itemId === undefined ? '<p class="muted">このリストのタグを作成・変更・削除できます。</p>' : '<p class="muted">チェックを変えると、この項目のタグが保存されます。</p>'}<div class="tag-editor-list">${
+      tags.length
+        ? tags
+            .map((tag) => {
+              const count =
+                s.active?.items.filter((entry) => entry.tagIds.includes(tag.id)).length ?? 0;
+              const assignment =
+                modal.itemId === undefined
+                  ? ""
+                  : `<label class="tag-assignment"><input type="checkbox" data-tag-id="${tag.id}" data-focus="tag-${tag.id}"${item?.tagIds.includes(tag.id) ? " checked" : ""}${disabled(s)} /><span class="sr-only">${e(item?.name ?? "")} に ${e(tag.name)} を付ける</span></label>`;
+              const actions =
+                s.tagDeletingId === tag.id
+                  ? `<div class="tag-delete-confirm"><span>「${e(tag.name)}」を削除しますか？項目からも外れます。</span><button type="button" class="danger small" data-action="confirm-tag-delete"${disabled(s)}>削除する</button><button type="button" class="secondary small" data-action="cancel-tag-delete"${disabled(s)}>キャンセル</button></div>`
+                  : `<button type="button" class="text-button small" data-action="edit-tag" data-id="${tag.id}"${disabled(s)}>名前</button><button type="button" class="text-button small danger-text" data-action="delete-tag" data-id="${tag.id}"${disabled(s)}>削除</button>`;
+              return `<div class="tag-editor-row">${assignment}<span class="tag-editor-name">${e(tag.name)} <small>${count} 件</small></span><div class="tag-editor-actions">${actions}</div></div>`;
+            })
+            .join("")
+        : '<p class="muted">タグはまだありません。</p>'
+    }</div><form data-form="save-tag" class="tag-form"><label for="tag-name">${s.tagEditingId === null ? "新しいタグ名" : "タグ名を変更"}</label><input id="tag-name" data-tag-draft data-focus="tag-draft" value="${e(s.tagDraft)}" required${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>${s.tagEditingId === null ? "タグを追加" : "変更を保存"}</button>${s.tagEditingId !== null ? `<button type="button" class="secondary" data-action="cancel-tag-edit"${disabled(s)}>キャンセル</button>` : ""}</div></form>${modal.itemId === undefined ? "" : '<p class="muted small">ここで作成したタグは、この項目にも付きます。</p>'}`;
   } else if (modal.kind === "image") {
     title = `${item?.name ?? "項目"} の画像`;
     const configured =
@@ -171,7 +204,7 @@ function modalView(s: AppState): string {
     title = modal.kind === "create-list" ? "新しいリスト" : "名前を変更";
     body = `<form data-form="save-name"><label for="name-input">${modal.kind === "rename-item" ? "項目名" : "リスト名"}</label><input id="name-input" data-draft="name" data-focus="name" value="${e(s.drafts.name)}" placeholder="例：好きなゲーム" required autofocus${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>${modal.kind === "create-list" ? "作成" : "保存"}</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div></form>`;
   }
-  return `<dialog id="app-dialog" class="${modal.kind === "image" ? "wide" : ""}" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title">${e(title)}</h2><button class="close-button" data-action="close-modal" aria-label="閉じる"${s.readPending === "image" ? "" : disabled(s)}>×</button></div>${s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${body}</dialog>`;
+  return `<dialog id="app-dialog" class="${modal.kind === "image" || modal.kind === "tags" ? "wide" : ""}" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title">${e(title)}</h2><button class="close-button" data-action="close-modal" aria-label="閉じる"${s.readPending === "image" ? "" : disabled(s)}>×</button></div>${s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${body}</dialog>`;
 }
 export function renderApp(s: AppState, assetUrl: (path: string) => string): string {
   if (s.fatal)

@@ -17,6 +17,7 @@ export type Modal =
   | { kind: "delete-list" }
   | { kind: "rename-item"; itemId: number }
   | { kind: "delete-item"; itemId: number }
+  | { kind: "tags"; itemId?: number }
   | { kind: "image"; itemId: number }
   | { kind: "bulk-image" }
   | null;
@@ -34,12 +35,16 @@ export type AppState = {
   active: ListState | null;
   pair: PairProposal | null;
   view: View;
+  selectedTagId: number | null;
   busy: boolean;
   initialized: boolean;
   fatal: boolean;
   error: string;
   notice: string;
   modal: Modal;
+  tagDraft: string;
+  tagEditingId: number | null;
+  tagDeletingId: number | null;
   settings: SearchSettings | null;
   bulkSettings: SearchSettings | null;
   bulkSettingsLoading: boolean;
@@ -72,12 +77,16 @@ export class AppController {
     active: null,
     pair: null,
     view: "items",
+    selectedTagId: null,
     busy: false,
     initialized: false,
     fatal: false,
     error: "",
     notice: "",
     modal: null,
+    tagDraft: "",
+    tagEditingId: null,
+    tagDeletingId: null,
     settings: null,
     bulkSettings: null,
     bulkSettingsLoading: false,
@@ -129,6 +138,7 @@ export class AppController {
   }
 
   private async loadFirstAvailableList(): Promise<ListState | null> {
+    this.state.selectedTagId = null;
     this.state.lists = await this.api.listSummaries();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const first = this.state.lists[0];
@@ -163,6 +173,12 @@ export class AppController {
       selected = true;
     });
     if (selected && this.state.view === "items") void this.refreshBulkSettings();
+  }
+
+  selectTag(tagId: number | null): void {
+    if (tagId !== null && !this.state.active?.tags.some((tag) => tag.id === tagId)) return;
+    this.state.selectedTagId = tagId;
+    this.changed();
   }
 
   async navigate(view: View): Promise<void> {
@@ -359,6 +375,9 @@ export class AppController {
     if (this.state.busy) return;
     this.state.modal = modal;
     this.state.error = "";
+    this.state.tagDraft = "";
+    this.state.tagEditingId = null;
+    this.state.tagDeletingId = null;
     const item =
       "itemId" in modal
         ? this.state.active?.items.find((entry) => entry.id === modal.itemId)
@@ -387,9 +406,101 @@ export class AppController {
 
   private acceptCommittedList(list: ListState): void {
     // Keep committed state usable even if a later sidebar refresh fails.
+    if (
+      this.state.active?.id !== list.id ||
+      (this.state.selectedTagId !== null &&
+        !list.tags.some((tag) => tag.id === this.state.selectedTagId))
+    )
+      this.state.selectedTagId = null;
     this.state.active = list;
     this.state.pair = null;
     this.updateListSummary(list);
+  }
+
+  editTag(tagId: number | null): void {
+    if (this.state.modal?.kind !== "tags" || this.state.busy) return;
+    const tag = this.state.active?.tags.find((entry) => entry.id === tagId);
+    this.state.tagEditingId = tag?.id ?? null;
+    this.state.tagDeletingId = null;
+    this.state.tagDraft = tag?.name ?? "";
+    this.state.error = "";
+    this.changed();
+  }
+
+  deleteTagPrompt(tagId: number | null): void {
+    if (this.state.modal?.kind !== "tags" || this.state.busy) return;
+    this.state.tagDeletingId = this.state.active?.tags.some((tag) => tag.id === tagId)
+      ? tagId
+      : null;
+    this.state.tagEditingId = null;
+    this.state.error = "";
+    this.changed();
+  }
+
+  async saveTag(): Promise<void> {
+    const list = this.state.active;
+    const modal = this.state.modal;
+    if (!list || modal?.kind !== "tags") return;
+    const name = this.state.tagDraft.trim();
+    const editingId = this.state.tagEditingId;
+    if (editingId !== null && name === list.tags.find((tag) => tag.id === editingId)?.name) {
+      this.editTag(null);
+      return;
+    }
+    await this.perform(async () => {
+      if (!name) throw new Error("タグ名を入力してください。");
+      const result =
+        editingId === null
+          ? await this.api
+              .createTag(list.id, name, modal.itemId)
+              .catch((error: unknown) =>
+                modal.itemId === undefined
+                  ? this.handleListError(list.id, error)
+                  : this.handleItemError(list.id, modal.itemId, error),
+              )
+          : await this.api
+              .renameTag(list.id, editingId, name)
+              .catch((error: unknown) => this.handleListError(list.id, error));
+      this.acceptCommittedList(result);
+      this.state.tagDraft = "";
+      this.state.tagEditingId = null;
+    });
+  }
+
+  async confirmTagDelete(): Promise<void> {
+    const list = this.state.active;
+    const tagId = this.state.tagDeletingId;
+    if (!list || this.state.modal?.kind !== "tags" || tagId === null) return;
+    await this.perform(async () => {
+      const result = await this.api
+        .deleteTag(list.id, tagId)
+        .catch((error: unknown) => this.handleListError(list.id, error));
+      this.acceptCommittedList(result);
+      this.state.tagDeletingId = null;
+    });
+  }
+
+  async toggleItemTag(tagId: number, checked: boolean): Promise<void> {
+    const list = this.state.active;
+    const modal = this.state.modal;
+    if (
+      !list ||
+      modal?.kind !== "tags" ||
+      modal.itemId === undefined ||
+      !list.tags.some((tag) => tag.id === tagId)
+    )
+      return;
+    const item = list.items.find((entry) => entry.id === modal.itemId);
+    if (!item) return;
+    const tagIds = checked
+      ? [...new Set([...item.tagIds, tagId])]
+      : item.tagIds.filter((id) => id !== tagId);
+    await this.perform(async () => {
+      const result = await this.api
+        .setItemTags(list.id, item.id, tagIds)
+        .catch((error: unknown) => this.handleItemError(list.id, item.id, error));
+      this.acceptCommittedList(result);
+    });
   }
 
   private updateListSummary(list: ListState): void {

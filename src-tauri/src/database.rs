@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::models::{ImageAsset, Item, ListState, ListSummary};
+use crate::models::{ImageAsset, Item, ListState, ListSummary, Tag};
 use crate::rating::{
     MODEL_PARAMETERS_JSON, MODEL_VERSION, Preference, Rating, convergence, ranking_ids, update_pair,
 };
@@ -17,10 +17,16 @@ struct Migration {
 }
 
 // Released migrations are immutable. Append a new consecutive version for every schema change.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/002_tags.sql"),
+    },
+];
 
 #[derive(Debug)]
 pub struct ImageChange<T> {
@@ -182,6 +188,91 @@ impl Database {
         read_list(&transaction, id)
     }
 
+    pub fn create_tag(
+        &mut self,
+        list_id: i64,
+        name: String,
+        item_id: Option<i64>,
+    ) -> Result<ListState, String> {
+        let name = validated_name(name)?;
+        self.mutate_list(list_id, |transaction| {
+            if let Some(item_id) = item_id {
+                ensure_active_item(transaction, list_id, item_id)?;
+            }
+            ensure_available_tag_name(transaction, list_id, None, &name)?;
+            transaction
+                .execute(
+                    "INSERT INTO tags (list_id, name) VALUES (?1, ?2)",
+                    params![list_id, name],
+                )
+                .map_err(db_error)?;
+            if let Some(item_id) = item_id {
+                transaction
+                    .execute(
+                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)",
+                        params![list_id, item_id, transaction.last_insert_rowid()],
+                    )
+                    .map_err(db_error)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn rename_tag(
+        &mut self,
+        list_id: i64,
+        tag_id: i64,
+        name: String,
+    ) -> Result<ListState, String> {
+        let name = validated_name(name)?;
+        self.mutate_list(list_id, |transaction| {
+            ensure_available_tag_name(transaction, list_id, Some(tag_id), &name)?;
+            require_tag_change(transaction.execute(
+                "UPDATE tags SET name = ?1 WHERE id = ?2 AND list_id = ?3",
+                params![name, tag_id, list_id],
+            ))
+        })
+    }
+
+    pub fn delete_tag(&mut self, list_id: i64, tag_id: i64) -> Result<ListState, String> {
+        self.mutate_list(list_id, |transaction| {
+            require_tag_change(transaction.execute(
+                "DELETE FROM tags WHERE id = ?1 AND list_id = ?2",
+                params![tag_id, list_id],
+            ))
+        })
+    }
+
+    pub fn set_item_tags(
+        &mut self,
+        list_id: i64,
+        item_id: i64,
+        tag_ids: Vec<i64>,
+    ) -> Result<ListState, String> {
+        self.mutate_list(list_id, |transaction| {
+            ensure_active_item(transaction, list_id, item_id)?;
+            let tag_ids: HashSet<_> = tag_ids.into_iter().collect();
+            for tag_id in &tag_ids {
+                ensure_tag_in_list(transaction, list_id, *tag_id)?;
+            }
+            transaction
+                .execute(
+                    "DELETE FROM item_tags WHERE list_id = ?1 AND item_id = ?2",
+                    params![list_id, item_id],
+                )
+                .map_err(db_error)?;
+            for tag_id in tag_ids {
+                transaction
+                    .execute(
+                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)",
+                        params![list_id, item_id, tag_id],
+                    )
+                    .map_err(db_error)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn comparison_state(&self, list_id: i64) -> Result<ComparisonState, String> {
         let transaction = self.read_transaction()?;
         Ok(ComparisonState {
@@ -238,6 +329,12 @@ impl Database {
                 "UPDATE items SET deleted = 1 WHERE id = ?1 AND list_id = ?2 AND deleted = 0",
                 params![item_id, list_id],
             ))?;
+            transaction
+                .execute(
+                    "DELETE FROM item_tags WHERE list_id = ?1 AND item_id = ?2",
+                    params![list_id, item_id],
+                )
+                .map_err(db_error)?;
             reset_snapshots(transaction, list_id)
         })
     }
@@ -551,6 +648,64 @@ fn require_item_change(result: rusqlite::Result<usize>) -> Result<(), String> {
     }
 }
 
+fn require_tag_change(result: rusqlite::Result<usize>) -> Result<(), String> {
+    if result.map_err(db_error)? == 1 {
+        Ok(())
+    } else {
+        Err("タグが見つかりません。".to_owned())
+    }
+}
+
+fn ensure_active_item(connection: &Connection, list_id: i64, item_id: i64) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM items WHERE id = ?1 AND list_id = ?2 AND deleted = 0)",
+            params![item_id, list_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if exists {
+        Ok(())
+    } else {
+        Err("項目が見つかりません。".to_owned())
+    }
+}
+
+fn ensure_tag_in_list(connection: &Connection, list_id: i64, tag_id: i64) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1 AND list_id = ?2)",
+            params![tag_id, list_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if exists {
+        Ok(())
+    } else {
+        Err("タグが見つかりません。".to_owned())
+    }
+}
+
+fn ensure_available_tag_name(
+    connection: &Connection,
+    list_id: i64,
+    except_id: Option<i64>,
+    name: &str,
+) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE list_id = ?1 AND name = ?2 AND (?3 IS NULL OR id <> ?3))",
+            params![list_id, name, except_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if exists {
+        Err("同じ名前のタグが既にあります。".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_supported_model(connection: &Connection, list_id: i64) -> Result<(), String> {
     let stored = connection
         .query_row(
@@ -584,7 +739,7 @@ fn read_items(connection: &Connection, list_id: i64) -> Result<Vec<Item>, String
              FROM items WHERE list_id = ?1 AND deleted = 0 ORDER BY mu DESC, id ASC",
         )
         .map_err(db_error)?;
-    statement
+    let mut items = statement
         .query_map([list_id], |row| {
             let path: Option<String> = row.get(2)?;
             let source_url = row.get(3)?;
@@ -598,6 +753,44 @@ fn read_items(connection: &Connection, list_id: i64) -> Result<Vec<Item>, String
                     sigma: row.get(5)?,
                 },
                 comparison_count: nonnegative_integer(row, 6)?,
+                tag_ids: Vec::new(),
+            })
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    let item_indexes: HashMap<i64, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id, index))
+        .collect();
+    let mut tags = connection
+        .prepare("SELECT item_id, tag_id FROM item_tags WHERE list_id = ?1 ORDER BY tag_id")
+        .map_err(db_error)?;
+    let memberships = tags
+        .query_map([list_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(db_error)?;
+    for membership in memberships {
+        let (item_id, tag_id) = membership.map_err(db_error)?;
+        if let Some(index) = item_indexes.get(&item_id) {
+            items[*index].tag_ids.push(tag_id);
+        }
+    }
+    Ok(items)
+}
+
+fn read_tags(connection: &Connection, list_id: i64) -> Result<Vec<Tag>, String> {
+    let mut statement = connection
+        .prepare("SELECT id, name FROM tags WHERE list_id = ?1 ORDER BY id")
+        .map_err(db_error)?;
+    statement
+        .query_map([list_id], |row| {
+            Ok(Tag {
+                id: row.get(0)?,
+                list_id,
+                name: row.get(1)?,
             })
         })
         .map_err(db_error)?
@@ -615,6 +808,7 @@ fn read_list(connection: &Transaction<'_>, list_id: i64) -> Result<ListState, St
         )
         .map_err(db_error)?;
     let items = read_items(connection, list_id)?;
+    let tags = read_tags(connection, list_id)?;
     let comparison_count = connection
         .query_row(
             "SELECT count(*) FROM comparisons WHERE list_id = ?1",
@@ -639,6 +833,7 @@ fn read_list(connection: &Transaction<'_>, list_id: i64) -> Result<ListState, St
         name,
         revision,
         items,
+        tags,
         comparison_count,
         convergence: convergence(&ratings, &snapshots),
     })
@@ -797,6 +992,8 @@ mod tests {
             "SELECT * FROM items ORDER BY id",
             "SELECT * FROM comparisons ORDER BY id",
             "SELECT * FROM rank_snapshots ORDER BY id",
+            "SELECT * FROM tags ORDER BY id",
+            "SELECT * FROM item_tags ORDER BY item_id, tag_id",
             "SELECT * FROM future_data ORDER BY rowid",
         ]
         .into_iter()
@@ -838,7 +1035,9 @@ mod tests {
                 .unwrap();
         }
         assert!(state.convergence.converged);
-        state
+        database
+            .create_tag(state.id, "Saved tag".into(), Some(state.items[0].id))
+            .unwrap()
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -848,6 +1047,10 @@ mod tests {
         ResumeList,
         RenameList,
         AddItems,
+        CreateTag,
+        RenameTag,
+        DeleteTag,
+        SetItemTags,
         RenameItem,
         DeleteItem,
         SetImage,
@@ -862,12 +1065,16 @@ mod tests {
             Self::ResumeList,
             Self::RenameList,
         ];
-        const ALL: [Self; 10] = [
+        const ALL: [Self; 14] = [
             Self::CreateList,
             Self::DeleteList,
             Self::ResumeList,
             Self::RenameList,
             Self::AddItems,
+            Self::CreateTag,
+            Self::RenameTag,
+            Self::DeleteTag,
+            Self::SetItemTags,
             Self::RenameItem,
             Self::DeleteItem,
             Self::SetImage,
@@ -883,6 +1090,16 @@ mod tests {
                 Self::ResumeList => database.resume_list(state.id).map(|_| ()),
                 Self::RenameList => database.rename_list(state.id, "Changed".into()).map(|_| ()),
                 Self::AddItems => database.add_items(state.id, vec!["New".into()]).map(|_| ()),
+                Self::CreateTag => database
+                    .create_tag(state.id, "New".into(), None)
+                    .map(|_| ()),
+                Self::RenameTag => database
+                    .rename_tag(state.id, state.tags[0].id, "Changed".into())
+                    .map(|_| ()),
+                Self::DeleteTag => database.delete_tag(state.id, state.tags[0].id).map(|_| ()),
+                Self::SetItemTags => database
+                    .set_item_tags(state.id, item_id, vec![])
+                    .map(|_| ()),
                 Self::RenameItem => database
                     .rename_item(state.id, item_id, "Changed".into())
                     .map(|_| ()),
@@ -1614,7 +1831,7 @@ mod tests {
         let path = directory.path().join("rankings.sqlite3");
         let expected = {
             let mut database = Database::open(&path).unwrap();
-            assert_eq!(schema_version(&database.connection).unwrap(), 1);
+            assert_eq!(schema_version(&database.connection).unwrap(), 2);
             let state = populated_list(&mut database, "お気に入り");
             let state = answer_once(&mut database, &state);
             let state = database
@@ -1637,6 +1854,209 @@ mod tests {
             expected
         );
         assert_eq!(snapshot_count(&database, id), 2);
+    }
+
+    #[test]
+    fn version_one_database_upgrades_without_losing_list_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upgrade.sqlite3");
+        {
+            let mut connection = test_connection(&path).unwrap();
+            migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO lists (name, model_version, model_parameters) VALUES (?1, ?2, ?3)",
+                    params!["以前のリスト", MODEL_VERSION, MODEL_PARAMETERS_JSON],
+                )
+                .unwrap();
+            for name in ["A", "B"] {
+                connection
+                    .execute(
+                        "INSERT INTO items (list_id, name, mu, sigma) VALUES (1, ?1, 25, 8)",
+                        [name],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute("INSERT INTO comparisons (list_id, a_id, b_id, preference) VALUES (1, 1, 2, 'equal')", [])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO rank_snapshots (list_id, ranking) VALUES (1, '[1,2]')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(schema_version(&connection).unwrap(), 1);
+        }
+        let database = Database::open(&path).unwrap();
+        assert_eq!(schema_version(&database.connection).unwrap(), 2);
+        let state = database.get_list(1).unwrap();
+        assert_eq!(state.name, "以前のリスト");
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.comparison_count, 1);
+        assert!(state.tags.is_empty());
+        assert!(state.items.iter().all(|item| item.tag_ids.is_empty()));
+        assert_eq!(snapshot_count(&database, 1), 1);
+    }
+
+    #[test]
+    fn tags_persist_multiple_memberships_without_resetting_ranking_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tags.sqlite3");
+        let (list_id, item_id, other_id, first_tag, second_tag, progress) = {
+            let mut database = Database::open(&path).unwrap();
+            let state = populated_list(&mut database, "Tagged");
+            let state = answer_once(&mut database, &state);
+            let progress = serde_json::to_value(&state.convergence).unwrap();
+            let item_id = state.items[0].id;
+            let other_id = state.items[1].id;
+            let state = database
+                .create_tag(state.id, " First ".into(), Some(item_id))
+                .unwrap();
+            let first_tag = state.tags[0].id;
+            let state = database
+                .create_tag(state.id, "Second".into(), None)
+                .unwrap();
+            let second_tag = state.tags[1].id;
+            let state = database
+                .set_item_tags(state.id, item_id, vec![second_tag, first_tag, first_tag])
+                .unwrap();
+            assert_eq!(
+                state
+                    .items
+                    .iter()
+                    .find(|item| item.id == item_id)
+                    .unwrap()
+                    .tag_ids,
+                vec![first_tag, second_tag]
+            );
+            assert_eq!(state.tags[0].name, "First");
+            assert_eq!(state.comparison_count, 1);
+            assert_eq!(snapshot_count(&database, state.id), 2);
+            assert_eq!(serde_json::to_value(&state.convergence).unwrap(), progress);
+            (state.id, item_id, other_id, first_tag, second_tag, progress)
+        };
+        let mut database = Database::open(&path).unwrap();
+        let state = database.get_list(list_id).unwrap();
+        assert_eq!(state.tags.len(), 2);
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .tag_ids,
+            vec![first_tag, second_tag]
+        );
+        let state = database
+            .rename_tag(list_id, first_tag, " Renamed ".into())
+            .unwrap();
+        assert_eq!(state.tags[0].name, "Renamed");
+        let state = database
+            .set_item_tags(list_id, other_id, vec![first_tag])
+            .unwrap();
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == other_id)
+                .unwrap()
+                .tag_ids,
+            vec![first_tag]
+        );
+        let state = database.delete_tag(list_id, first_tag).unwrap();
+        assert_eq!(state.tags.len(), 1);
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .unwrap()
+                .tag_ids,
+            vec![second_tag]
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .find(|item| item.id == other_id)
+                .unwrap()
+                .tag_ids
+                .is_empty()
+        );
+        assert_eq!(serde_json::to_value(&state.convergence).unwrap(), progress);
+        assert_eq!(snapshot_count(&database, list_id), 2);
+    }
+
+    #[test]
+    fn tag_operations_reject_invalid_names_and_cross_list_or_deleted_items() {
+        let mut database = memory_database();
+        let first = populated_list(&mut database, "First");
+        let second = populated_list(&mut database, "Second");
+        let item_id = first.items[0].id;
+        let other_item_id = second.items[0].id;
+        let state = database
+            .create_tag(first.id, "Same".into(), Some(item_id))
+            .unwrap();
+        let tag_id = state.tags[0].id;
+        let other = database.create_tag(second.id, "Same".into(), None).unwrap();
+        let other_tag_id = other.tags[0].id;
+        let before = serde_json::to_value(database.get_list(first.id).unwrap()).unwrap();
+        assert!(database.create_tag(first.id, "  ".into(), None).is_err());
+        assert!(
+            database
+                .create_tag(first.id, " Same ".into(), None)
+                .is_err()
+        );
+        assert!(database.rename_tag(first.id, tag_id, "  ".into()).is_err());
+        assert!(
+            database
+                .rename_tag(first.id, other_tag_id, "Changed".into())
+                .is_err()
+        );
+        assert!(database.delete_tag(first.id, other_tag_id).is_err());
+        assert!(
+            database
+                .create_tag(first.id, "New".into(), Some(other_item_id))
+                .is_err()
+        );
+        assert!(
+            database
+                .set_item_tags(first.id, item_id, vec![tag_id, other_tag_id])
+                .is_err()
+        );
+        assert!(
+            database
+                .set_item_tags(first.id, other_item_id, vec![tag_id])
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(database.get_list(first.id).unwrap()).unwrap(),
+            before
+        );
+        let deleted = database.delete_item(first.id, item_id).unwrap().value;
+        assert!(
+            database
+                .set_item_tags(first.id, item_id, vec![tag_id])
+                .is_err()
+        );
+        assert!(
+            database
+                .create_tag(first.id, "New".into(), Some(item_id))
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM item_tags WHERE item_id = ?1",
+                    [item_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(deleted.tags.len(), 1);
     }
 
     #[test]
@@ -1684,7 +2104,7 @@ mod tests {
         MIGRATE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
         assert_eq!(*result.borrow(), Some(Ok(())));
         migrated.unwrap();
-        assert_eq!(schema_version(&first).unwrap(), 1);
+        assert_eq!(schema_version(&first).unwrap(), 2);
         let name: String = first
             .query_row("SELECT name FROM lists", [], |row| row.get(0))
             .unwrap();
@@ -1722,9 +2142,10 @@ mod tests {
             *pending.borrow_mut() = Some(Box::new(move || {
                 let migrations = [
                     Migration { version: 1, sql: MIGRATIONS[0].sql },
+                    Migration { version: 2, sql: MIGRATIONS[1].sql },
                     Migration {
-                        version: 2,
-                        sql: "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('saved by v2');",
+                        version: 3,
+                        sql: "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('saved by v3');",
                     },
                 ];
                 *completed.borrow_mut() = Some(migrate(&mut second, &migrations));
@@ -1738,19 +2159,19 @@ mod tests {
         first.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
         UPGRADE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
         assert_eq!(*result.borrow(), Some(Ok(())));
-        assert!(migrated.unwrap_err().contains("バージョン 2"));
-        assert_eq!(schema_version(&first).unwrap(), 2);
+        assert!(migrated.unwrap_err().contains("バージョン 3"));
+        assert_eq!(schema_version(&first).unwrap(), 3);
         let saved: String = first
             .query_row("SELECT value FROM future_data", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(saved, "saved by v2");
+        assert_eq!(saved, "saved by v3");
         assert!(first.is_autocommit());
     }
 
     #[test]
     fn pending_migrations_preserve_data_and_apply_in_order_as_one_upgrade() {
         let mut connection = test_connection(Path::new(":memory:")).unwrap();
-        migrate(&mut connection, MIGRATIONS).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
         connection
             .execute(
                 "INSERT INTO lists (name, model_version, model_parameters) VALUES ('before', 1, '{}')",
@@ -1792,7 +2213,7 @@ mod tests {
     #[test]
     fn failed_upgrade_rolls_back_every_pending_schema_data_and_version_change() {
         let mut connection = test_connection(Path::new(":memory:")).unwrap();
-        migrate(&mut connection, MIGRATIONS).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
         connection.execute(
             "INSERT INTO lists (name, model_version, model_parameters) VALUES ('original', 1, '{}')",
             [],
@@ -1843,7 +2264,7 @@ mod tests {
     #[test]
     fn migration_rejects_broken_references_before_commit() {
         let mut connection = test_connection(Path::new(":memory:")).unwrap();
-        migrate(&mut connection, MIGRATIONS).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
         // Table-rebuild migrations may run with immediate foreign key enforcement disabled.
         connection
             .pragma_update(None, "foreign_keys", false)

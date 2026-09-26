@@ -11,6 +11,11 @@ export const api: AppApi = {
   addItems: (listId, names) => invoke("add_items", { listId, names }),
   renameItem: (listId, itemId, name) => invoke("rename_item", { listId, itemId, name }),
   deleteItem: (listId, itemId) => invoke("delete_item", { listId, itemId }),
+  createTag: (listId, name, itemId) =>
+    invoke("create_tag", { listId, name, itemId: itemId ?? null }),
+  renameTag: (listId, tagId, name) => invoke("rename_tag", { listId, tagId, name }),
+  deleteTag: (listId, tagId) => invoke("delete_tag", { listId, tagId }),
+  setItemTags: (listId, itemId, tagIds) => invoke("set_item_tags", { listId, itemId, tagIds }),
   resumeList: (listId) => invoke("resume_list", { listId }),
   nextPair: (listId) => invoke("next_pair", { listId }),
   answer: (pair, preference) =>

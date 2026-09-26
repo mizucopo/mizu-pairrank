@@ -18,6 +18,15 @@ pub struct Item {
     pub image: Option<ImageAsset>,
     pub rating: Rating,
     pub comparison_count: u64,
+    pub tag_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: i64,
+    pub list_id: i64,
+    pub name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +46,7 @@ pub struct ListState {
     pub name: String,
     pub revision: u64,
     pub items: Vec<Item>,
+    pub tags: Vec<Tag>,
     pub comparison_count: u64,
     pub convergence: Convergence,
 }
