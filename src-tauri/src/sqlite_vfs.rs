@@ -20,7 +20,7 @@ const VFS_NAME: &CStr = c"pairrank-directory";
 const LOCAL_PREFIX: &str = "/__pairrank_vfs/";
 const UNC_PREFIX: &str = "//pairrank-vfs/";
 const SQLITE_SOURCE: &str =
-    "2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6d618";
+    "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24";
 
 struct Namespace {
     identity: same_file::Handle,
