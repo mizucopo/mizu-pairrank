@@ -142,6 +142,11 @@ describe("desktop app interaction", () => {
       ["C", ["項目5"]],
       ["D", ["項目6"]],
     ]);
+    const scrollableRow = root.querySelector(".tier-row:nth-child(2) .tier-items");
+    if (!(scrollableRow instanceof HTMLOListElement)) throw new Error("Missing Tier row");
+    expect(scrollableRow.tabIndex).toBe(0);
+    scrollableRow.focus();
+    expect(document.activeElement).toBe(scrollableRow);
     expect(
       [...root.querySelectorAll(".tier-card .tier-rank")].map((rank) => rank.textContent),
     ).toEqual(["1 位", "2 位", "3 位", "4 位", "5 位", "6 位"]);

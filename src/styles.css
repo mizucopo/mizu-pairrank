@@ -662,6 +662,10 @@ progress {
   padding: 12px;
   list-style: none;
 }
+.tier-items:focus-visible {
+  outline: 3px solid #a8caba;
+  outline-offset: -3px;
+}
 .tier-card {
   display: flex;
   flex: 0 0 132px;

@@ -30,6 +30,20 @@ describe("tierRows", () => {
     ]);
   });
 
+  it("places fractional boundaries in the lower tier without moving nearby scores", () => {
+    const rows = tierRows(
+      [1, 0.800001, 0.8, 0.6, 0.4, 0.2, 0].map((mu, index) => item(index + 1, mu)),
+    );
+
+    expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.rating.mu))).toEqual([
+      [1, 0.800001],
+      [0.8],
+      [0.6],
+      [0.4],
+      [0.2, 0],
+    ]);
+  });
+
   it("keeps equal scores together and preserves the incoming ranking order and ranks", () => {
     const rows = tierRows([item(1, 50), item(42, 40), item(7, 40), item(2, 35), item(9, 0)]);
 

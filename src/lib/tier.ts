@@ -17,7 +17,14 @@ export function tierRows(items: readonly Item[]): TierRow[] {
   }
   const span = highest - lowest;
   items.forEach((item, index) => {
-    const tier = span === 0 ? 3 : Math.min(4, Math.floor((5 * (highest - item.rating.mu)) / span));
+    let tier = span === 0 ? 3 : 0;
+    if (span !== 0) {
+      for (let boundary = 1; boundary < labels.length; boundary += 1) {
+        if (item.rating.mu <= lowest + (span * (labels.length - boundary)) / labels.length) {
+          tier = boundary;
+        }
+      }
+    }
     rows[tier]?.entries.push({ item, rank: index + 1 });
   });
   return rows;
