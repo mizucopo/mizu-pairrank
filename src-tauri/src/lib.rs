@@ -255,6 +255,41 @@ async fn delete_item(app: AppHandle, list_id: i64, item_id: i64) -> Result<ListS
         .await
 }
 #[tauri::command]
+async fn create_tag(
+    app: AppHandle,
+    list_id: i64,
+    name: String,
+    item_id: Option<i64>,
+) -> Result<ListState, String> {
+    database_job(app, move |db| db.create_tag(list_id, name, item_id)).await
+}
+#[tauri::command]
+async fn rename_tag(
+    app: AppHandle,
+    list_id: i64,
+    tag_id: i64,
+    name: String,
+) -> Result<ListState, String> {
+    database_job(app, move |db| db.rename_tag(list_id, tag_id, name)).await
+}
+#[tauri::command]
+async fn delete_tag(app: AppHandle, list_id: i64, tag_id: i64) -> Result<ListState, String> {
+    database_job(app, move |db| db.delete_tag(list_id, tag_id)).await
+}
+#[tauri::command]
+async fn set_item_tag(
+    app: AppHandle,
+    list_id: i64,
+    item_id: i64,
+    tag_id: i64,
+    assigned: bool,
+) -> Result<ListState, String> {
+    database_job(app, move |db| {
+        db.set_item_tag(list_id, item_id, tag_id, assigned)
+    })
+    .await
+}
+#[tauri::command]
 async fn resume_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
     database_job(app, move |db| db.resume_list(list_id)).await
 }
@@ -456,6 +491,10 @@ pub fn run() {
             add_items,
             rename_item,
             delete_item,
+            create_tag,
+            rename_tag,
+            delete_tag,
+            set_item_tag,
             resume_list,
             next_pair,
             answer,
