@@ -61,7 +61,12 @@ export type AppApi = {
   createTag: (listId: number, name: string, itemId?: number) => Promise<ListState>;
   renameTag: (listId: number, tagId: number, name: string) => Promise<ListState>;
   deleteTag: (listId: number, tagId: number) => Promise<ListState>;
-  setItemTags: (listId: number, itemId: number, tagIds: number[]) => Promise<ListState>;
+  setItemTag: (
+    listId: number,
+    itemId: number,
+    tagId: number,
+    assigned: boolean,
+  ) => Promise<ListState>;
   resumeList: (listId: number) => Promise<ListState>;
   nextPair: (listId: number) => Promise<PairProposal | null>;
   answer: (pair: PairProposal, preference: Preference) => Promise<ListState>;

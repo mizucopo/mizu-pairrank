@@ -65,7 +65,7 @@ function setup(
     createTag: vi.fn<AppApi["createTag"]>().mockResolvedValue(state),
     renameTag: vi.fn<AppApi["renameTag"]>().mockResolvedValue(state),
     deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(state),
-    setItemTags: vi.fn<AppApi["setItemTags"]>().mockResolvedValue(state),
+    setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(state),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(state),
     nextPair,
     answer: vi.fn<AppApi["answer"]>().mockImplementation(async () => {
@@ -1516,8 +1516,11 @@ describe("desktop app interaction", () => {
       });
       return state;
     });
-    api.setItemTags.mockImplementation(async (_listId, itemId, tagIds) => {
-      state.items.find((item) => item.id === itemId)!.tagIds = tagIds;
+    api.setItemTag.mockImplementation(async (_listId, itemId, tagId, assigned) => {
+      const item = state.items.find((entry) => entry.id === itemId)!;
+      item.tagIds = assigned
+        ? [...new Set([...item.tagIds, tagId])]
+        : item.tagIds.filter((id) => id !== tagId);
       return state;
     });
     await controller.initialize();
@@ -1545,7 +1548,7 @@ describe("desktop app interaction", () => {
     checkbox.checked = false;
     checkbox.dispatchEvent(new Event("change", { bubbles: true }));
     await settle(controller);
-    expect(api.setItemTags).toHaveBeenCalledExactlyOnceWith(1, 10, []);
+    expect(api.setItemTag).toHaveBeenCalledExactlyOnceWith(1, 10, 1, false);
     await click(root, controller, '[data-action="close-modal"]');
     expect(document.activeElement).toBe(button(root, '[data-action="tags"][data-id="10"]'));
     expect(root.querySelector(".tag-summary")?.textContent).toContain("甘い 0 件");
@@ -1567,4 +1570,91 @@ describe("desktop app interaction", () => {
     expect(api.deleteTag).toHaveBeenCalledExactlyOnceWith(1, 1);
     expect(root.textContent).toContain("タグはまだありません。");
   });
+
+  it.each(["item", "management"] as const)(
+    "focuses the %s tag deletion confirmation and returns focus on cancellation",
+    async (entry) => {
+      const { root, controller, state } = setup();
+      state.tags = [{ id: 1, listId: 1, name: "甘い" }];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      const deleteButton = button(root, '[data-action="delete-tag"][data-id="1"]');
+      deleteButton.focus();
+      deleteButton.click();
+      expect(document.activeElement).toBe(button(root, '[data-action="confirm-tag-delete"]'));
+      button(root, '[data-action="cancel-tag-delete"]').click();
+      expect(document.activeElement).toBe(button(root, '[data-action="delete-tag"][data-id="1"]'));
+    },
+  );
+
+  it.each(["scrollTop", "scrollLeft"] as const)(
+    "preserves tag editor %s through assignment, editing, and deletion prompts",
+    async (axis) => {
+      const { root, controller, api, state } = setup();
+      state.tags = Array.from({ length: 20 }, (_, index) => ({
+        id: index + 1,
+        listId: 1,
+        name: `タグ ${index + 1}`,
+      }));
+      await controller.initialize();
+      await click(root, controller, '[data-action="tags"][data-id="10"]');
+      let finish: () => void = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      api.setItemTag.mockImplementationOnce(async () => {
+        await pending;
+        state.items[0]!.tagIds = [15];
+        return state;
+      });
+      const editor = root.querySelector<HTMLElement>(".tag-editor-list");
+      const checkbox = root.querySelector<HTMLInputElement>('[data-tag-id="15"]');
+      if (!editor || !checkbox) throw new Error("Missing tag editor");
+      editor[axis] = 500;
+      checkbox.focus({ preventScroll: true });
+      checkbox.checked = true;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(controller.state.busy).toBe(true);
+      const busyEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      expect(busyEditor).not.toBe(editor);
+      expect(busyEditor?.[axis]).toBe(500);
+      if (!busyEditor) throw new Error("Missing busy tag editor");
+      busyEditor[axis] = 650;
+      finish();
+      await settle(controller);
+      const completedEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      expect(completedEditor?.[axis]).toBe(650);
+      expect(document.activeElement).toBe(root.querySelector('[data-tag-id="15"]'));
+      await click(root, controller, '[data-action="edit-tag"][data-id="15"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      api.renameTag.mockImplementationOnce(async (_listId, tagId, name) => {
+        state.tags.find((tag) => tag.id === tagId)!.name = name;
+        return state;
+      });
+      const name = root.querySelector<HTMLInputElement>("#tag-name");
+      if (!name) throw new Error("Missing tag name field");
+      name.value = "変更したタグ";
+      name.dispatchEvent(new Event("input", { bubbles: true }));
+      root
+        .querySelector<HTMLFormElement>('[data-form="save-tag"]')
+        ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await settle(controller);
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      await click(root, controller, '[data-action="delete-tag"][data-id="16"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      await click(root, controller, '[data-action="cancel-tag-delete"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      api.deleteTag.mockImplementationOnce(async (_listId, tagId) => {
+        state.tags = state.tags.filter((tag) => tag.id !== tagId);
+        return state;
+      });
+      await click(root, controller, '[data-action="delete-tag"][data-id="16"]');
+      await click(root, controller, '[data-action="confirm-tag-delete"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+    },
+  );
 });

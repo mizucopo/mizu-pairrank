@@ -94,6 +94,10 @@ export function mountApp(
   function render(): void {
     const lists = root.querySelector<HTMLElement>(".lists");
     const listScroll = { top: lists?.scrollTop ?? 0, left: lists?.scrollLeft ?? 0 };
+    const tagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+    const tagScroll = { top: tagEditor?.scrollTop ?? 0, left: tagEditor?.scrollLeft ?? 0 };
+    const tagModal = renderedModal;
+    const tagListId = renderedListId;
     const focus = document.activeElement;
     if (!pendingButtonFocus && focus instanceof HTMLButtonElement && root.contains(focus)) {
       pendingButtonFocus = rememberButton(focus);
@@ -106,7 +110,9 @@ export function mountApp(
         listId: focusKey === "braveKey" || focusKey === "ollamaKey" ? null : renderedListId,
         dialog: Boolean(focus?.closest("dialog")),
         selection:
-          focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement
+          (focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement) &&
+          focus.selectionStart !== null &&
+          focus.selectionEnd !== null
             ? [focus.selectionStart, focus.selectionEnd]
             : null,
       };
@@ -169,6 +175,13 @@ export function mountApp(
     if (renderedLists) {
       renderedLists.scrollTop = listScroll.top;
       renderedLists.scrollLeft = listScroll.left;
+    }
+    if (tagEditor && renderedModal === tagModal && renderedListId === tagListId) {
+      const renderedTagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      if (renderedTagEditor) {
+        renderedTagEditor.scrollTop = tagScroll.top;
+        renderedTagEditor.scrollLeft = tagScroll.left;
+      }
     }
   }
   root.addEventListener("input", (event) => {
@@ -284,10 +297,22 @@ export function mountApp(
         break;
       case "delete-tag":
         controller.deleteTagPrompt(id);
+        if (controller.state.tagDeletingId === id) {
+          root
+            .querySelector<HTMLButtonElement>('[data-action="confirm-tag-delete"]')
+            ?.focus({ preventScroll: true });
+        }
         break;
-      case "cancel-tag-delete":
+      case "cancel-tag-delete": {
+        const tagId = controller.state.tagDeletingId;
         controller.deleteTagPrompt(null);
+        if (tagId !== null) {
+          root
+            .querySelector<HTMLButtonElement>(`[data-action="delete-tag"][data-id="${tagId}"]`)
+            ?.focus({ preventScroll: true });
+        }
         break;
+      }
       case "confirm-tag-delete":
         void controller.confirmTagDelete();
         break;

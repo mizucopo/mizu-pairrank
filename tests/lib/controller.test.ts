@@ -73,7 +73,7 @@ function backend(first = list(), second = list(2)) {
     createTag: vi.fn<AppApi["createTag"]>().mockResolvedValue(first),
     renameTag: vi.fn<AppApi["renameTag"]>().mockResolvedValue(first),
     deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(first),
-    setItemTags: vi.fn<AppApi["setItemTags"]>().mockResolvedValue(first),
+    setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(first),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(first),
     nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(proposal(first)),
     answer: vi.fn<AppApi["answer"]>().mockResolvedValue(first),
@@ -143,10 +143,86 @@ describe("tag management", () => {
       ...created,
       items: created.items.map((item) => (item.id === 11 ? { ...item, tagIds: [1, 2] } : item)),
     };
-    api.setItemTags.mockResolvedValueOnce(assigned);
+    api.setItemTag.mockResolvedValueOnce(assigned);
     await controller.toggleItemTag(2, true);
-    expect(api.setItemTags).toHaveBeenCalledExactlyOnceWith(1, 11, [1, 2]);
+    expect(api.setItemTag).toHaveBeenCalledExactlyOnceWith(1, 11, 2, true);
     expect(controller.state.active).toEqual(assigned);
+  });
+
+  it("reloads a concurrently deleted tag and clears the editor after a rename error", async () => {
+    const initial = {
+      ...list(),
+      tags: [{ id: 3, listId: 1, name: "以前" }],
+    };
+    const refreshed = { ...initial, tags: [] };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(3);
+    await controller.openModal({ kind: "tags" });
+    controller.editTag(3);
+    controller.state.tagDraft = "新しい";
+    api.renameTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+    api.getList.mockResolvedValueOnce(refreshed);
+
+    await controller.saveTag();
+
+    expect(api.getList).toHaveBeenCalledTimes(2);
+    expect(controller.state.active).toEqual(refreshed);
+    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.tagEditingId).toBeNull();
+    expect(controller.state.tagDraft).toBe("");
+    expect(controller.state.error).toBe("タグが見つかりません。");
+  });
+
+  it("reloads a concurrently deleted tag after deletion or assignment fails", async () => {
+    for (const action of ["delete", "assignment"] as const) {
+      const initial = {
+        ...list(),
+        tags: [{ id: 3, listId: 1, name: "以前" }],
+      };
+      const refreshed = { ...initial, tags: [] };
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.openModal({ kind: "tags", itemId: 11 });
+      api.getList.mockResolvedValueOnce(refreshed);
+      if (action === "delete") {
+        controller.deleteTagPrompt(3);
+        api.deleteTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+        await controller.confirmTagDelete();
+      } else {
+        api.setItemTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+        await controller.toggleItemTag(3, true);
+      }
+      expect(controller.state.active).toEqual(refreshed);
+      expect(controller.state.tagDeletingId).toBeNull();
+      expect(controller.state.error).toBe("タグが見つかりません。");
+    }
+  });
+
+  it("closes an item tag editor when a successful tag change returns without that item", async () => {
+    const initial = {
+      ...list(),
+      tags: [{ id: 3, listId: 1, name: "以前" }],
+    };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "tags", itemId: 11 });
+    controller.editTag(3);
+    controller.state.tagDraft = "新しい";
+    api.renameTag.mockResolvedValueOnce({
+      ...initial,
+      tags: [{ ...initial.tags[0]!, name: "新しい" }],
+      items: initial.items.filter((item) => item.id !== 11),
+    });
+
+    await controller.saveTag();
+
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.tagEditingId).toBeNull();
+    expect(controller.state.error).toBe("");
   });
 
   it("renames and deletes tags while resetting a deleted ranking filter", async () => {

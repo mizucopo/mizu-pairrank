@@ -277,13 +277,17 @@ async fn delete_tag(app: AppHandle, list_id: i64, tag_id: i64) -> Result<ListSta
     database_job(app, move |db| db.delete_tag(list_id, tag_id)).await
 }
 #[tauri::command]
-async fn set_item_tags(
+async fn set_item_tag(
     app: AppHandle,
     list_id: i64,
     item_id: i64,
-    tag_ids: Vec<i64>,
+    tag_id: i64,
+    assigned: bool,
 ) -> Result<ListState, String> {
-    database_job(app, move |db| db.set_item_tags(list_id, item_id, tag_ids)).await
+    database_job(app, move |db| {
+        db.set_item_tag(list_id, item_id, tag_id, assigned)
+    })
+    .await
 }
 #[tauri::command]
 async fn resume_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
@@ -490,7 +494,7 @@ pub fn run() {
             create_tag,
             rename_tag,
             delete_tag,
-            set_item_tags,
+            set_item_tag,
             resume_list,
             next_pair,
             answer,

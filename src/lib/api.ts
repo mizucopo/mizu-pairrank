@@ -15,7 +15,8 @@ export const api: AppApi = {
     invoke("create_tag", { listId, name, itemId: itemId ?? null }),
   renameTag: (listId, tagId, name) => invoke("rename_tag", { listId, tagId, name }),
   deleteTag: (listId, tagId) => invoke("delete_tag", { listId, tagId }),
-  setItemTags: (listId, itemId, tagIds) => invoke("set_item_tags", { listId, itemId, tagIds }),
+  setItemTag: (listId, itemId, tagId, assigned) =>
+    invoke("set_item_tag", { listId, itemId, tagId, assigned }),
   resumeList: (listId) => invoke("resume_list", { listId }),
   nextPair: (listId) => invoke("next_pair", { listId }),
   answer: (pair, preference) =>

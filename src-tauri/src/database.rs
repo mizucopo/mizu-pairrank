@@ -243,28 +243,28 @@ impl Database {
         })
     }
 
-    pub fn set_item_tags(
+    pub fn set_item_tag(
         &mut self,
         list_id: i64,
         item_id: i64,
-        tag_ids: Vec<i64>,
+        tag_id: i64,
+        assigned: bool,
     ) -> Result<ListState, String> {
         self.mutate_list(list_id, |transaction| {
             ensure_active_item(transaction, list_id, item_id)?;
-            let tag_ids: HashSet<_> = tag_ids.into_iter().collect();
-            for tag_id in &tag_ids {
-                ensure_tag_in_list(transaction, list_id, *tag_id)?;
-            }
-            transaction
-                .execute(
-                    "DELETE FROM item_tags WHERE list_id = ?1 AND item_id = ?2",
-                    params![list_id, item_id],
-                )
-                .map_err(db_error)?;
-            for tag_id in tag_ids {
+            ensure_tag_in_list(transaction, list_id, tag_id)?;
+            if assigned {
                 transaction
                     .execute(
-                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)",
+                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(item_id, tag_id) DO NOTHING",
+                        params![list_id, item_id, tag_id],
+                    )
+                    .map_err(db_error)?;
+            } else {
+                transaction
+                    .execute(
+                        "DELETE FROM item_tags WHERE list_id = ?1 AND item_id = ?2 AND tag_id = ?3",
                         params![list_id, item_id, tag_id],
                     )
                     .map_err(db_error)?;
@@ -840,10 +840,22 @@ fn read_list(connection: &Transaction<'_>, list_id: i64) -> Result<ListState, St
 }
 
 fn append_snapshot(connection: &Connection, list_id: i64) -> Result<(), String> {
-    let ratings: Vec<_> = read_items(connection, list_id)?
-        .iter()
-        .map(|item| (item.id, item.rating))
-        .collect();
+    let mut statement = connection
+        .prepare("SELECT id, mu, sigma FROM items WHERE list_id = ?1 AND deleted = 0")
+        .map_err(db_error)?;
+    let ratings = statement
+        .query_map([list_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                Rating {
+                    mu: row.get(1)?,
+                    sigma: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
     let ranking =
         serde_json::to_string(&ranking_ids(&ratings)).map_err(|error| error.to_string())?;
     connection
@@ -1050,7 +1062,7 @@ mod tests {
         CreateTag,
         RenameTag,
         DeleteTag,
-        SetItemTags,
+        SetItemTag,
         RenameItem,
         DeleteItem,
         SetImage,
@@ -1074,7 +1086,7 @@ mod tests {
             Self::CreateTag,
             Self::RenameTag,
             Self::DeleteTag,
-            Self::SetItemTags,
+            Self::SetItemTag,
             Self::RenameItem,
             Self::DeleteItem,
             Self::SetImage,
@@ -1097,8 +1109,8 @@ mod tests {
                     .rename_tag(state.id, state.tags[0].id, "Changed".into())
                     .map(|_| ()),
                 Self::DeleteTag => database.delete_tag(state.id, state.tags[0].id).map(|_| ()),
-                Self::SetItemTags => database
-                    .set_item_tags(state.id, item_id, vec![])
+                Self::SetItemTag => database
+                    .set_item_tag(state.id, item_id, state.tags[0].id, false)
                     .map(|_| ()),
                 Self::RenameItem => database
                     .rename_item(state.id, item_id, "Changed".into())
@@ -1919,7 +1931,10 @@ mod tests {
                 .unwrap();
             let second_tag = state.tags[1].id;
             let state = database
-                .set_item_tags(state.id, item_id, vec![second_tag, first_tag, first_tag])
+                .set_item_tag(state.id, item_id, second_tag, true)
+                .unwrap();
+            let state = database
+                .set_item_tag(state.id, item_id, first_tag, true)
                 .unwrap();
             assert_eq!(
                 state
@@ -1953,7 +1968,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.tags[0].name, "Renamed");
         let state = database
-            .set_item_tags(list_id, other_id, vec![first_tag])
+            .set_item_tag(list_id, other_id, first_tag, true)
             .unwrap();
         assert_eq!(
             state
@@ -1986,6 +2001,39 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(&state.convergence).unwrap(), progress);
         assert_eq!(snapshot_count(&database, list_id), 2);
+    }
+
+    #[test]
+    fn tag_toggle_from_stale_instance_preserves_other_memberships() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-tags.sqlite3");
+        let mut first = Database::open(&path).unwrap();
+        let list = populated_list(&mut first, "Shared tags");
+        let item_id = list.items[0].id;
+        let list = first.create_tag(list.id, "First".into(), None).unwrap();
+        let list = first.create_tag(list.id, "Second".into(), None).unwrap();
+        let first_tag = list.tags[0].id;
+        let second_tag = list.tags[1].id;
+        let mut second = Database::open(&path).unwrap();
+        let stale = second.get_list(list.id).unwrap();
+        assert!(stale.items[0].tag_ids.is_empty());
+
+        first
+            .set_item_tag(list.id, item_id, first_tag, true)
+            .unwrap();
+        let state = second
+            .set_item_tag(stale.id, item_id, second_tag, true)
+            .unwrap();
+        assert_eq!(state.items[0].tag_ids, vec![first_tag, second_tag]);
+
+        let state = first
+            .set_item_tag(stale.id, item_id, first_tag, false)
+            .unwrap();
+        assert_eq!(state.items[0].tag_ids, vec![second_tag]);
+        assert_eq!(
+            second.get_list(list.id).unwrap().items[0].tag_ids,
+            vec![second_tag]
+        );
     }
 
     #[test]
@@ -2022,12 +2070,12 @@ mod tests {
         );
         assert!(
             database
-                .set_item_tags(first.id, item_id, vec![tag_id, other_tag_id])
+                .set_item_tag(first.id, item_id, other_tag_id, true)
                 .is_err()
         );
         assert!(
             database
-                .set_item_tags(first.id, other_item_id, vec![tag_id])
+                .set_item_tag(first.id, other_item_id, tag_id, true)
                 .is_err()
         );
         assert_eq!(
@@ -2037,7 +2085,7 @@ mod tests {
         let deleted = database.delete_item(first.id, item_id).unwrap().value;
         assert!(
             database
-                .set_item_tags(first.id, item_id, vec![tag_id])
+                .set_item_tag(first.id, item_id, tag_id, false)
                 .is_err()
         );
         assert!(

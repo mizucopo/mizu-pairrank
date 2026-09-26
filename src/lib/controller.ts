@@ -414,6 +414,17 @@ export class AppController {
       this.state.selectedTagId = null;
     this.state.active = list;
     this.state.pair = null;
+    const modal = this.state.modal;
+    if (
+      modal?.kind === "tags" &&
+      modal.itemId !== undefined &&
+      !list.items.some((item) => item.id === modal.itemId)
+    ) {
+      this.state.modal = null;
+      this.state.tagDraft = "";
+      this.state.tagEditingId = null;
+      this.state.tagDeletingId = null;
+    }
     this.updateListSummary(list);
   }
 
@@ -458,7 +469,7 @@ export class AppController {
       } else {
         result = await this.api
           .renameTag(list.id, editingId, name)
-          .catch((error: unknown) => this.handleListError(list.id, error));
+          .catch((error: unknown) => this.handleTagError(list.id, error));
       }
       this.acceptCommittedList(result);
       this.state.tagDraft = "";
@@ -473,7 +484,7 @@ export class AppController {
     await this.perform(async () => {
       const result = await this.api
         .deleteTag(list.id, tagId)
-        .catch((error: unknown) => this.handleListError(list.id, error));
+        .catch((error: unknown) => this.handleTagError(list.id, error));
       this.acceptCommittedList(result);
       this.state.tagDeletingId = null;
     });
@@ -491,13 +502,14 @@ export class AppController {
       return;
     const item = list.items.find((entry) => entry.id === modal.itemId);
     if (!item) return;
-    const tagIds = checked
-      ? [...new Set([...item.tagIds, tagId])]
-      : item.tagIds.filter((id) => id !== tagId);
     await this.perform(async () => {
       const result = await this.api
-        .setItemTags(list.id, item.id, tagIds)
-        .catch((error: unknown) => this.handleItemError(list.id, item.id, error));
+        .setItemTag(list.id, item.id, tagId, checked)
+        .catch((error: unknown) => {
+          if (errorMessage(error) === "タグが見つかりません。")
+            return this.handleTagError(list.id, error);
+          return this.handleItemError(list.id, item.id, error);
+        });
       this.acceptCommittedList(result);
     });
   }
@@ -659,6 +671,19 @@ export class AppController {
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
       if (this.state.active && this.state.view === "items") void this.refreshBulkSettings();
     }
+    throw error;
+  }
+
+  private async handleTagError(listId: number, error: unknown): Promise<never> {
+    if (errorMessage(error) !== "タグが見つかりません。")
+      return this.handleListError(listId, error);
+    this.state.tagDraft = "";
+    this.state.tagEditingId = null;
+    this.state.tagDeletingId = null;
+    const current = await this.api
+      .getList(listId)
+      .catch((reloadError: unknown) => this.handleListError(listId, reloadError));
+    this.acceptCommittedList(current);
     throw error;
   }
 
