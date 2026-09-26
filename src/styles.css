@@ -660,6 +660,76 @@ progress {
   color: var(--ink);
   font-size: 0.85rem;
 }
+.tier-table {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+}
+.tier-row {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  min-height: 96px;
+}
+.tier-row + .tier-row {
+  border-top: 1px solid var(--line);
+}
+.tier-label {
+  display: grid;
+  place-items: center;
+  margin: 0;
+  background: #eaf0e4;
+  color: var(--accent);
+  font-size: 1.25rem;
+}
+.tier-row:first-child .tier-label {
+  background: #f5ebd8;
+  color: #8d682e;
+}
+.tier-items {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin: 0;
+  padding: 12px;
+  list-style: none;
+}
+.tier-items:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+.tier-card {
+  display: flex;
+  flex: 0 0 132px;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  text-align: center;
+  min-width: 0;
+}
+.tier-card .item-image {
+  width: 48px;
+  height: 48px;
+}
+.tier-rank {
+  color: var(--ink);
+  font-size: 0.65rem;
+}
+.tier-name {
+  font-size: 0.76rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.tier-empty {
+  align-self: center;
+  margin: 0;
+  padding: 12px;
+  color: var(--ink);
+  font-size: 0.76rem;
+}
 .converged-banner {
   display: flex;
   align-items: center;

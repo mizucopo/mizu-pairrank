@@ -76,7 +76,8 @@ export function mountApp(
       target.modal === controller.state.modal &&
       (target.listId === null || target.listId === controller.state.active?.id)
     ) {
-      button = matchingButtons(target.key)[target.index];
+      const matches = matchingButtons(target.key);
+      button = matches[target.index] ?? matches.find((candidate) => candidate.closest(".tabs"));
     }
     if (button && !button.disabled) button.focus({ preventScroll: true });
     else {
@@ -94,6 +95,12 @@ export function mountApp(
   function render(): void {
     const lists = root.querySelector<HTMLElement>(".lists");
     const listScroll = { top: lists?.scrollTop ?? 0, left: lists?.scrollLeft ?? 0 };
+    const tierScroll = new Map(
+      [...root.querySelectorAll<HTMLElement>(".tier-items")].map((row) => [
+        row.dataset.focus,
+        row.scrollLeft,
+      ]),
+    );
     const tagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
     const tagScroll = { top: tagEditor?.scrollTop ?? 0, left: tagEditor?.scrollLeft ?? 0 };
     const tagModal = renderedModal;
@@ -176,6 +183,9 @@ export function mountApp(
       renderedLists.scrollTop = listScroll.top;
       renderedLists.scrollLeft = listScroll.left;
     }
+    for (const row of root.querySelectorAll<HTMLElement>(".tier-items")) {
+      row.scrollLeft = tierScroll.get(row.dataset.focus) ?? 0;
+    }
     if (tagEditor && renderedModal === tagModal && renderedListId === tagListId) {
       const renderedTagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
       if (renderedTagEditor) {
@@ -255,7 +265,13 @@ export function mountApp(
       return;
     }
     const view = button.dataset.view;
-    if (view === "items" || view === "compare" || view === "ranking" || view === "settings") {
+    if (
+      view === "items" ||
+      view === "compare" ||
+      view === "ranking" ||
+      view === "tier" ||
+      view === "settings"
+    ) {
       void controller.navigate(view);
       return;
     }

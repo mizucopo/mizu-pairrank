@@ -1,5 +1,6 @@
 import { answers, tagNameMaxLength } from "./controller.js";
 import type { AppState, View } from "./controller.js";
+import { tierRows } from "./tier.js";
 import type { Item } from "./types.js";
 
 export function escapeHtml(value: string): string {
@@ -44,6 +45,7 @@ function listHeader(s: AppState): string {
     { view: "items", label: "項目" },
     { view: "compare", label: "比較する" },
     { view: "ranking", label: "ランキング" },
+    { view: "tier", label: "Tier 表" },
   ];
   return `<header class="page-header"><div><p class="eyebrow">MY RANKING</p><h1>${e(list.name)}</h1><p class="muted">${list.items.length} 項目 · ${list.comparisonCount} 回の比較</p></div><div class="header-actions"><button class="text-button" data-action="rename-list"${disabled(s)}>名前を変更</button><button class="text-button danger-text" data-action="delete-list"${disabled(s)}>削除</button></div></header><nav class="tabs" aria-label="表示切り替え">${tabs.map(({ view, label }) => `<button data-view="${view}" class="${s.view === view ? "active" : ""}" ${s.view === view ? 'aria-current="page"' : ""}${disabled(s)} ${view === "compare" && list.items.length < 2 ? "disabled" : ""}>${label}</button>`).join("")}</nav>`;
 }
@@ -113,6 +115,12 @@ function rankingView(s: AppState, assetUrl: (path: string) => string): string {
       ? list.items
       : list.items.filter((item) => item.tagIds.includes(selectedTagId));
   return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div><div class="ranking-filter"><label for="ranking-tag">表示するタグ</label><select id="ranking-tag" data-focus="ranking-tag"${disabled(s)}><option value=""${s.selectedTagId === null ? " selected" : ""}>すべて</option>${list.tags.map((tag) => `<option value="${tag.id}"${s.selectedTagId === tag.id ? " selected" : ""}>${e(tag.name)}</option>`).join("")}</select></div>${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagId !== null ? '<div class="empty compact"><p>このタグが付いた項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
+}
+function tierView(s: AppState, assetUrl: (path: string) => string): string {
+  const list = s.active;
+  if (!list) return "";
+  const rows = tierRows(list.items);
+  return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && rows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div>${list.items.length ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item, rank }) => `<li class="tier-card"><span class="tier-rank">${rank} 位</span>${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
   return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header><section class="settings-grid">${(
@@ -221,6 +229,7 @@ export function renderApp(s: AppState, assetUrl: (path: string) => string): stri
     content = listHeader(s);
     if (s.view === "compare") content += comparisonView(s, assetUrl);
     else if (s.view === "ranking") content += rankingView(s, assetUrl);
+    else if (s.view === "tier") content += tierView(s, assetUrl);
     else content += itemsView(s, assetUrl);
   }
   return `${sidebar(s)}<main class="workspace" aria-busy="${s.busy}">${!s.modal && s.error ? `<div class="error" role="alert">${e(s.error)}</div>` : ""}${s.notice ? `<div class="notice" role="status">${e(s.notice)}</div>` : ""}${content}<div class="save-status" role="status">${s.busy ? "処理中…" : ""}</div></main>${modalView(s)}`;
