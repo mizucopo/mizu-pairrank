@@ -120,6 +120,41 @@ async function listSelection(context: "startup" | "after deletion") {
 }
 
 describe("tag management", () => {
+  it("accepts 30 Unicode characters after trimming and rejects a longer new tag", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "tags" });
+    const validName = `${"あ".repeat(29)}😀`;
+    controller.state.tagDraft = ` ${validName} `;
+    await controller.saveTag();
+    expect(api.createTag).toHaveBeenCalledExactlyOnceWith(1, validName, undefined);
+
+    const tooLong = `${"あ".repeat(30)}😀`;
+    controller.state.tagDraft = tooLong;
+    await controller.saveTag();
+    expect(api.createTag).toHaveBeenCalledTimes(1);
+    expect(controller.state.error).toBe("タグ名は30文字以内にしてください。");
+    expect(controller.state.tagDraft).toBe(tooLong);
+  });
+
+  it("rejects a longer tag rename without calling the backend", async () => {
+    const initial = { ...list(), tags: [{ id: 3, listId: 1, name: "以前" }] };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "tags" });
+    controller.editTag(3);
+    const tooLong = `${"い".repeat(30)}😀`;
+    controller.state.tagDraft = tooLong;
+
+    await controller.saveTag();
+
+    expect(api.renameTag).not.toHaveBeenCalled();
+    expect(controller.state.error).toBe("タグ名は30文字以内にしてください。");
+    expect(controller.state.tagDraft).toBe(tooLong);
+  });
+
   it("creates a tag for the open item and persists multi-tag assignment", async () => {
     const initial = list();
     const api = backend(initial);

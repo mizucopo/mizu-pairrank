@@ -28,6 +28,8 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+const TAG_NAME_MAX_LENGTH: usize = 30;
+
 #[derive(Debug)]
 pub struct ImageChange<T> {
     pub value: T,
@@ -194,7 +196,7 @@ impl Database {
         name: String,
         item_id: Option<i64>,
     ) -> Result<ListState, String> {
-        let name = validated_name(name)?;
+        let name = validated_tag_name(name)?;
         self.mutate_list(list_id, |transaction| {
             if let Some(item_id) = item_id {
                 ensure_active_item(transaction, list_id, item_id)?;
@@ -224,7 +226,7 @@ impl Database {
         tag_id: i64,
         name: String,
     ) -> Result<ListState, String> {
-        let name = validated_name(name)?;
+        let name = validated_tag_name(name)?;
         self.mutate_list(list_id, |transaction| {
             ensure_tag_in_list(transaction, list_id, tag_id)?;
             ensure_available_tag_name(transaction, list_id, Some(tag_id), &name)?;
@@ -636,6 +638,17 @@ fn validated_name(name: String) -> Result<String, String> {
     let name = name.trim().to_owned();
     if name.is_empty() {
         Err("名前を入力してください。".to_owned())
+    } else {
+        Ok(name)
+    }
+}
+
+fn validated_tag_name(name: String) -> Result<String, String> {
+    let name = validated_name(name)?;
+    if name.chars().count() > TAG_NAME_MAX_LENGTH {
+        Err(format!(
+            "タグ名は{TAG_NAME_MAX_LENGTH}文字以内にしてください。"
+        ))
     } else {
         Ok(name)
     }
@@ -2129,6 +2142,54 @@ mod tests {
             0
         );
         assert_eq!(deleted.tags.len(), 1);
+    }
+
+    #[test]
+    fn tag_names_are_limited_to_30_unicode_characters_after_trimming() {
+        let mut database = memory_database();
+        let list = database.create_list("Tags".into()).unwrap();
+        let valid_name = format!("{}😀", "あ".repeat(29));
+        let too_long = format!("{}😀", "あ".repeat(30));
+        let state = database
+            .create_tag(list.id, format!(" {valid_name} "), None)
+            .unwrap();
+        let tag_id = state.tags[0].id;
+        assert_eq!(state.tags[0].name, valid_name);
+        assert_eq!(
+            database
+                .create_tag(list.id, too_long.clone(), None)
+                .unwrap_err(),
+            "タグ名は30文字以内にしてください。"
+        );
+        assert_eq!(
+            database.rename_tag(list.id, tag_id, too_long).unwrap_err(),
+            "タグ名は30文字以内にしてください。"
+        );
+        assert_eq!(database.get_list(list.id).unwrap().tags[0].name, valid_name);
+        let renamed = format!("{}😀", "い".repeat(29));
+        let state = database
+            .rename_tag(list.id, tag_id, format!(" {renamed} "))
+            .unwrap();
+        assert_eq!(state.tags[0].name, renamed);
+    }
+
+    #[test]
+    fn existing_long_tag_names_remain_readable_and_deletable() {
+        let mut database = memory_database();
+        let list = database.create_list("Tags".into()).unwrap();
+        let old_name = format!("https://example.com/{}", "long-segment".repeat(8));
+        database
+            .connection
+            .execute(
+                "INSERT INTO tags (list_id, name) VALUES (?1, ?2)",
+                params![list.id, old_name],
+            )
+            .unwrap();
+        let state = database.get_list(list.id).unwrap();
+        assert_eq!(state.tags[0].name, old_name);
+
+        let state = database.delete_tag(list.id, state.tags[0].id).unwrap();
+        assert!(state.tags.is_empty());
     }
 
     #[test]

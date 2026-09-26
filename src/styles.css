@@ -827,6 +827,12 @@ dialog::backdrop {
   flex-wrap: wrap;
   align-items: center;
   gap: 5px;
+  min-width: 0;
+}
+.tag-delete-confirm span {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .tag-form {
   margin-top: 20px;
