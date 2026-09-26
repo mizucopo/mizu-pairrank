@@ -284,6 +284,9 @@ export function mountApp(
       case "create-list":
         void openModal({ kind: "create-list" }, button);
         break;
+      case "duplicate-list":
+        void controller.duplicateList();
+        break;
       case "rename-list":
         void openModal({ kind: "rename-list" }, button);
         break;

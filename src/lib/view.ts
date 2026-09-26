@@ -47,7 +47,7 @@ function listHeader(s: AppState): string {
     { view: "ranking", label: "ランキング" },
     { view: "tier", label: "Tier 表" },
   ];
-  return `<header class="page-header"><div><p class="eyebrow">MY RANKING</p><h1>${e(list.name)}</h1><p class="muted">${list.items.length} 項目 · ${list.comparisonCount} 回の比較</p></div><div class="header-actions"><button class="text-button" data-action="rename-list"${disabled(s)}>名前を変更</button><button class="text-button danger-text" data-action="delete-list"${disabled(s)}>削除</button></div></header><nav class="tabs" aria-label="表示切り替え">${tabs.map(({ view, label }) => `<button data-view="${view}" class="${s.view === view ? "active" : ""}" ${s.view === view ? 'aria-current="page"' : ""}${disabled(s)} ${view === "compare" && list.items.length < 2 ? "disabled" : ""}>${label}</button>`).join("")}</nav>`;
+  return `<header class="page-header"><div><p class="eyebrow">MY RANKING</p><h1>${e(list.name)}</h1><p class="muted">${list.items.length} 項目 · ${list.comparisonCount} 回の比較</p></div><div class="header-actions"><button class="text-button" data-action="duplicate-list"${disabled(s)}>複製</button><button class="text-button" data-action="rename-list"${disabled(s)}>名前を変更</button><button class="text-button danger-text" data-action="delete-list"${disabled(s)}>削除</button></div></header><nav class="tabs" aria-label="表示切り替え">${tabs.map(({ view, label }) => `<button data-view="${view}" class="${s.view === view ? "active" : ""}" ${s.view === view ? 'aria-current="page"' : ""}${disabled(s)} ${view === "compare" && list.items.length < 2 ? "disabled" : ""}>${label}</button>`).join("")}</nav>`;
 }
 function itemsView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;

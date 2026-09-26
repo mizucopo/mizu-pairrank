@@ -65,6 +65,7 @@ function backend(first = list(), second = list(2)) {
       .fn<AppApi["getList"]>()
       .mockImplementation(async (id) => (id === first.id ? first : second)),
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(first),
+    duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(first),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(first),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(first),

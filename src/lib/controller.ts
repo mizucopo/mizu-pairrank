@@ -545,6 +545,32 @@ export class AppController {
     }
   }
 
+  async duplicateList(): Promise<void> {
+    const list = this.state.active;
+    if (!list) return;
+    let copiedId: number | null = null;
+    this.cancelRead("settings");
+    await this.perform(async () => {
+      const copy = await this.api
+        .duplicateList(list.id)
+        .catch((error: unknown) => this.handleListError(list.id, error));
+      copiedId = copy.id;
+      this.state.modal = null;
+      this.state.drafts.name = "";
+      this.state.drafts.items = "";
+      this.state.drafts.query = "";
+      this.state.tagDraft = "";
+      this.state.tagEditingId = null;
+      this.state.tagDeletingId = null;
+      this.state.candidates = [];
+      this.state.searched = false;
+      this.state.view = "items";
+      await this.acceptList(copy);
+    });
+    if (this.state.active?.id === copiedId && this.state.view === "items")
+      void this.refreshBulkSettings();
+  }
+
   async saveName(): Promise<void> {
     const modal = this.state.modal;
     const list = this.state.active;

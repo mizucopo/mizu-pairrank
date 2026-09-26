@@ -226,6 +226,10 @@ async fn create_list(app: AppHandle, name: String) -> Result<ListState, String> 
     database_job(app, move |db| db.create_list(name)).await
 }
 #[tauri::command]
+async fn duplicate_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
+    database_job(app, move |db| db.duplicate_list(list_id)).await
+}
+#[tauri::command]
 async fn rename_list(app: AppHandle, list_id: i64, name: String) -> Result<ListState, String> {
     database_job(app, move |db| db.rename_list(list_id, name)).await
 }
@@ -486,6 +490,7 @@ pub fn run() {
             list_summaries,
             get_list,
             create_list,
+            duplicate_list,
             rename_list,
             delete_list,
             add_items,
@@ -1329,6 +1334,29 @@ mod tests {
                 .unwrap();
             assert!(!image_path.exists(), "{removed_form} -> {retained_form}");
         }
+    }
+
+    #[tokio::test]
+    async fn duplicated_list_keeps_image_until_its_last_reference_is_deleted() {
+        let (directory, backend) = backend();
+        let (source_id, _, image) = list_with_image(&backend).await;
+        let path = directory.path().join("images").join(&image.path);
+        let copy = backend
+            .database_job(move |db| db.duplicate_list(source_id))
+            .await
+            .unwrap();
+        assert_eq!(copy.items[0].image.as_ref().unwrap().path, image.path);
+
+        backend
+            .change_images(None, move |db, _| db.delete_list(source_id))
+            .await
+            .unwrap();
+        assert!(path.is_file());
+        backend
+            .change_images(None, move |db, _| db.delete_list(copy.id))
+            .await
+            .unwrap();
+        assert!(!path.exists());
     }
 
     #[tokio::test]

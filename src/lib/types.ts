@@ -53,6 +53,7 @@ export type AppApi = {
   listSummaries: () => Promise<ListSummary[]>;
   getList: (listId: number) => Promise<ListState>;
   createList: (name: string) => Promise<ListState>;
+  duplicateList: (listId: number) => Promise<ListState>;
   renameList: (listId: number, name: string) => Promise<ListState>;
   deleteList: (listId: number) => Promise<void>;
   addItems: (listId: number, names: string[]) => Promise<ListState>;
