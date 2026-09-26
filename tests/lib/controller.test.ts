@@ -21,7 +21,9 @@ function list(id = 1): ListState {
       image: null,
       rating: { mu: 25, sigma: 25 / 3 },
       comparisonCount: 0,
+      tagIds: [],
     })),
+    tags: [],
     comparisonCount: 0,
     convergence: {
       converged: false,
@@ -68,6 +70,10 @@ function backend(first = list(), second = list(2)) {
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(first),
     renameItem: vi.fn<AppApi["renameItem"]>().mockResolvedValue(first),
     deleteItem: vi.fn<AppApi["deleteItem"]>().mockResolvedValue(first),
+    createTag: vi.fn<AppApi["createTag"]>().mockResolvedValue(first),
+    renameTag: vi.fn<AppApi["renameTag"]>().mockResolvedValue(first),
+    deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(first),
+    setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(first),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(first),
     nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(proposal(first)),
     answer: vi.fn<AppApi["answer"]>().mockResolvedValue(first),
@@ -112,6 +118,198 @@ async function listSelection(context: "startup" | "after deletion") {
   const load = () => (context === "startup" ? controller.initialize() : controller.confirmDelete());
   return { api, controller, load };
 }
+
+describe("tag management", () => {
+  it("creates a tag for the open item and persists multi-tag assignment", async () => {
+    const initial = list();
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "tags", itemId: 11 });
+    controller.state.tagDraft = " 好き ";
+    const created: ListState = {
+      ...initial,
+      tags: [
+        { id: 1, listId: 1, name: "好き" },
+        { id: 2, listId: 1, name: "果物" },
+      ],
+      items: initial.items.map((item) => (item.id === 11 ? { ...item, tagIds: [1] } : item)),
+    };
+    api.createTag.mockResolvedValueOnce(created);
+    await controller.saveTag();
+    expect(api.createTag).toHaveBeenCalledExactlyOnceWith(1, "好き", 11);
+    expect(controller.state.modal).toEqual({ kind: "tags", itemId: 11 });
+    const assigned: ListState = {
+      ...created,
+      items: created.items.map((item) => (item.id === 11 ? { ...item, tagIds: [1, 2] } : item)),
+    };
+    api.setItemTag.mockResolvedValueOnce(assigned);
+    await controller.toggleItemTag(2, true);
+    expect(api.setItemTag).toHaveBeenCalledExactlyOnceWith(1, 11, 2, true);
+    expect(controller.state.active).toEqual(assigned);
+  });
+
+  it.each([undefined, 11])(
+    "reloads tags after another instance creates the same name (itemId=%s)",
+    async (itemId) => {
+      const initial = list();
+      const refreshed = {
+        ...initial,
+        tags: [{ id: 3, listId: 1, name: "好き" }],
+      };
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      const modal =
+        itemId === undefined ? ({ kind: "tags" } as const) : ({ kind: "tags", itemId } as const);
+      await controller.openModal(modal);
+      controller.state.tagDraft = "好き";
+      api.createTag.mockRejectedValueOnce(new Error("同じ名前のタグが既にあります。"));
+      api.getList.mockResolvedValueOnce(refreshed);
+
+      await controller.saveTag();
+
+      expect(api.getList).toHaveBeenCalledTimes(2);
+      expect(controller.state.active).toEqual(refreshed);
+      expect(controller.state.modal).toEqual(modal);
+      expect(controller.state.tagDraft).toBe("好き");
+      expect(controller.state.error).toBe("同じ名前のタグが既にあります。");
+    },
+  );
+
+  it("reloads a concurrently deleted tag and clears the editor after a rename error", async () => {
+    const initial = {
+      ...list(),
+      tags: [{ id: 3, listId: 1, name: "以前" }],
+    };
+    const refreshed = { ...initial, tags: [] };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(3);
+    await controller.openModal({ kind: "tags" });
+    controller.editTag(3);
+    controller.state.tagDraft = "新しい";
+    api.renameTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+    api.getList.mockResolvedValueOnce(refreshed);
+
+    await controller.saveTag();
+
+    expect(api.getList).toHaveBeenCalledTimes(2);
+    expect(controller.state.active).toEqual(refreshed);
+    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.tagEditingId).toBeNull();
+    expect(controller.state.tagDraft).toBe("");
+    expect(controller.state.error).toBe("タグが見つかりません。");
+  });
+
+  it("reloads a concurrently deleted tag after deletion or assignment fails", async () => {
+    for (const action of ["delete", "assignment"] as const) {
+      const initial = {
+        ...list(),
+        tags: [{ id: 3, listId: 1, name: "以前" }],
+      };
+      const refreshed = { ...initial, tags: [] };
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.openModal({ kind: "tags", itemId: 11 });
+      api.getList.mockResolvedValueOnce(refreshed);
+      if (action === "delete") {
+        controller.deleteTagPrompt(3);
+        api.deleteTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+        await controller.confirmTagDelete();
+      } else {
+        api.setItemTag.mockRejectedValueOnce(new Error("タグが見つかりません。"));
+        await controller.toggleItemTag(3, true);
+      }
+      expect(controller.state.active).toEqual(refreshed);
+      expect(controller.state.tagDeletingId).toBeNull();
+      expect(controller.state.error).toBe("タグが見つかりません。");
+    }
+  });
+
+  it("closes an item tag editor when a successful tag change returns without that item", async () => {
+    const initial = {
+      ...list(),
+      tags: [{ id: 3, listId: 1, name: "以前" }],
+    };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "tags", itemId: 11 });
+    controller.editTag(3);
+    controller.state.tagDraft = "新しい";
+    api.renameTag.mockResolvedValueOnce({
+      ...initial,
+      tags: [{ ...initial.tags[0]!, name: "新しい" }],
+      items: initial.items.filter((item) => item.id !== 11),
+    });
+
+    await controller.saveTag();
+
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.tagEditingId).toBeNull();
+    expect(controller.state.error).toBe("");
+  });
+
+  it("renames and deletes tags while resetting a deleted ranking filter", async () => {
+    const initial: ListState = {
+      ...list(),
+      tags: [{ id: 3, listId: 1, name: "以前" }],
+      items: list().items.map((item) => ({ ...item, tagIds: [3] })),
+    };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(3);
+    await controller.openModal({ kind: "tags" });
+    controller.editTag(3);
+    controller.state.tagDraft = "新しい";
+    const renamed = { ...initial, tags: [{ ...initial.tags[0]!, name: "新しい" }] };
+    api.renameTag.mockResolvedValueOnce(renamed);
+    await controller.saveTag();
+    expect(api.renameTag).toHaveBeenCalledExactlyOnceWith(1, 3, "新しい");
+    expect(controller.state.selectedTagId).toBe(3);
+    controller.deleteTagPrompt(3);
+    const deleted = {
+      ...renamed,
+      tags: [],
+      items: renamed.items.map((item) => ({ ...item, tagIds: [] })),
+    };
+    api.deleteTag.mockResolvedValueOnce(deleted);
+    await controller.confirmTagDelete();
+    expect(api.deleteTag).toHaveBeenCalledExactlyOnceWith(1, 3);
+    expect(controller.state.selectedTagId).toBeNull();
+  });
+
+  it("resets the selected tag when switching lists", async () => {
+    const first = { ...list(), tags: [{ id: 3, listId: 1, name: "好き" }] };
+    const second = { ...list(2), tags: [{ id: 4, listId: 2, name: "好き" }] };
+    const api = backend(first, second);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(3);
+    await controller.selectList(2);
+    expect(controller.state.selectedTagId).toBeNull();
+    controller.selectTag(3);
+    expect(controller.state.selectedTagId).toBeNull();
+  });
+
+  it("clears the selected tag when deleting the current list and loading another", async () => {
+    const first = { ...list(), tags: [{ id: 3, listId: 1, name: "好き" }] };
+    const second = { ...list(2), tags: [{ id: 3, listId: 2, name: "別のタグ" }] };
+    const api = backend(first, second);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(3);
+    await controller.openModal({ kind: "delete-list" });
+    api.listSummaries.mockResolvedValueOnce([summary(second)]);
+    await controller.confirmDelete();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.selectedTagId).toBeNull();
+  });
+});
 
 const mutationMethods = [
   "renameList",

@@ -101,6 +101,10 @@ export function mountApp(
         row.scrollLeft,
       ]),
     );
+    const tagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+    const tagScroll = { top: tagEditor?.scrollTop ?? 0, left: tagEditor?.scrollLeft ?? 0 };
+    const tagModal = renderedModal;
+    const tagListId = renderedListId;
     const focus = document.activeElement;
     if (!pendingButtonFocus && focus instanceof HTMLButtonElement && root.contains(focus)) {
       pendingButtonFocus = rememberButton(focus);
@@ -113,7 +117,9 @@ export function mountApp(
         listId: focusKey === "braveKey" || focusKey === "ollamaKey" ? null : renderedListId,
         dialog: Boolean(focus?.closest("dialog")),
         selection:
-          focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement
+          (focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement) &&
+          focus.selectionStart !== null &&
+          focus.selectionEnd !== null
             ? [focus.selectionStart, focus.selectionEnd]
             : null,
       };
@@ -180,10 +186,21 @@ export function mountApp(
     for (const row of root.querySelectorAll<HTMLElement>(".tier-items")) {
       row.scrollLeft = tierScroll.get(row.dataset.focus) ?? 0;
     }
+    if (tagEditor && renderedModal === tagModal && renderedListId === tagListId) {
+      const renderedTagEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      if (renderedTagEditor) {
+        renderedTagEditor.scrollTop = tagScroll.top;
+        renderedTagEditor.scrollLeft = tagScroll.left;
+      }
+    }
   }
   root.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+    if (target instanceof HTMLInputElement && target.hasAttribute("data-tag-draft")) {
+      controller.state.tagDraft = target.value;
+      return;
+    }
     const field = target.dataset.draft;
     if (draftField(field)) controller.state.drafts[field] = target.value;
   });
@@ -199,6 +216,10 @@ export function mountApp(
       controller.state.bulkProvider =
         target.value === "brave" || target.value === "ollama" ? target.value : null;
       render();
+    } else if (target instanceof HTMLSelectElement && target.id === "ranking-tag") {
+      controller.selectTag(target.value === "" ? null : Number(target.value));
+    } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
+      void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     }
   });
   root.addEventListener("submit", (event) => {
@@ -217,6 +238,9 @@ export function mountApp(
         break;
       case "save-name":
         void controller.saveName();
+        break;
+      case "save-tag":
+        void controller.saveTag();
         break;
       case "search-images":
         void controller.searchImages();
@@ -274,6 +298,49 @@ export function mountApp(
         break;
       case "image":
         void openModal({ kind: "image", itemId: id }, button);
+        break;
+      case "tags":
+        void openModal({ kind: "tags", itemId: id }, button);
+        break;
+      case "manage-tags":
+        void openModal({ kind: "tags" }, button);
+        break;
+      case "edit-tag":
+        controller.editTag(id);
+        if (controller.state.tagEditingId === id) {
+          root.querySelector<HTMLInputElement>("#tag-name")?.focus({ preventScroll: true });
+        }
+        break;
+      case "cancel-tag-edit": {
+        const tagId = controller.state.tagEditingId;
+        controller.editTag(null);
+        if (tagId !== null) {
+          root
+            .querySelector<HTMLButtonElement>(`[data-action="edit-tag"][data-id="${tagId}"]`)
+            ?.focus({ preventScroll: true });
+        }
+        break;
+      }
+      case "delete-tag":
+        controller.deleteTagPrompt(id);
+        if (controller.state.tagDeletingId === id) {
+          root
+            .querySelector<HTMLButtonElement>('[data-action="confirm-tag-delete"]')
+            ?.focus({ preventScroll: true });
+        }
+        break;
+      case "cancel-tag-delete": {
+        const tagId = controller.state.tagDeletingId;
+        controller.deleteTagPrompt(null);
+        if (tagId !== null) {
+          root
+            .querySelector<HTMLButtonElement>(`[data-action="delete-tag"][data-id="${tagId}"]`)
+            ?.focus({ preventScroll: true });
+        }
+        break;
+      }
+      case "confirm-tag-delete":
+        void controller.confirmTagDelete();
         break;
       case "bulk-images":
         modalOpener = rememberButton(button);

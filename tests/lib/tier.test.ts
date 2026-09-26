@@ -7,6 +7,7 @@ function item(id: number, mu: number): Item {
   return {
     id,
     listId: 1,
+    tagIds: [],
     name: `項目${id}`,
     image: null,
     rating: { mu, sigma: 8 },

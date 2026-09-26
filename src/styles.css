@@ -420,6 +420,38 @@ small,
   color: var(--muted);
   font-size: 0.64rem;
 }
+.tag-management {
+  margin-top: 28px;
+}
+.tag-summary,
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+.tag-chip {
+  display: inline-block;
+  border-radius: 12px;
+  background: #eaf0e4;
+  color: var(--ink);
+  padding: 3px 9px;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+.tag-chip small {
+  color: var(--muted);
+}
+.ranking-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 0.8rem;
+}
+.ranking-filter select {
+  width: min(100%, 260px);
+}
 .item-actions {
   display: flex;
   align-items: center;
@@ -832,6 +864,46 @@ dialog::backdrop {
   align-items: center;
   margin-top: 18px;
 }
+.tag-editor-list {
+  max-height: 42vh;
+  overflow-y: auto;
+  margin: 14px 0;
+}
+.tag-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.tag-assignment {
+  display: flex;
+  align-items: center;
+}
+.tag-assignment input {
+  width: auto;
+}
+.tag-editor-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tag-editor-name small {
+  color: var(--muted);
+}
+.tag-editor-actions,
+.tag-delete-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.tag-form {
+  margin-top: 20px;
+}
+.tag-form input {
+  margin-top: 6px;
+}
 .image-options {
   display: flex;
   gap: 8px;
@@ -1006,6 +1078,11 @@ dialog::backdrop {
   }
   .item-actions {
     gap: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .tag-editor-row {
+    flex-wrap: wrap;
   }
   .header-actions {
     flex-direction: column;

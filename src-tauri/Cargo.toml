@@ -17,7 +17,7 @@ tauri = { version = "2.11.3", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 puruspe = "0.4.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
@@ -40,5 +40,5 @@ rustix = { version = "1.1", features = ["fs"] }
 windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
 
 [dev-dependencies]
-rusqlite = { version = "0.39", features = ["trace"] }
+rusqlite = { version = "0.40", features = ["trace"] }
 tempfile = "3"

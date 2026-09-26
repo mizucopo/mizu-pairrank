@@ -3,6 +3,7 @@ export type SearchProvider = "brave" | "ollama";
 export type AutoRegisterOutcome = "registered" | "skipped" | "unavailable";
 export type Rating = { mu: number; sigma: number };
 export type ImageAsset = { path: string; sourceUrl: string | null };
+export type Tag = { id: number; listId: number; name: string };
 export type Item = {
   id: number;
   listId: number;
@@ -10,6 +11,7 @@ export type Item = {
   image: ImageAsset | null;
   rating: Rating;
   comparisonCount: number;
+  tagIds: number[];
 };
 export type Convergence = {
   converged: boolean;
@@ -30,6 +32,7 @@ export type ListState = {
   name: string;
   revision: number;
   items: Item[];
+  tags: Tag[];
   comparisonCount: number;
   convergence: Convergence;
 };
@@ -55,6 +58,15 @@ export type AppApi = {
   addItems: (listId: number, names: string[]) => Promise<ListState>;
   renameItem: (listId: number, itemId: number, name: string) => Promise<ListState>;
   deleteItem: (listId: number, itemId: number) => Promise<ListState>;
+  createTag: (listId: number, name: string, itemId?: number) => Promise<ListState>;
+  renameTag: (listId: number, tagId: number, name: string) => Promise<ListState>;
+  deleteTag: (listId: number, tagId: number) => Promise<ListState>;
+  setItemTag: (
+    listId: number,
+    itemId: number,
+    tagId: number,
+    assigned: boolean,
+  ) => Promise<ListState>;
   resumeList: (listId: number) => Promise<ListState>;
   nextPair: (listId: number) => Promise<PairProposal | null>;
   answer: (pair: PairProposal, preference: Preference) => Promise<ListState>;

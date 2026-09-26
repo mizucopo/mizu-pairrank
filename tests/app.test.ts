@@ -22,13 +22,15 @@ function setup(
     image: null,
     rating: { mu: 25, sigma: 8 },
     comparisonCount: 0,
+    tagIds: [],
   };
-  const second = { ...first, id: 11, name: "みかん" };
+  const second = { ...first, id: 11, name: "みかん", tagIds: [] };
   const state: ListState = {
     id: 1,
     name: "好きな果物",
     revision: 5,
     items: [first, second],
+    tags: [],
     comparisonCount: 0,
     convergence: {
       converged: false,
@@ -60,6 +62,10 @@ function setup(
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(state),
     renameItem: vi.fn<AppApi["renameItem"]>().mockResolvedValue(state),
     deleteItem: vi.fn<AppApi["deleteItem"]>().mockResolvedValue(state),
+    createTag: vi.fn<AppApi["createTag"]>().mockResolvedValue(state),
+    renameTag: vi.fn<AppApi["renameTag"]>().mockResolvedValue(state),
+    deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(state),
+    setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(state),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(state),
     nextPair,
     answer: vi.fn<AppApi["answer"]>().mockImplementation(async () => {
@@ -1564,4 +1570,263 @@ describe("desktop app interaction", () => {
     expect(root.querySelector('[role="alert"]')?.textContent).toBe(text);
     expect(root.querySelector("script, img, [onerror]")).toBeNull();
   });
+
+  it("filters the ranking in saved order, renumbers it, and escapes tag names", async () => {
+    const { root, controller, state } = setup();
+    const hostile = `<img src=x onerror="alert(1)">&`;
+    state.tags = [
+      { id: 3, listId: 1, name: hostile },
+      { id: 4, listId: 1, name: "全件" },
+      { id: 5, listId: 1, name: "空" },
+    ];
+    state.items[0]!.tagIds = [3, 4];
+    state.items[1]!.tagIds = [4];
+    await controller.initialize();
+    await controller.navigate("ranking");
+    const select = root.querySelector<HTMLSelectElement>("#ranking-tag");
+    if (!select) throw new Error("Missing ranking tag selector");
+    expect(select.options[1]?.textContent).toBe(hostile);
+    expect(root.querySelector(".ranking-filter img, [onerror]")).toBeNull();
+    select.value = "3";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    expect([...root.querySelectorAll(".rank-row h3")].map((node) => node.textContent)).toEqual([
+      "りんご",
+    ]);
+    expect(root.querySelector(".rank-number")?.textContent).toBe("1");
+    const emptySelect = root.querySelector<HTMLSelectElement>("#ranking-tag");
+    if (!emptySelect) throw new Error("Missing ranking tag selector");
+    emptySelect.value = "5";
+    emptySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(root.textContent).toContain("このタグが付いた項目はありません。");
+    expect(root.textContent).toContain("リスト全体で行います");
+    const allSelect = root.querySelector<HTMLSelectElement>("#ranking-tag");
+    if (!allSelect) throw new Error("Missing ranking tag selector");
+    allSelect.value = "";
+    allSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect([...root.querySelectorAll(".rank-row h3")].map((node) => node.textContent)).toEqual([
+      "りんご",
+      "みかん",
+    ]);
+    expect([...root.querySelectorAll(".rank-number")].map((node) => node.textContent)).toEqual([
+      "1",
+      "2",
+    ]);
+  });
+
+  it("creates from item tags, changes assignment, and manages rename and deletion from the items screen", async () => {
+    const { root, controller, api, state } = setup();
+    api.createTag.mockImplementation(async (_listId, name, itemId) => {
+      const id = state.tags.length + 1;
+      state.tags.push({ id, listId: 1, name });
+      if (itemId !== undefined) state.items.find((item) => item.id === itemId)?.tagIds.push(id);
+      return state;
+    });
+    api.renameTag.mockImplementation(async (_listId, tagId, name) => {
+      state.tags.find((tag) => tag.id === tagId)!.name = name;
+      return state;
+    });
+    api.deleteTag.mockImplementation(async (_listId, tagId) => {
+      state.tags = state.tags.filter((tag) => tag.id !== tagId);
+      state.items.forEach((item) => {
+        item.tagIds = item.tagIds.filter((id) => id !== tagId);
+      });
+      return state;
+    });
+    api.setItemTag.mockImplementation(async (_listId, itemId, tagId, assigned) => {
+      const item = state.items.find((entry) => entry.id === itemId)!;
+      item.tagIds = assigned
+        ? [...new Set([...item.tagIds, tagId])]
+        : item.tagIds.filter((id) => id !== tagId);
+      return state;
+    });
+    await controller.initialize();
+    const opener = button(root, '[data-action="tags"][data-id="10"]');
+    opener.focus();
+    await click(root, controller, '[data-action="tags"][data-id="10"]');
+    const name = root.querySelector<HTMLInputElement>("#tag-name");
+    if (!name) throw new Error("Missing tag name field");
+    name.value = "甘い";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    root
+      .querySelector<HTMLFormElement>('[data-form="save-tag"]')
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle(controller);
+    expect(api.createTag).toHaveBeenCalledExactlyOnceWith(1, "甘い", 10);
+    expect(root.querySelector<HTMLInputElement>('[data-tag-id="1"]')?.checked).toBe(true);
+    await click(root, controller, '[data-action="edit-tag"][data-id="1"]');
+    expect(root.querySelector<HTMLInputElement>("#tag-name")?.value).toBe("甘い");
+    await click(root, controller, '[data-action="cancel-tag-edit"]');
+    await click(root, controller, '[data-action="delete-tag"][data-id="1"]');
+    expect(root.querySelector('[data-action="confirm-tag-delete"]')).not.toBeNull();
+    await click(root, controller, '[data-action="cancel-tag-delete"]');
+    const checkbox = root.querySelector<HTMLInputElement>('[data-tag-id="1"]');
+    if (!checkbox) throw new Error("Missing tag checkbox");
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle(controller);
+    expect(api.setItemTag).toHaveBeenCalledExactlyOnceWith(1, 10, 1, false);
+    await click(root, controller, '[data-action="close-modal"]');
+    expect(document.activeElement).toBe(button(root, '[data-action="tags"][data-id="10"]'));
+    expect(root.querySelector(".tag-summary")?.textContent).toContain("甘い 0 件");
+    await click(root, controller, '[data-action="manage-tags"]');
+    await click(root, controller, '[data-action="edit-tag"][data-id="1"]');
+    const rename = root.querySelector<HTMLInputElement>("#tag-name");
+    if (!rename) throw new Error("Missing rename field");
+    rename.value = "赤い";
+    rename.dispatchEvent(new Event("input", { bubbles: true }));
+    root
+      .querySelector<HTMLFormElement>('[data-form="save-tag"]')
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle(controller);
+    expect(api.renameTag).toHaveBeenCalledExactlyOnceWith(1, 1, "赤い");
+    await click(root, controller, '[data-action="delete-tag"][data-id="1"]');
+    expect(api.deleteTag).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("項目からも外れます");
+    await click(root, controller, '[data-action="confirm-tag-delete"]');
+    expect(api.deleteTag).toHaveBeenCalledExactlyOnceWith(1, 1);
+    expect(root.textContent).toContain("タグはまだありません。");
+  });
+
+  it.each(["item", "management"] as const)(
+    "focuses the %s tag deletion confirmation and returns focus on cancellation",
+    async (entry) => {
+      const { root, controller, state } = setup();
+      state.tags = [{ id: 1, listId: 1, name: "甘い" }];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      const deleteButton = button(root, '[data-action="delete-tag"][data-id="1"]');
+      deleteButton.focus();
+      deleteButton.click();
+      expect(document.activeElement).toBe(button(root, '[data-action="confirm-tag-delete"]'));
+      button(root, '[data-action="cancel-tag-delete"]').click();
+      expect(document.activeElement).toBe(button(root, '[data-action="delete-tag"][data-id="1"]'));
+    },
+  );
+
+  it.each(["item", "management"] as const)(
+    "focuses the %s tag rename field and returns to its rename button on cancellation",
+    async (entry) => {
+      const { root, controller, api, state } = setup();
+      state.tags = [{ id: 1, listId: 1, name: "甘い" }];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      const editor = root.querySelector<HTMLElement>(".tag-editor-list");
+      if (!editor) throw new Error("Missing tag editor");
+      editor.scrollTop = 300;
+      const renameButton = button(root, '[data-action="edit-tag"][data-id="1"]');
+      renameButton.focus({ preventScroll: true });
+      renameButton.click();
+      expect(document.activeElement).toBe(root.querySelector("#tag-name"));
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.scrollTop).toBe(300);
+      button(root, '[data-action="cancel-tag-edit"]').click();
+      expect(document.activeElement).toBe(button(root, '[data-action="edit-tag"][data-id="1"]'));
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.scrollTop).toBe(300);
+      expect(api.renameTag).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["item", "management"] as const)(
+    "names each %s tag action for its own tag",
+    async (entry) => {
+      const { root, controller, state } = setup();
+      const hostileName = '<赤い "タグ" &>';
+      state.tags = [
+        { id: 1, listId: 1, name: "甘い" },
+        { id: 2, listId: 1, name: hostileName },
+      ];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      for (const [id, name] of [
+        [1, "甘い"],
+        [2, hostileName],
+      ] as const) {
+        const rename = button(root, `[data-action="edit-tag"][data-id="${id}"]`);
+        const remove = button(root, `[data-action="delete-tag"][data-id="${id}"]`);
+        expect(rename.getAttribute("aria-label")).toBe(`${name} の名前を変更`);
+        expect(remove.getAttribute("aria-label")).toBe(`${name} を削除`);
+        expect(rename.textContent).toBe("名前");
+        expect(remove.textContent).toBe("削除");
+      }
+      expect(root.querySelector(".tag-editor-list img, .tag-editor-list [onerror]")).toBeNull();
+    },
+  );
+
+  it.each(["scrollTop", "scrollLeft"] as const)(
+    "preserves tag editor %s through assignment, editing, and deletion prompts",
+    async (axis) => {
+      const { root, controller, api, state } = setup();
+      state.tags = Array.from({ length: 20 }, (_, index) => ({
+        id: index + 1,
+        listId: 1,
+        name: `タグ ${index + 1}`,
+      }));
+      await controller.initialize();
+      await click(root, controller, '[data-action="tags"][data-id="10"]');
+      let finish: () => void = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      api.setItemTag.mockImplementationOnce(async () => {
+        await pending;
+        state.items[0]!.tagIds = [15];
+        return state;
+      });
+      const editor = root.querySelector<HTMLElement>(".tag-editor-list");
+      const checkbox = root.querySelector<HTMLInputElement>('[data-tag-id="15"]');
+      if (!editor || !checkbox) throw new Error("Missing tag editor");
+      editor[axis] = 500;
+      checkbox.focus({ preventScroll: true });
+      checkbox.checked = true;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(controller.state.busy).toBe(true);
+      const busyEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      expect(busyEditor).not.toBe(editor);
+      expect(busyEditor?.[axis]).toBe(500);
+      if (!busyEditor) throw new Error("Missing busy tag editor");
+      busyEditor[axis] = 650;
+      finish();
+      await settle(controller);
+      const completedEditor = root.querySelector<HTMLElement>(".tag-editor-list");
+      expect(completedEditor?.[axis]).toBe(650);
+      expect(document.activeElement).toBe(root.querySelector('[data-tag-id="15"]'));
+      await click(root, controller, '[data-action="edit-tag"][data-id="15"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      api.renameTag.mockImplementationOnce(async (_listId, tagId, name) => {
+        state.tags.find((tag) => tag.id === tagId)!.name = name;
+        return state;
+      });
+      const name = root.querySelector<HTMLInputElement>("#tag-name");
+      if (!name) throw new Error("Missing tag name field");
+      name.value = "変更したタグ";
+      name.dispatchEvent(new Event("input", { bubbles: true }));
+      root
+        .querySelector<HTMLFormElement>('[data-form="save-tag"]')
+        ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await settle(controller);
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      await click(root, controller, '[data-action="delete-tag"][data-id="16"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      await click(root, controller, '[data-action="cancel-tag-delete"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+      api.deleteTag.mockImplementationOnce(async (_listId, tagId) => {
+        state.tags = state.tags.filter((tag) => tag.id !== tagId);
+        return state;
+      });
+      await click(root, controller, '[data-action="delete-tag"][data-id="16"]');
+      await click(root, controller, '[data-action="confirm-tag-delete"]');
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
+    },
+  );
 });
