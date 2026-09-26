@@ -65,6 +65,8 @@ export const answers: { value: Preference; label: string; key: string }[] = [
   { value: "b_strong", label: "Bが大好き", key: "5" },
 ];
 
+export const tagNameMaxLength = 30;
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -460,6 +462,8 @@ export class AppController {
     }
     await this.perform(async () => {
       if (!name) throw new Error("タグ名を入力してください。");
+      if (Array.from(name).length > tagNameMaxLength)
+        throw new Error(`タグ名は${tagNameMaxLength}文字以内にしてください。`);
       let result: ListState;
       if (editingId === null) {
         result = await this.api.createTag(list.id, name, modal.itemId).catch((error: unknown) => {

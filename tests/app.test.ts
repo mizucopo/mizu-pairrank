@@ -1645,6 +1645,9 @@ describe("desktop app interaction", () => {
     await click(root, controller, '[data-action="tags"][data-id="10"]');
     const name = root.querySelector<HTMLInputElement>("#tag-name");
     if (!name) throw new Error("Missing tag name field");
+    const limit = root.querySelector<HTMLElement>("#tag-name-limit");
+    expect(name.getAttribute("aria-describedby")).toBe(limit?.id);
+    expect(limit?.textContent).toContain("30文字以内");
     name.value = "甘い";
     name.dispatchEvent(new Event("input", { bubbles: true }));
     root
@@ -1688,10 +1691,11 @@ describe("desktop app interaction", () => {
   });
 
   it.each(["item", "management"] as const)(
-    "focuses the %s tag deletion confirmation and returns focus on cancellation",
+    "keeps long existing tags in the %s deletion confirmation and returns focus on cancellation",
     async (entry) => {
       const { root, controller, state } = setup();
-      state.tags = [{ id: 1, listId: 1, name: "甘い" }];
+      const longTagName = `https://example.com/${"long-segment".repeat(8)}`;
+      state.tags = [{ id: 1, listId: 1, name: longTagName }];
       await controller.initialize();
       await click(
         root,
@@ -1701,6 +1705,7 @@ describe("desktop app interaction", () => {
       const deleteButton = button(root, '[data-action="delete-tag"][data-id="1"]');
       deleteButton.focus();
       deleteButton.click();
+      expect(root.querySelector(".tag-delete-confirm")?.textContent).toContain(longTagName);
       expect(document.activeElement).toBe(button(root, '[data-action="confirm-tag-delete"]'));
       button(root, '[data-action="cancel-tag-delete"]').click();
       expect(document.activeElement).toBe(button(root, '[data-action="delete-tag"][data-id="1"]'));

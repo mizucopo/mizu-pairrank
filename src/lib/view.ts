@@ -1,4 +1,4 @@
-import { answers } from "./controller.js";
+import { answers, tagNameMaxLength } from "./controller.js";
 import type { AppState, View } from "./controller.js";
 import { tierRows } from "./tier.js";
 import type { Item } from "./types.js";
@@ -194,7 +194,7 @@ function modalView(s: AppState): string {
             })
             .join("")
         : '<p class="muted">タグはまだありません。</p>'
-    }</div><form data-form="save-tag" class="tag-form"><label for="tag-name">${s.tagEditingId === null ? "新しいタグ名" : "タグ名を変更"}</label><input id="tag-name" data-tag-draft data-focus="tag-draft" value="${e(s.tagDraft)}" required${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>${s.tagEditingId === null ? "タグを追加" : "変更を保存"}</button>${s.tagEditingId !== null ? `<button type="button" class="secondary" data-action="cancel-tag-edit"${disabled(s)}>キャンセル</button>` : ""}</div></form>${modal.itemId === undefined ? "" : '<p class="muted small">ここで作成したタグは、この項目にも付きます。</p>'}`;
+    }</div><form data-form="save-tag" class="tag-form"><label for="tag-name">${s.tagEditingId === null ? "新しいタグ名" : "タグ名を変更"}</label><input id="tag-name" data-tag-draft data-focus="tag-draft" aria-describedby="tag-name-limit" value="${e(s.tagDraft)}" required${disabled(s)} /><p id="tag-name-limit" class="muted small">${tagNameMaxLength}文字以内</p><div class="form-actions"><button type="submit"${disabled(s)}>${s.tagEditingId === null ? "タグを追加" : "変更を保存"}</button>${s.tagEditingId !== null ? `<button type="button" class="secondary" data-action="cancel-tag-edit"${disabled(s)}>キャンセル</button>` : ""}</div></form>${modal.itemId === undefined ? "" : '<p class="muted small">ここで作成したタグは、この項目にも付きます。</p>'}`;
   } else if (modal.kind === "image") {
     title = `${item?.name ?? "項目"} の画像`;
     const configured =
