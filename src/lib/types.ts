@@ -1,5 +1,6 @@
 export type Preference = "a_strong" | "a_weak" | "equal" | "b_weak" | "b_strong";
 export type SearchProvider = "brave" | "ollama";
+export type AutoRegisterOutcome = "registered" | "skipped" | "unavailable";
 export type Rating = { mu: number; sigma: number };
 export type ImageAsset = { path: string; sourceUrl: string | null };
 export type Item = {
@@ -60,6 +61,11 @@ export type AppApi = {
   searchSettings: () => Promise<SearchSettings>;
   setApiKey: (provider: SearchProvider, key: string) => Promise<void>;
   searchImages: (provider: SearchProvider, query: string) => Promise<ImageCandidate[]>;
+  autoRegisterImage: (
+    listId: number,
+    itemId: number,
+    provider: SearchProvider,
+  ) => Promise<AutoRegisterOutcome>;
   setLocalImage: (listId: number, itemId: number) => Promise<ListState | null>;
   setRemoteImage: (listId: number, itemId: number, candidate: ImageCandidate) => Promise<ListState>;
   removeImage: (listId: number, itemId: number) => Promise<ListState>;

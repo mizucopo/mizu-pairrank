@@ -50,7 +50,24 @@ function listHeader(s: AppState): string {
 function itemsView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
-  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><h2>登録した項目 <span class="count">${list.items.length}</span></h2>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div>${
+  const missing = list.items.filter((item) => !item.image).length;
+  const providers = (["brave", "ollama"] as const).filter(
+    (provider) =>
+      (provider === "brave" ? s.bulkSettings?.braveConfigured : s.bulkSettings?.ollamaConfigured) &&
+      s.bulkSettings?.errors?.[provider] === undefined,
+  );
+  const bulkDisabled = s.busy || !missing || !providers.length || s.bulkSettingsLoading;
+  let bulkHelp = "";
+  if (s.bulkSettingsLoading) {
+    bulkHelp = "検索設定を確認しています…";
+  } else if (!s.bulkSettings) {
+    bulkHelp =
+      '検索設定を確認できませんでした。<button class="text-button" data-action="refresh-bulk-settings">再確認</button>';
+  } else if (!providers.length) {
+    bulkHelp =
+      '一括登録には検索設定が必要です。<button class="text-button" data-view="settings">検索設定を開く</button>';
+  }
+  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件${bulkHelp ? ` · ${bulkHelp}` : ""}</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div>${
     list.items.length === 0
       ? '<div class="empty compact"><span class="empty-symbol">＋</span><h3>最初の2項目を追加しましょう</h3><p>どちらが好きかを答えると、少しずつ順位が見えてきます。</p></div>'
       : `<div class="item-list">${[...list.items]
@@ -118,7 +135,25 @@ function modalView(s: AppState): string {
     "itemId" in modal ? s.active?.items.find((entry) => entry.id === modal.itemId) : null;
   let title: string;
   let body: string;
-  if (modal.kind === "image") {
+  if (modal.kind === "bulk-image") {
+    title = "未登録画像を一括登録";
+    const run = s.bulkRun;
+    const providers = (["brave", "ollama"] as const).filter(
+      (provider) =>
+        (provider === "brave"
+          ? s.bulkSettings?.braveConfigured
+          : s.bulkSettings?.ollamaConfigured) && s.bulkSettings?.errors?.[provider] === undefined,
+    );
+    const missing = s.active?.items.filter((entry) => !entry.image).length ?? 0;
+    const providerChoice =
+      providers.length > 1
+        ? `<label for="bulk-provider">検索元</label><select id="bulk-provider" data-focus="bulk-provider"${run ? " disabled" : ""}><option value=""${s.bulkProvider ? "" : " selected"}>選択してください</option>${providers.map((provider) => `<option value="${provider}"${s.bulkProvider === provider ? " selected" : ""}>${provider === "brave" ? "Brave" : "Ollama"}</option>`).join("")}</select>`
+        : `<p>検索元: ${providers[0] === "ollama" ? "Ollama" : "Brave"}</p>`;
+    const summary = run
+      ? `<div class="bulk-progress" role="status"><p>${run.done} / ${run.total} 件を処理 · 登録 ${run.registered} 件 · 見送り ${run.skipped} 件</p><progress max="${run.total}" value="${run.done}" aria-label="画像登録の進捗"></progress>${run.running ? `<p class="muted">${run.stopping ? "現在の項目が終わり次第停止します…" : "画像を検索して登録しています…"}</p>` : `<p>${run.stopped ? "停止しました。" : s.error ? "途中で停止しました。" : "一括処理が完了しました。"}</p>`}</div>`
+      : "";
+    body = `<p>開いているリストの画像未登録 ${run?.total ?? missing} 件を処理します。各サービスの料金・利用制限が適用されます。</p>${run ? "" : providerChoice}${summary}<div class="form-actions">${run?.running ? `<button type="button" class="secondary" data-action="stop-bulk-images"${run.stopping ? " disabled" : ""}>${run.stopping ? "停止待ち" : "停止"}</button>` : run ? '<button type="button" class="secondary" data-action="close-modal">閉じる</button>' : `<button type="button" data-action="start-bulk-images"${s.bulkProvider ? "" : " disabled"}>一括登録を開始</button><button type="button" class="secondary" data-action="close-modal">キャンセル</button>`}</div>`;
+  } else if (modal.kind === "image") {
     title = `${item?.name ?? "項目"} の画像`;
     const configured =
       s.provider === "brave" ? s.settings?.braveConfigured : s.settings?.ollamaConfigured;

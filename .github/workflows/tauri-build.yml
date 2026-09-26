@@ -1,17 +1,317 @@
-name: Tauri Build
+name: Tauri Distribution Release
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
+  pull-requests: read
 
-defaults:
-  run:
-    shell: bash
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
-  tauri-build:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.decision.outputs.needs_build }}
+      zip_prefix: ${{ steps.metadata.outputs.zip_prefix }}
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      tag_exists: ${{ steps.release-state.outputs.tag_exists }}
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify merged PR commit checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_SHA="${{ github.sha }}"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          if [ "$CURRENT_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Expected checkout at release commit $RELEASE_SHA but found $CURRENT_SHA."
+            exit 1
+          fi
+
+          PR_NUMBER="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/pulls" \
+              --jq '.[] | select(.merged_at != null and .base.ref == "main") | .number' \
+              | head -n 1
+          )"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::Release commit $RELEASE_SHA is not associated with a merged pull request into main."
+            exit 1
+          fi
+
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+
+          fail_version() {
+            printf '%s\n' "$1" > version_check_error.txt
+            echo "::error::$1"
+            exit 1
+          }
+
+
+          VERSION_RAW="$(
+          python3 <<'PY'
+          import json
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+
+          def fail(message: str) -> None:
+              Path("version_check_error.txt").write_text(f"{message}\n")
+              print(message, file=sys.stderr)
+              raise SystemExit(1)
+
+
+          try:
+              package_version = json.loads(Path("package.json").read_text())["version"]
+              tauri_version = json.loads(
+                  Path("src-tauri/tauri.conf.json").read_text()
+              )["version"]
+              with Path("src-tauri/Cargo.toml").open("rb") as cargo_file:
+                  cargo_version = tomllib.load(cargo_file)["package"]["version"]
+          except (OSError, ValueError, KeyError, TypeError) as error:
+              fail(f"Could not read Tauri versions: {error}")
+
+          semver = re.compile(
+              r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+              r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          )
+          if not isinstance(package_version, str) or not semver.fullmatch(package_version):
+              fail("package.json version must be a valid SemVer string.")
+          if package_version != tauri_version or package_version != cargo_version:
+              fail(
+                  "Tauri versions must match across package.json, "
+                  "src-tauri/tauri.conf.json, and src-tauri/Cargo.toml."
+              )
+
+          sys.stdout.write(package_version)
+          PY
+          )"
+
+
+          case "$VERSION_RAW" in
+            *$'\n'*)
+              fail_version "version must contain exactly one line."
+              ;;
+          esac
+
+          VERSION="$(
+            printf '%s' "$VERSION_RAW" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+          )"
+
+          if [ -z "$VERSION" ]; then
+            fail_version "version must not be empty."
+          fi
+
+
+          if [[ ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            fail_version "version contains characters that are not valid for this release tag."
+          fi
+
+
+          if ! git check-ref-format "refs/tags/$VERSION"; then
+            fail_version "version is not a valid git tag."
+          fi
+
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            echo 'is_prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'is_prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare release asset names
+        id: metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          echo "zip_prefix=$repository_name-$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect release state
+        id: release-state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.version }}
+          RELEASE_ASSET_NAMES: "${{ steps.metadata.outputs.zip_prefix }}-windows-x64.zip|${{ steps.metadata.outputs.zip_prefix }}-windows-arm64.zip|${{ steps.metadata.outputs.zip_prefix }}-macos-arm64.zip"
+        run: |
+          set -euo pipefail
+
+          git fetch --force --tags
+
+          HEAD_SHA="$(git rev-parse HEAD)"
+          tag_exists=false
+          release_exists=false
+          release_asset_exists=false
+
+          if git show-ref --tags --verify --quiet "refs/tags/$TAG"; then
+            TAG_SHA="$(git rev-list -n 1 "refs/tags/$TAG")"
+            if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Tag $TAG already points to $TAG_SHA, not $HEAD_SHA."
+              exit 1
+            fi
+            tag_exists=true
+          fi
+
+          RELEASE_RESPONSE="$(mktemp)"
+          trap 'rm -f "$RELEASE_RESPONSE"' EXIT
+
+          set +e
+          RELEASE_HTTP_STATUS="$(
+            curl --silent --show-error --location \
+              --output "$RELEASE_RESPONSE" \
+              --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          )"
+          CURL_STATUS=$?
+          set -e
+
+          if [ "$CURL_STATUS" -ne 0 ]; then
+            echo "::error::Could not inspect GitHub Release $TAG."
+            exit "$CURL_STATUS"
+          fi
+
+          case "$RELEASE_HTTP_STATUS" in
+            200)
+              release_exists=true
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::Could not inspect GitHub Release $TAG: HTTP $RELEASE_HTTP_STATUS."
+              exit 1
+              ;;
+          esac
+
+          if [ "$release_exists" = "true" ] && [ "$tag_exists" != "true" ]; then
+            echo "::error::GitHub Release $TAG exists, but the matching git tag was not found."
+            exit 1
+          fi
+
+          if [ -n "${RELEASE_ASSET_NAME:-}" ] && [ -n "${RELEASE_ASSET_NAMES:-}" ]; then
+            echo "::error::Specify only one release asset input."
+            exit 1
+          fi
+
+          if [ "$release_exists" = "true" ] && [ -n "${RELEASE_ASSET_NAME:-}${RELEASE_ASSET_NAMES:-}" ]; then
+            if [ -n "${RELEASE_ASSET_NAMES:-}" ]; then
+              IFS='|' read -r -a expected_assets <<< "$RELEASE_ASSET_NAMES"
+            else
+              expected_assets=("$RELEASE_ASSET_NAME")
+            fi
+            release_asset_exists=true
+            for asset_name in "${expected_assets[@]}"; do
+              if [ -z "$asset_name" ]; then
+                echo "::error::Release asset name must not be empty."
+                exit 1
+              fi
+              if ! asset_exists="$(
+                jq -r --arg name "$asset_name" \
+                  'any(.assets[]?; .name == $name)' \
+                  "$RELEASE_RESPONSE"
+              )"; then
+                echo "::error::Could not inspect assets for GitHub Release $TAG."
+                exit 1
+              fi
+              case "$asset_exists" in
+                true) ;;
+                false) release_asset_exists=false ;;
+                *)
+                  echo "::error::GitHub Release $TAG returned an invalid asset state."
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+
+          {
+            echo "tag_exists=$tag_exists"
+            echo "release_exists=$release_exists"
+            echo "release_asset_exists=$release_asset_exists"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reject incomplete immutable release
+        if: steps.release-state.outputs.release_exists == 'true' && steps.release-state.outputs.release_asset_exists != 'true'
+        run: |
+          echo "::error::GitHub Release is missing one or more Tauri distribution ZIP assets."
+          exit 1
+
+      - name: Decide whether to build
+        id: decision
+        env:
+          RELEASE_EXISTS: ${{ steps.release-state.outputs.release_exists }}
+        run: |
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  quality:
+    needs: preflight
+    if: needs.preflight.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ".node-version"
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libxdo-dev
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run quality gate
+        run: npm run check
+
+  build:
+    needs: [preflight, quality]
+    if: needs.preflight.outputs.needs_build == 'true'
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -30,9 +330,12 @@ jobs:
     env:
       RUST_TARGET: ${{ matrix.target }}
       ARTIFACT_PLATFORM: ${{ matrix.platform }}
+      ZIP_PREFIX: ${{ needs.preflight.outputs.zip_prefix }}
     steps:
-      - name: Checkout
+      - name: Checkout release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -40,11 +343,13 @@ jobs:
           node-version-file: ".node-version"
 
       - name: Install Rust toolchain
+        shell: bash
         run: |
           rustup show
           rustup target add "$RUST_TARGET"
 
       - name: Install dependencies
+        shell: bash
         run: |
           if [ -f package-lock.json ]; then
             npm ci
@@ -54,54 +359,222 @@ jobs:
 
       - name: Build Windows application
         if: runner.os == 'Windows'
+        shell: bash
         run: npm run tauri -- build --target "$RUST_TARGET" --no-bundle
 
       - name: Build macOS application
         if: runner.os == 'macOS'
+        shell: bash
         env:
           APPLE_SIGNING_IDENTITY: "-"
         run: npm run tauri -- build --target "$RUST_TARGET" --bundles app
 
-      - name: Prepare application artifact
-        id: artifact
+      - name: Create Windows distribution ZIP
+        if: runner.os == 'Windows'
+        id: windows-zip
+        shell: pwsh
         run: |
+          $metadata = cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not locate the Cargo target directory." }
+          $releaseDir = Join-Path (Join-Path $metadata.target_directory $env:RUST_TARGET) "release"
+          $applications = @(Get-ChildItem -LiteralPath $releaseDir -Filter "*.exe" -File)
+          if ($applications.Count -ne 1) { throw "Expected exactly one Windows application in $releaseDir." }
+          $artifactDir = Join-Path $env:RUNNER_TEMP "tauri-artifacts"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          $zipPath = Join-Path $artifactDir "$($env:ZIP_PREFIX)-$($env:ARTIFACT_PLATFORM).zip"
+          Compress-Archive -LiteralPath $applications[0].FullName -DestinationPath $zipPath
+          "path=$zipPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create macOS distribution ZIP
+        if: runner.os == 'macOS'
+        id: macos-zip
+        shell: bash
+        run: |
+          set -euo pipefail
           shopt -s nullglob dotglob
           cargo_target_dir="$(
             cd src-tauri
             cargo metadata --no-deps --format-version 1 |
-              node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).target_directory.replaceAll("\\", "/")'
+              node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).target_directory'
           )"
-          release_dir="$cargo_target_dir/$RUST_TARGET/release"
+          bundle_dir="$cargo_target_dir/$RUST_TARGET/release/bundle/macos"
+          applications=("$bundle_dir"/*.app)
+          if [ "${#applications[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one macOS application in $bundle_dir."
+            exit 1
+          fi
           artifact_dir="$RUNNER_TEMP/tauri-artifacts"
           mkdir -p "$artifact_dir"
+          ditto -c -k --keepParent "${applications[0]}" \
+            "$artifact_dir/$ZIP_PREFIX-$ARTIFACT_PLATFORM.zip"
+          echo "path=$artifact_dir/$ZIP_PREFIX-$ARTIFACT_PLATFORM.zip" >> "$GITHUB_OUTPUT"
 
-          if [[ "$ARTIFACT_PLATFORM" == windows-* ]]; then
-            applications=("$release_dir"/*.exe)
-            if [ "${#applications[@]}" -ne 1 ]; then
-              echo "::error::Expected exactly one Windows application in $release_dir."
-              exit 1
-            fi
-            app_name="${applications[0]##*/}"
-            artifact_path="$artifact_dir/${app_name%.exe}-$ARTIFACT_PLATFORM.exe"
-            cp "${applications[0]}" "$artifact_path"
-          else
-            applications=("$release_dir"/bundle/macos/*.app)
-            if [ "${#applications[@]}" -ne 1 ]; then
-              echo "::error::Expected exactly one macOS application in $release_dir/bundle/macos."
-              exit 1
-            fi
-            app_name="${applications[0]##*/}"
-            artifact_path="$artifact_dir/${app_name%.app}-$ARTIFACT_PLATFORM.tar.gz"
-            tar -czf "$artifact_path" -C "$release_dir/bundle/macos" -- "$app_name"
-          fi
-
-          # Upload the directory so glob characters in app names remain literal.
-          echo "path=$artifact_dir" >> "$GITHUB_OUTPUT"
-
-      - name: Upload application artifact
+      - name: Upload distribution ZIP
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: ${{ steps.artifact.outputs.path }}
+          path: ${{ steps.windows-zip.outputs.path || steps.macos-zip.outputs.path }}
           archive: false
-          include-hidden-files: true
           if-no-files-found: error
+
+  publish:
+    permissions:
+      contents: write
+    needs: [preflight, quality, build]
+    if: ${{ always() && needs.preflight.result == 'success' && ((needs.preflight.outputs.needs_build == 'false' && needs.quality.result == 'skipped' && needs.build.result == 'skipped') || (needs.preflight.outputs.needs_build == 'true' && needs.quality.result == 'success' && needs.build.result == 'success')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download distribution ZIPs
+        if: needs.preflight.outputs.needs_build == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ needs.preflight.outputs.zip_prefix }}-*.zip
+          path: ${{ runner.temp }}/release-assets
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Verify distribution ZIPs
+        if: needs.preflight.outputs.needs_build == 'true'
+        env:
+          ZIP_PREFIX: ${{ needs.preflight.outputs.zip_prefix }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          if [ "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l)" -ne 3 ]; then
+            echo "::error::Expected exactly three distribution ZIPs."
+            exit 1
+          fi
+          for platform in windows-x64 windows-arm64 macos-arm64; do
+            zip_path="$artifact_dir/$ZIP_PREFIX-$platform.zip"
+            if [ ! -s "$zip_path" ]; then
+              echo "::error::Missing distribution ZIP: $zip_path"
+              exit 1
+            fi
+            unzip -tq "$zip_path"
+          done
+
+      - name: Configure Git
+        if: needs.preflight.outputs.needs_build == 'true'
+        env:
+          GIT_USER_NAME: "\u307f\u305a"
+          GIT_USER_EMAIL: "mizu.copo@gmail.com"
+        run: |
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Create version tag
+        if: needs.preflight.outputs.needs_build == 'true' && needs.preflight.outputs.tag_exists != 'true'
+        env:
+          TAG: ${{ needs.preflight.outputs.version }}
+        run: |
+          git tag -a "$TAG" -m "Tauri Release $TAG"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create GitHub Release
+        if: needs.preflight.outputs.needs_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.version }}
+          ZIP_PREFIX: ${{ needs.preflight.outputs.zip_prefix }}
+          IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          title="$TAG"
+          notes="Tauri application ZIPs for Windows x64, Windows ARM64, and macOS ARM64."
+          assets=(
+            "$artifact_dir/$ZIP_PREFIX-windows-x64.zip"
+            "$artifact_dir/$ZIP_PREFIX-windows-arm64.zip"
+            "$artifact_dir/$ZIP_PREFIX-macos-arm64.zip"
+          )
+          release_flags=(--latest=false)
+          case "$IS_PRERELEASE" in
+            true) release_flags+=(--prerelease) ;;
+            false) ;;
+            *) echo "::error::Invalid prerelease state."; exit 1 ;;
+          esac
+
+          lookup_release() {
+            gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -c --arg tag "$TAG" \
+                '[.[][] | select(.tag_name == $tag)] | if length == 0 then null elif length == 1 then .[0] else error("Duplicate releases for tag") end'
+          }
+
+          release="$(lookup_release)"
+          if [ "$release" = null ]; then
+            gh release create "$TAG" "${assets[@]}" \
+              --verify-tag \
+              "${release_flags[@]}" \
+              --title "$title" \
+              --notes "$notes"
+          else
+            if ! jq -e \
+              --arg title "$title" \
+              --arg notes "$notes" \
+              --argjson prerelease "$IS_PRERELEASE" \
+              '.draft == true and .name == $title and .body == $notes and .prerelease == $prerelease' \
+              <<< "$release" > /dev/null; then
+              echo "::error::Release $TAG already exists and is not a matching workflow draft."
+              exit 1
+            fi
+
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            release="$(lookup_release)"
+            if [ "$(jq -r '.draft' <<< "$release")" != true ]; then
+              echo "::error::Release $TAG changed while uploading draft assets."
+              exit 1
+            fi
+            for asset in "${assets[@]}"; do
+              if ! jq -e --arg name "${asset##*/}" \
+                'any(.assets[]?; .name == $name and .state == "uploaded" and .size > 0)' \
+                <<< "$release" > /dev/null; then
+                echo "::error::Draft release $TAG is missing a complete asset: ${asset##*/}"
+                exit 1
+              fi
+            done
+
+            release_id="$(jq -r '.id' <<< "$release")"
+            if [ "$(gh api --method PATCH \
+              "/repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false -f make_latest=false --jq '.draft')" != false ]; then
+              echo "::error::Could not publish draft release $TAG."
+              exit 1
+            fi
+          fi
+
+      - name: Record latest release
+        if: needs.preflight.outputs.is_prerelease != 'true'
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.version }}
+        run: bash .github/scripts/authorize-release-latest.sh record
+
+  promote-latest:
+    permissions:
+      contents: write
+    needs: [preflight, publish]
+    if: needs.preflight.outputs.is_prerelease != 'true'
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read latest release
+        id: latest-state
+        run: bash .github/scripts/authorize-release-latest.sh read
+
+      - name: Mark GitHub Release as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.latest-state.outputs.release_tag }}
+        run: gh release edit "$TAG" --latest

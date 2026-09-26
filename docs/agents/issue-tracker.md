@@ -1,53 +1,21 @@
-# Issue tracker: GitHub Issues
+# GitHub Issue の使い方
 
-Issues for this repository are tracked in GitHub Issues. Infer the repository
-from the configured Git remote instead of hard-coding an owner or repository
-name in agent instructions.
+Issue とレビュー後の追加課題は GitHub Issues で管理します。
 
-## Resolve the target repository
+## 作成先を決める
 
-Before creating an Issue, including a review-follow-up Issue:
+1. ユーザーがリポジトリを指定したら、そこを使う。
+2. 指定がなければ `git remote -v` と GitHub の情報で fork 関係を確認する。`origin`、`upstream`、push 先の名前だけでは決めない。同じリポジトリの fetch URL と push URL は1件として扱う。
+3. fork でない候補が1件だけで、作業内容とも一致すればそこを使う。fork や複数候補がある場合は、元 Issue、レビュー対象 PR の base、貢献ガイドを確認する。fork の親だけでは作成先を決めない。
+4. まだ不明なら、候補と迷っている理由を示し、ユーザーにリポジトリ URL を聞く。回答まで Issue は作成しない。読み取り調査は続けてよい。
+5. 作成先で Issue を利用できることを確認し、GitHub の host・owner・repo を明示して作成する。確認できなければ別のリポジトリへ切り替えず、報告して作成先を確認する。
 
-1. Use an explicit target repository from the user's request when provided.
-   Otherwise, inspect `git remote -v` and available GitHub repository metadata,
-   including fork relationships. Treat remote names such as `origin` and
-   `upstream` as hints, not proof of the Issue destination.
-2. Select a remote's repository when it is the single unambiguous non-fork
-   repository and the task context agrees. Fetch and push URLs that identify
-   the same repository count as one candidate.
-3. For a fork or multiple distinct remote repositories, use the source Issue,
-   the reviewed PR's base repository, and repository contribution guidance to
-   establish where the Issue belongs. A fork parent or a push destination
-   alone does not establish that target.
-4. If the target remains unclear, including when no remote is configured or
-   metadata is unavailable, ask the user for the target repository URL. Show
-   any candidates and the ambiguity. Wait for an answer before creating the
-   Issue; unrelated read-only investigation may continue.
-5. Verify the selected repository is accessible and accepts Issues, then pass
-   that repository explicitly to the GitHub integration or `gh --repo`.
-   Preserve its GitHub host as well as owner and name. If verification fails,
-   report the blocker and confirm the intended target rather than falling
-   back to another repository.
+## Issue の書き方と扱い方
 
-## Conventions
+- 着手前に本文・コメント・ラベルをすべて読む。
+- 目的、望む結果、問題や未決事項を短く書く。完了条件は役立つ場合だけ加える。
+- 実装方法は、必須の条件でなければ指定しない。必要な根拠や参照 URL は添える。
+- ブロック関係は GitHub の Issue 依存関係で示す。使えなければ本文に書く。
+- PR は実装とレビューに使う。課題の追跡には Issue を使う。
 
-- Create review-follow-up Issues as GitHub Issues.
-- Read the full issue body, comments, and labels before acting on an issue.
-- Keep issues concise and centered on the purpose, desired outcome, and problem
-  or open question. Add acceptance criteria only when they clarify what done
-  means.
-- Avoid prescribing implementation details unless they are requirements or
-  constraints. Decide the approach when implementation begins so it reflects
-  the current code, tools, and constraints.
-- Include source URLs or other evidence when needed to explain the purpose or
-  constraints.
-- Use GitHub's native issue dependencies for blocking relationships when they
-  are available. Otherwise, record blockers in the issue body.
-- Treat pull requests as implementation and review surfaces, not as substitutes
-  for triage issues.
-
-## Skill terminology
-
-When a skill says to publish a ticket, create a GitHub Issue. When a skill says
-to fetch a ticket, read the corresponding GitHub Issue. Prefer an available
-GitHub integration and use the `gh` CLI as the fallback.
+スキルの「ticket」は GitHub Issue と読み替えます。利用可能な GitHub 連携を優先し、なければ `gh --repo` を使います。

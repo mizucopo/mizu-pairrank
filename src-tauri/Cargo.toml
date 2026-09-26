@@ -1,6 +1,6 @@
 [package]
 name = "mizu-pairrank"
-version = "0.3.4"
+version = "0.4.3"
 description = "mizu-pairrank"
 authors = ["\u307f\u305a"]
 edition = "2024"
@@ -27,7 +27,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["net", "rt", "macros", "time", "sync"] }
 rand = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
 same-file = "1.0.6"
