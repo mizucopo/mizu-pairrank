@@ -291,10 +291,20 @@ export function mountApp(
         break;
       case "edit-tag":
         controller.editTag(id);
+        if (controller.state.tagEditingId === id) {
+          root.querySelector<HTMLInputElement>("#tag-name")?.focus({ preventScroll: true });
+        }
         break;
-      case "cancel-tag-edit":
+      case "cancel-tag-edit": {
+        const tagId = controller.state.tagEditingId;
         controller.editTag(null);
+        if (tagId !== null) {
+          root
+            .querySelector<HTMLButtonElement>(`[data-action="edit-tag"][data-id="${tagId}"]`)
+            ?.focus({ preventScroll: true });
+        }
         break;
+      }
       case "delete-tag":
         controller.deleteTagPrompt(id);
         if (controller.state.tagDeletingId === id) {

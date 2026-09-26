@@ -1591,6 +1591,32 @@ describe("desktop app interaction", () => {
     },
   );
 
+  it.each(["item", "management"] as const)(
+    "focuses the %s tag rename field and returns to its rename button on cancellation",
+    async (entry) => {
+      const { root, controller, api, state } = setup();
+      state.tags = [{ id: 1, listId: 1, name: "甘い" }];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      const editor = root.querySelector<HTMLElement>(".tag-editor-list");
+      if (!editor) throw new Error("Missing tag editor");
+      editor.scrollTop = 300;
+      const renameButton = button(root, '[data-action="edit-tag"][data-id="1"]');
+      renameButton.focus({ preventScroll: true });
+      renameButton.click();
+      expect(document.activeElement).toBe(root.querySelector("#tag-name"));
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.scrollTop).toBe(300);
+      button(root, '[data-action="cancel-tag-edit"]').click();
+      expect(document.activeElement).toBe(button(root, '[data-action="edit-tag"][data-id="1"]'));
+      expect(root.querySelector<HTMLElement>(".tag-editor-list")?.scrollTop).toBe(300);
+      expect(api.renameTag).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["scrollTop", "scrollLeft"] as const)(
     "preserves tag editor %s through assignment, editing, and deletion prompts",
     async (axis) => {

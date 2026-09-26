@@ -226,6 +226,7 @@ impl Database {
     ) -> Result<ListState, String> {
         let name = validated_name(name)?;
         self.mutate_list(list_id, |transaction| {
+            ensure_tag_in_list(transaction, list_id, tag_id)?;
             ensure_available_tag_name(transaction, list_id, Some(tag_id), &name)?;
             require_tag_change(transaction.execute(
                 "UPDATE tags SET name = ?1 WHERE id = ?2 AND list_id = ?3",
@@ -2034,6 +2035,29 @@ mod tests {
             second.get_list(list.id).unwrap().items[0].tag_ids,
             vec![second_tag]
         );
+    }
+
+    #[test]
+    fn rename_deleted_tag_reports_missing_even_when_name_is_taken() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared-tag-rename.sqlite3");
+        let mut first = Database::open(&path).unwrap();
+        let list = first.create_list("Shared tags".into()).unwrap();
+        let list = first.create_tag(list.id, "Old".into(), None).unwrap();
+        let old_tag_id = list.tags[0].id;
+        let list = first.create_tag(list.id, "Taken".into(), None).unwrap();
+        let mut second = Database::open(&path).unwrap();
+        let stale = second.get_list(list.id).unwrap();
+        assert!(stale.tags.iter().any(|tag| tag.id == old_tag_id));
+
+        let current = first.delete_tag(list.id, old_tag_id).unwrap();
+        assert_eq!(
+            second
+                .rename_tag(stale.id, old_tag_id, "Taken".into())
+                .unwrap_err(),
+            "タグが見つかりません。"
+        );
+        assert_eq!(second.get_list(list.id).unwrap().revision, current.revision);
     }
 
     #[test]
