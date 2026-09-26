@@ -695,7 +695,7 @@ progress {
   align-self: center;
   margin: 0;
   padding: 12px;
-  color: var(--muted);
+  color: var(--ink);
   font-size: 0.76rem;
 }
 .converged-banner {

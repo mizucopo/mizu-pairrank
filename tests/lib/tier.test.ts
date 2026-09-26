@@ -95,6 +95,22 @@ describe("tierRows", () => {
     ]);
   });
 
+  it("does not demote a score when its floating-point ratio rounds to a boundary", () => {
+    const rows = tierRows(
+      [33.550664760147896, 31.924467635513754, 25.41967913697718].map((mu, index) =>
+        item(index + 1, mu),
+      ),
+    );
+
+    expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.id))).toEqual([
+      [1, 2],
+      [],
+      [],
+      [],
+      [3],
+    ]);
+  });
+
   it("keeps equal scores together and preserves the incoming ranking order and ranks", () => {
     const rows = tierRows([item(1, 50), item(42, 40), item(7, 40), item(2, 35), item(9, 0)]);
 
