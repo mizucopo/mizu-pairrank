@@ -158,6 +158,84 @@ impl Database {
         Ok(state)
     }
 
+    pub fn duplicate_list(&mut self, source_id: i64) -> Result<ListState, String> {
+        let transaction = self.write_transaction()?;
+        let source = read_list(&transaction, source_id)?;
+        let base_name = format!("{} のコピー", source.name);
+        let mut name = base_name.clone();
+        let mut number = 2;
+        while transaction
+            .query_row(
+                "SELECT 1 FROM lists WHERE name = ?1 LIMIT 1",
+                [&name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(db_error)?
+            .is_some()
+        {
+            name = format!("{base_name} ({number})");
+            number += 1;
+        }
+        transaction
+            .execute(
+                "INSERT INTO lists (name, model_version, model_parameters) VALUES (?1, ?2, ?3)",
+                params![name, MODEL_VERSION, MODEL_PARAMETERS_JSON],
+            )
+            .map_err(db_error)?;
+        let list_id = transaction.last_insert_rowid();
+
+        let mut tag_ids = HashMap::new();
+        for tag in &source.tags {
+            transaction
+                .execute(
+                    "INSERT INTO tags (list_id, name) VALUES (?1, ?2)",
+                    params![list_id, tag.name],
+                )
+                .map_err(db_error)?;
+            tag_ids.insert(tag.id, transaction.last_insert_rowid());
+        }
+
+        // read_list presents the current ranking; insert by source ID so a fresh
+        // list starts in registration order rather than retaining that ranking.
+        let mut items = source.items;
+        items.sort_by_key(|item| item.id);
+        let initial = Rating::default();
+        for item in &items {
+            let image = item.image.as_ref();
+            transaction
+                .execute(
+                    "INSERT INTO items (list_id, name, image_path, image_source_url, mu, sigma)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        list_id,
+                        item.name,
+                        image.map(|asset| asset.path.as_str()),
+                        image.and_then(|asset| asset.source_url.as_deref()),
+                        initial.mu,
+                        initial.sigma,
+                    ],
+                )
+                .map_err(db_error)?;
+            let item_id = transaction.last_insert_rowid();
+            for old_tag_id in &item.tag_ids {
+                let tag_id = tag_ids
+                    .get(old_tag_id)
+                    .ok_or_else(|| "タグの複製に失敗しました。".to_owned())?;
+                transaction
+                    .execute(
+                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)",
+                        params![list_id, item_id, tag_id],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        reset_snapshots(&transaction, list_id)?;
+        let state = read_list(&transaction, list_id)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(state)
+    }
+
     pub fn rename_list(&mut self, id: i64, name: String) -> Result<ListState, String> {
         let name = validated_name(name)?;
         self.mutate_list(id, |transaction| {
@@ -1069,6 +1147,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum WriteOperation {
         CreateList,
+        DuplicateList,
         DeleteList,
         ResumeList,
         RenameList,
@@ -1085,14 +1164,16 @@ mod tests {
     }
 
     impl WriteOperation {
-        const ENTRY_POINTS: [Self; 4] = [
+        const ENTRY_POINTS: [Self; 5] = [
             Self::CreateList,
+            Self::DuplicateList,
             Self::DeleteList,
             Self::ResumeList,
             Self::RenameList,
         ];
-        const ALL: [Self; 14] = [
+        const ALL: [Self; 15] = [
             Self::CreateList,
+            Self::DuplicateList,
             Self::DeleteList,
             Self::ResumeList,
             Self::RenameList,
@@ -1112,6 +1193,7 @@ mod tests {
             let item_id = state.items[0].id;
             match self {
                 Self::CreateList => database.create_list("New list".into()).map(|_| ()),
+                Self::DuplicateList => database.duplicate_list(state.id).map(|_| ()),
                 Self::DeleteList => database.delete_list(state.id).map(|_| ()),
                 Self::ResumeList => database.resume_list(state.id).map(|_| ()),
                 Self::RenameList => database.rename_list(state.id, "Changed".into()).map(|_| ()),
@@ -2533,6 +2615,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn duplicate_list_copies_content_but_starts_comparisons_from_scratch() {
+        let mut database = memory_database();
+        let source = database.create_list("好きな果物".into()).unwrap();
+        let source = database
+            .add_items(source.id, vec!["A".into(), "B".into(), "Removed".into()])
+            .unwrap();
+        let a_id = source.items[0].id;
+        let b_id = source.items[1].id;
+        let removed_id = source.items[2].id;
+        let source = database
+            .create_tag(source.id, "Group".into(), Some(a_id))
+            .unwrap();
+        let group_id = source.tags[0].id;
+        let source = database
+            .create_tag(source.id, "A only".into(), Some(a_id))
+            .unwrap();
+        let source = database
+            .set_item_tag(source.id, b_id, group_id, true)
+            .unwrap();
+        let image = ImageAsset {
+            path: "saved.png".into(),
+            source_url: Some("https://example.org/saved".into()),
+        };
+        let source = database
+            .set_image(source.id, a_id, Some(image.clone()))
+            .unwrap()
+            .value;
+        let source = database.delete_item(source.id, removed_id).unwrap().value;
+        let source = database
+            .answer(source.id, a_id, b_id, Preference::BStrong, source.revision)
+            .unwrap();
+        assert_eq!(source.items[0].id, b_id);
+        assert_eq!(source.comparison_count, 1);
+
+        let copy = database.duplicate_list(source.id).unwrap();
+        assert_eq!(copy.name, "好きな果物 のコピー");
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.revision, 0);
+        assert_eq!(copy.comparison_count, 0);
+        assert!(!copy.convergence.converged);
+        assert_eq!(copy.convergence.observed_answers, 0);
+        assert_eq!(snapshot_count(&database, copy.id), 1);
+        assert_eq!(copy.items.len(), 2);
+        assert_eq!(copy.items[0].name, "A");
+        assert_eq!(copy.items[1].name, "B");
+        assert_eq!(copy.items[0].image.as_ref().unwrap().path, image.path);
+        assert_eq!(
+            copy.items[0].image.as_ref().unwrap().source_url,
+            image.source_url
+        );
+        assert!(copy.items.iter().all(|item| {
+            item.list_id == copy.id
+                && item.id != a_id
+                && item.id != b_id
+                && item.rating == Rating::default()
+                && item.comparison_count == 0
+        }));
+        assert_eq!(copy.tags.len(), 2);
+        assert!(copy.tags.iter().all(|tag| tag.list_id == copy.id));
+        assert!(
+            copy.tags
+                .iter()
+                .all(|tag| !source.tags.iter().any(|old| old.id == tag.id))
+        );
+        let copy_group = copy.tags.iter().find(|tag| tag.name == "Group").unwrap().id;
+        let copy_a_only = copy
+            .tags
+            .iter()
+            .find(|tag| tag.name == "A only")
+            .unwrap()
+            .id;
+        assert_eq!(copy.items[0].tag_ids, vec![copy_group, copy_a_only]);
+        assert_eq!(copy.items[1].tag_ids, vec![copy_group]);
+        let comparisons: i64 = database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM comparisons WHERE list_id = ?1",
+                [copy.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(comparisons, 0);
+        assert_eq!(database.get_list(source.id).unwrap().comparison_count, 1);
+
+        database
+            .rename_item(copy.id, copy.items[0].id, "Changed".into())
+            .unwrap();
+        assert_eq!(database.get_list(source.id).unwrap().items[1].name, "A");
+    }
+
+    #[test]
+    fn duplicate_list_chooses_an_unused_name_and_rejects_missing_source() {
+        let mut database = memory_database();
+        let source = database.create_list("A".into()).unwrap();
+        database.create_list("A のコピー".into()).unwrap();
+        let first = database.duplicate_list(source.id).unwrap();
+        let second = database.duplicate_list(source.id).unwrap();
+        assert_eq!(first.name, "A のコピー (2)");
+        assert_eq!(second.name, "A のコピー (3)");
+        assert_eq!(first.items.len(), 0);
+        assert_eq!(
+            database.duplicate_list(-1).unwrap_err(),
+            "リストが見つかりません。"
+        );
+        assert_eq!(database.list_summaries().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn duplicate_list_rolls_back_all_rows_if_membership_copy_fails() {
+        let mut database = memory_database();
+        let source = populated_list(&mut database, "Source");
+        database
+            .create_tag(source.id, "Group".into(), Some(source.items[0].id))
+            .unwrap();
+        database
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_duplicate_membership BEFORE INSERT ON item_tags
+                 WHEN NEW.list_id != {} BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                source.id
+            ))
+            .unwrap();
+        assert!(database.duplicate_list(source.id).is_err());
+        for table in ["lists", "items", "tags", "item_tags", "rank_snapshots"] {
+            let count: i64 = database
+                .connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let expected = match table {
+                "lists" => 1,
+                "items" => 2,
+                "tags" | "item_tags" | "rank_snapshots" => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(count, expected, "{table}");
+        }
     }
 
     #[test]

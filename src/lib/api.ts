@@ -6,6 +6,7 @@ export const api: AppApi = {
   listSummaries: () => invoke("list_summaries"),
   getList: (listId) => invoke("get_list", { listId }),
   createList: (name) => invoke("create_list", { name }),
+  duplicateList: (listId) => invoke("duplicate_list", { listId }),
   renameList: (listId, name) => invoke("rename_list", { listId, name }),
   deleteList: (listId) => invoke("delete_list", { listId }),
   addItems: (listId, names) => invoke("add_items", { listId, names }),

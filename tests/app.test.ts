@@ -57,6 +57,7 @@ function setup(
       ]),
     getList: vi.fn<AppApi["getList"]>().mockResolvedValue(state),
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(state),
+    duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(state),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(state),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(state),
@@ -1109,6 +1110,69 @@ describe("desktop app interaction", () => {
     await click(root, controller, '[data-action="select-list"][data-id="2"]');
     expect(root.querySelector("h1")?.textContent).toBe(created.name);
     expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
+  });
+
+  it("duplicates the active list and opens the new list's items", async () => {
+    const { root, controller, api, state } = setup();
+    const copy: ListState = {
+      ...state,
+      id: 2,
+      name: "好きな果物 のコピー",
+      revision: 0,
+      items: state.items.map((item) => ({ ...item, id: item.id + 10, listId: 2 })),
+    };
+    await controller.initialize();
+    await click(root, controller, '.tabs [data-view="ranking"]');
+    controller.state.drafts.items = "追加途中";
+    controller.state.drafts.query = "画像検索途中";
+    api.duplicateList.mockResolvedValueOnce(copy);
+    api.listSummaries.mockResolvedValueOnce([
+      { id: 1, name: state.name, itemCount: 2, comparisonCount: 0, converged: false },
+      { id: 2, name: copy.name, itemCount: 2, comparisonCount: 0, converged: false },
+    ]);
+
+    await click(root, controller, '[data-action="duplicate-list"]');
+
+    expect(api.duplicateList).toHaveBeenCalledExactlyOnceWith(state.id);
+    expect(controller.state.active).toEqual(copy);
+    expect(controller.state.view).toBe("items");
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.drafts.query).toBe("");
+    expect(root.querySelector("h1")?.textContent).toBe(copy.name);
+    expect(
+      root.querySelector('[data-action="select-list"][data-id="2"]')?.getAttribute("aria-current"),
+    ).toBe("true");
+    expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
+    expect(root.querySelector("#item-names")).not.toBeNull();
+  });
+
+  it("shows a duplicate error and keeps the source list selected", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    controller.state.drafts.items = "追加途中";
+    api.duplicateList.mockRejectedValueOnce(new Error("複製できませんでした"));
+
+    await click(root, controller, '[data-action="duplicate-list"]');
+
+    expect(controller.state.active).toEqual(state);
+    expect(controller.state.drafts.items).toBe("追加途中");
+    expect(root.querySelector('[role="alert"]')?.textContent).toBe("複製できませんでした");
+    expect(
+      root.querySelector('[data-action="select-list"][data-id="1"]')?.getAttribute("aria-current"),
+    ).toBe("true");
+  });
+
+  it("recovers when the source list disappears before duplication", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    api.duplicateList.mockRejectedValueOnce(new Error("リストが見つかりません。"));
+    api.listSummaries.mockResolvedValueOnce([]);
+
+    await click(root, controller, '[data-action="duplicate-list"]');
+
+    expect(controller.state.active).toBeNull();
+    expect(root.querySelector(".welcome")).not.toBeNull();
+    expect(root.querySelector('[role="alert"]')?.textContent).toBe("リストが見つかりません。");
   });
 
   it.each([
