@@ -486,7 +486,7 @@ jobs:
           set -euo pipefail
 
           artifact_dir="$RUNNER_TEMP/release-assets"
-          title="Tauri Release $TAG"
+          title="$TAG"
           notes="Tauri application ZIPs for Windows x64, Windows ARM64, and macOS ARM64."
           assets=(
             "$artifact_dir/$ZIP_PREFIX-windows-x64.zip"
