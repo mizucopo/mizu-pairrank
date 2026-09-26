@@ -145,6 +145,7 @@ describe("desktop app interaction", () => {
     const scrollableRow = root.querySelector(".tier-row:nth-child(2) .tier-items");
     if (!(scrollableRow instanceof HTMLOListElement)) throw new Error("Missing Tier row");
     expect(scrollableRow.tabIndex).toBe(0);
+    expect(scrollableRow.getAttribute("role")).toBe("list");
     scrollableRow.focus();
     expect(document.activeElement).toBe(scrollableRow);
     expect(
@@ -188,6 +189,20 @@ describe("desktop app interaction", () => {
     await click(root, controller, '.tabs [data-view="tier"]');
     expect(root.textContent).toContain("項目を追加すると、ここに Tier 表が表示されます。");
     expect(root.querySelector(".tier-table")).toBeNull();
+  });
+
+  it("restores focus to the Compare tab after opening comparison from the Tier view", async () => {
+    const { root, controller } = setup();
+    await controller.initialize();
+    await click(root, controller, '.tabs [data-view="tier"]');
+
+    const cta = button(root, '.section-heading [data-view="compare"]');
+    cta.focus();
+    cta.click();
+    await settle(controller);
+
+    expect(controller.state.view).toBe("compare");
+    expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
   });
 
   it.each([

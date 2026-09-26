@@ -663,7 +663,7 @@ progress {
   list-style: none;
 }
 .tier-items:focus-visible {
-  outline: 3px solid #a8caba;
+  outline: 3px solid var(--accent);
   outline-offset: -3px;
 }
 .tier-card {

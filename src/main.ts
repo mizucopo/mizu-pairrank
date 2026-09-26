@@ -76,7 +76,8 @@ export function mountApp(
       target.modal === controller.state.modal &&
       (target.listId === null || target.listId === controller.state.active?.id)
     ) {
-      button = matchingButtons(target.key)[target.index];
+      const matches = matchingButtons(target.key);
+      button = matches[target.index] ?? matches.find((candidate) => candidate.closest(".tabs"));
     }
     if (button && !button.disabled) button.focus({ preventScroll: true });
     else {

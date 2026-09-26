@@ -57,6 +57,18 @@ describe("tierRows", () => {
     ]);
   });
 
+  it("keeps the maximum in S when the rating range is only a few ULPs wide", () => {
+    const rows = tierRows([item(1, 25.000000000000007), item(2, 25)]);
+
+    expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.id))).toEqual([
+      [1],
+      [],
+      [],
+      [],
+      [2],
+    ]);
+  });
+
   it("keeps equal scores together and preserves the incoming ranking order and ranks", () => {
     const rows = tierRows([item(1, 50), item(42, 40), item(7, 40), item(2, 35), item(9, 0)]);
 

@@ -22,7 +22,8 @@ export function tierRows(items: readonly Item[]): TierRow[] {
   );
   items.forEach((item, index) => {
     let tier = span === 0 ? 3 : 0;
-    if (span !== 0) {
+    // A narrow span can round its upper boundary to the maximum.
+    if (span !== 0 && item.rating.mu !== highest) {
       for (let boundary = 1; boundary < labels.length; boundary += 1) {
         // Keep a rounded boundary score in the lower tier.
         if (
