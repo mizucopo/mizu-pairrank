@@ -42,6 +42,19 @@ describe("tierRows", () => {
       [0.4],
       [0.2, 0],
     ]);
+
+    const narrowRows = tierRows(
+      [0.35, 0.280001, 0.28, 0.210001, 0.21, 0.140001, 0.14, 0.070001, 0.07, 0].map((mu, index) =>
+        item(index + 1, mu),
+      ),
+    );
+    expect(narrowRows.map((row) => row.entries.map(({ item: entry }) => entry.rating.mu))).toEqual([
+      [0.35, 0.280001],
+      [0.28, 0.210001],
+      [0.21, 0.140001],
+      [0.14, 0.070001],
+      [0.07, 0],
+    ]);
   });
 
   it("keeps equal scores together and preserves the incoming ranking order and ranks", () => {

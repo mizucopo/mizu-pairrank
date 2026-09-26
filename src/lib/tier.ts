@@ -16,11 +16,19 @@ export function tierRows(items: readonly Item[]): TierRow[] {
     lowest = Math.min(lowest, item.rating.mu);
   }
   const span = highest - lowest;
+  const tolerance = Math.min(
+    span / (2 * labels.length),
+    2 * Number.EPSILON * Math.max(Math.abs(highest), Math.abs(lowest)),
+  );
   items.forEach((item, index) => {
     let tier = span === 0 ? 3 : 0;
     if (span !== 0) {
       for (let boundary = 1; boundary < labels.length; boundary += 1) {
-        if (item.rating.mu <= lowest + (span * (labels.length - boundary)) / labels.length) {
+        // Keep a rounded boundary score in the lower tier.
+        if (
+          item.rating.mu <=
+          lowest + (span * (labels.length - boundary)) / labels.length + tolerance
+        ) {
           tier = boundary;
         }
       }
