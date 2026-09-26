@@ -205,6 +205,32 @@ describe("desktop app interaction", () => {
     expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
   });
 
+  it("keeps a Tier row's focus and horizontal scroll after a background settings refresh", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    let finishRead: (settings: Awaited<ReturnType<AppApi["searchSettings"]>>) => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const refreshing = controller.refreshBulkSettings();
+    await click(root, controller, '.tabs [data-view="tier"]');
+    const row = root.querySelector<HTMLElement>(".tier-items");
+    if (!row) throw new Error("Missing Tier row");
+    row.focus();
+    row.scrollLeft = 80;
+
+    finishRead({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
+    await refreshing;
+
+    const refreshedRow = root.querySelector<HTMLElement>(".tier-items");
+    expect(refreshedRow).not.toBe(row);
+    expect(document.activeElement).toBe(refreshedRow);
+    expect(refreshedRow?.scrollLeft).toBe(80);
+  });
+
   it.each([
     [false, false, true, null, false],
     [true, false, false, "brave", false],

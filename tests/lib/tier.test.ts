@@ -32,11 +32,13 @@ describe("tierRows", () => {
 
   it("places fractional boundaries in the lower tier without moving nearby scores", () => {
     const rows = tierRows(
-      [1, 0.800001, 0.8, 0.6, 0.4, 0.2, 0].map((mu, index) => item(index + 1, mu)),
+      [1, 0.800001, 0.8000000000000002, 0.8, 0.6, 0.4, 0.2, 0].map((mu, index) =>
+        item(index + 1, mu),
+      ),
     );
 
     expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.rating.mu))).toEqual([
-      [1, 0.800001],
+      [1, 0.800001, 0.8000000000000002],
       [0.8],
       [0.6],
       [0.4],
@@ -55,6 +57,15 @@ describe("tierRows", () => {
       [0.14, 0.070001],
       [0.07, 0],
     ]);
+
+    const tinyRows = tierRows([item(1, 1e-8), item(2, 8e-9), item(3, 0)]);
+    expect(tinyRows.map((row) => row.entries.map(({ item: entry }) => entry.id))).toEqual([
+      [1],
+      [2],
+      [],
+      [],
+      [3],
+    ]);
   });
 
   it("keeps the maximum in S when the rating range is only a few ULPs wide", () => {
@@ -66,6 +77,21 @@ describe("tierRows", () => {
       [],
       [],
       [2],
+    ]);
+  });
+
+  it("keeps representable scores above a narrow boundary in the higher tier", () => {
+    const ulp = 25.000000000000004 - 25;
+    const rows = tierRows(
+      [25 + 20 * ulp, 25 + 17 * ulp, 25 + 16 * ulp, 25].map((mu, index) => item(index + 1, mu)),
+    );
+
+    expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.id))).toEqual([
+      [1, 2],
+      [3],
+      [],
+      [],
+      [4],
     ]);
   });
 

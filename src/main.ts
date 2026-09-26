@@ -95,6 +95,12 @@ export function mountApp(
   function render(): void {
     const lists = root.querySelector<HTMLElement>(".lists");
     const listScroll = { top: lists?.scrollTop ?? 0, left: lists?.scrollLeft ?? 0 };
+    const tierScroll = new Map(
+      [...root.querySelectorAll<HTMLElement>(".tier-items")].map((row) => [
+        row.dataset.focus,
+        row.scrollLeft,
+      ]),
+    );
     const focus = document.activeElement;
     if (!pendingButtonFocus && focus instanceof HTMLButtonElement && root.contains(focus)) {
       pendingButtonFocus = rememberButton(focus);
@@ -170,6 +176,9 @@ export function mountApp(
     if (renderedLists) {
       renderedLists.scrollTop = listScroll.top;
       renderedLists.scrollLeft = listScroll.left;
+    }
+    for (const row of root.querySelectorAll<HTMLElement>(".tier-items")) {
+      row.scrollLeft = tierScroll.get(row.dataset.focus) ?? 0;
     }
   }
   root.addEventListener("input", (event) => {
