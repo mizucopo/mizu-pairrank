@@ -1617,6 +1617,36 @@ describe("desktop app interaction", () => {
     },
   );
 
+  it.each(["item", "management"] as const)(
+    "names each %s tag action for its own tag",
+    async (entry) => {
+      const { root, controller, state } = setup();
+      const hostileName = '<赤い "タグ" &>';
+      state.tags = [
+        { id: 1, listId: 1, name: "甘い" },
+        { id: 2, listId: 1, name: hostileName },
+      ];
+      await controller.initialize();
+      await click(
+        root,
+        controller,
+        entry === "item" ? '[data-action="tags"][data-id="10"]' : '[data-action="manage-tags"]',
+      );
+      for (const [id, name] of [
+        [1, "甘い"],
+        [2, hostileName],
+      ] as const) {
+        const rename = button(root, `[data-action="edit-tag"][data-id="${id}"]`);
+        const remove = button(root, `[data-action="delete-tag"][data-id="${id}"]`);
+        expect(rename.getAttribute("aria-label")).toBe(`${name} の名前を変更`);
+        expect(remove.getAttribute("aria-label")).toBe(`${name} を削除`);
+        expect(rename.textContent).toBe("名前");
+        expect(remove.textContent).toBe("削除");
+      }
+      expect(root.querySelector(".tag-editor-list img, .tag-editor-list [onerror]")).toBeNull();
+    },
+  );
+
   it.each(["scrollTop", "scrollLeft"] as const)(
     "preserves tag editor %s through assignment, editing, and deletion prompts",
     async (axis) => {

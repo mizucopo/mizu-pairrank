@@ -181,7 +181,7 @@ function modalView(s: AppState): string {
               const actions =
                 s.tagDeletingId === tag.id
                   ? `<div class="tag-delete-confirm"><span>「${e(tag.name)}」を削除しますか？項目からも外れます。</span><button type="button" class="danger small" data-action="confirm-tag-delete"${disabled(s)}>削除する</button><button type="button" class="secondary small" data-action="cancel-tag-delete"${disabled(s)}>キャンセル</button></div>`
-                  : `<button type="button" class="text-button small" data-action="edit-tag" data-id="${tag.id}"${disabled(s)}>名前</button><button type="button" class="text-button small danger-text" data-action="delete-tag" data-id="${tag.id}"${disabled(s)}>削除</button>`;
+                  : `<button type="button" class="text-button small" data-action="edit-tag" data-id="${tag.id}" aria-label="${e(tag.name)} の名前を変更"${disabled(s)}>名前</button><button type="button" class="text-button small danger-text" data-action="delete-tag" data-id="${tag.id}" aria-label="${e(tag.name)} を削除"${disabled(s)}>削除</button>`;
               return `<div class="tag-editor-row">${assignment}<span class="tag-editor-name">${e(tag.name)} <small>${count} 件</small></span><div class="tag-editor-actions">${actions}</div></div>`;
             })
             .join("")

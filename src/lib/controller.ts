@@ -463,6 +463,8 @@ export class AppController {
       let result: ListState;
       if (editingId === null) {
         result = await this.api.createTag(list.id, name, modal.itemId).catch((error: unknown) => {
+          if (errorMessage(error) === "同じ名前のタグが既にあります。")
+            return this.handleTagError(list.id, error);
           if (modal.itemId === undefined) return this.handleListError(list.id, error);
           return this.handleItemError(list.id, modal.itemId, error);
         });
@@ -675,11 +677,14 @@ export class AppController {
   }
 
   private async handleTagError(listId: number, error: unknown): Promise<never> {
-    if (errorMessage(error) !== "タグが見つかりません。")
+    const message = errorMessage(error);
+    if (message !== "タグが見つかりません。" && message !== "同じ名前のタグが既にあります。")
       return this.handleListError(listId, error);
-    this.state.tagDraft = "";
-    this.state.tagEditingId = null;
-    this.state.tagDeletingId = null;
+    if (message === "タグが見つかりません。") {
+      this.state.tagDraft = "";
+      this.state.tagEditingId = null;
+      this.state.tagDeletingId = null;
+    }
     const current = await this.api
       .getList(listId)
       .catch((reloadError: unknown) => this.handleListError(listId, reloadError));

@@ -149,6 +149,34 @@ describe("tag management", () => {
     expect(controller.state.active).toEqual(assigned);
   });
 
+  it.each([undefined, 11])(
+    "reloads tags after another instance creates the same name (itemId=%s)",
+    async (itemId) => {
+      const initial = list();
+      const refreshed = {
+        ...initial,
+        tags: [{ id: 3, listId: 1, name: "好き" }],
+      };
+      const api = backend(initial);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      const modal =
+        itemId === undefined ? ({ kind: "tags" } as const) : ({ kind: "tags", itemId } as const);
+      await controller.openModal(modal);
+      controller.state.tagDraft = "好き";
+      api.createTag.mockRejectedValueOnce(new Error("同じ名前のタグが既にあります。"));
+      api.getList.mockResolvedValueOnce(refreshed);
+
+      await controller.saveTag();
+
+      expect(api.getList).toHaveBeenCalledTimes(2);
+      expect(controller.state.active).toEqual(refreshed);
+      expect(controller.state.modal).toEqual(modal);
+      expect(controller.state.tagDraft).toBe("好き");
+      expect(controller.state.error).toBe("同じ名前のタグが既にあります。");
+    },
+  );
+
   it("reloads a concurrently deleted tag and clears the editor after a rename error", async () => {
     const initial = {
       ...list(),
