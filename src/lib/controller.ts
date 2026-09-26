@@ -9,7 +9,7 @@ import type {
   SearchSettings,
 } from "./types.js";
 
-export type View = "items" | "compare" | "ranking" | "settings";
+export type View = "items" | "compare" | "ranking" | "tier" | "settings";
 type ReadKind = "image" | "settings";
 export type Modal =
   | { kind: "create-list" }
