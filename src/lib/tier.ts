@@ -71,9 +71,9 @@ export function tierRows(items: readonly Item[]): TierRow[] {
       const binaryPosition = (binaryScores[index]! - binaryLowest) * BigInt(labels.length);
       for (let boundary = 1; boundary < labels.length; boundary += 1) {
         const lowerBands = labels.length - boundary;
-        // Decimal JSON scores and their binary representations can round on opposite sides.
+        // Treat exact decimal boundaries as equal without letting rounded text shift other scores.
         if (
-          decimalPosition <= decimalSpan * BigInt(lowerBands) ||
+          decimalPosition === decimalSpan * BigInt(lowerBands) ||
           binaryPosition <= binarySpan * BigInt(lowerBands)
         ) {
           tier = boundary;

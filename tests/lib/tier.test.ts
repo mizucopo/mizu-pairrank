@@ -112,6 +112,22 @@ describe("tierRows", () => {
     ]);
   });
 
+  it("does not let rounded decimal text demote a score above the binary boundary", () => {
+    const rows = tierRows(
+      [32.59861497583112, 29.786112771572636, 18.536103954538703].map((mu, index) =>
+        item(index + 1, mu),
+      ),
+    );
+
+    expect(rows.map((row) => row.entries.map(({ item: entry }) => entry.id))).toEqual([
+      [1, 2],
+      [],
+      [],
+      [],
+      [3],
+    ]);
+  });
+
   it("keeps equal scores together and preserves the incoming ranking order and ranks", () => {
     const rows = tierRows([item(1, 50), item(42, 40), item(7, 40), item(2, 35), item(9, 0)]);
 
