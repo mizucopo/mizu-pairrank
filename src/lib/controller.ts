@@ -449,18 +449,17 @@ export class AppController {
     }
     await this.perform(async () => {
       if (!name) throw new Error("タグ名を入力してください。");
-      const result =
-        editingId === null
-          ? await this.api
-              .createTag(list.id, name, modal.itemId)
-              .catch((error: unknown) =>
-                modal.itemId === undefined
-                  ? this.handleListError(list.id, error)
-                  : this.handleItemError(list.id, modal.itemId, error),
-              )
-          : await this.api
-              .renameTag(list.id, editingId, name)
-              .catch((error: unknown) => this.handleListError(list.id, error));
+      let result: ListState;
+      if (editingId === null) {
+        result = await this.api.createTag(list.id, name, modal.itemId).catch((error: unknown) => {
+          if (modal.itemId === undefined) return this.handleListError(list.id, error);
+          return this.handleItemError(list.id, modal.itemId, error);
+        });
+      } else {
+        result = await this.api
+          .renameTag(list.id, editingId, name)
+          .catch((error: unknown) => this.handleListError(list.id, error));
+      }
       this.acceptCommittedList(result);
       this.state.tagDraft = "";
       this.state.tagEditingId = null;

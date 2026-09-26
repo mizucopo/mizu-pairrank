@@ -107,10 +107,11 @@ function comparisonView(s: AppState, assetUrl: (path: string) => string): string
 function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
+  const selectedTagId = s.selectedTagId;
   const visible =
-    s.selectedTagId === null
+    selectedTagId === null
       ? list.items
-      : list.items.filter((item) => item.tagIds.includes(s.selectedTagId!));
+      : list.items.filter((item) => item.tagIds.includes(selectedTagId));
   return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div><div class="ranking-filter"><label for="ranking-tag">表示するタグ</label><select id="ranking-tag" data-focus="ranking-tag"${disabled(s)}><option value=""${s.selectedTagId === null ? " selected" : ""}>すべて</option>${list.tags.map((tag) => `<option value="${tag.id}"${s.selectedTagId === tag.id ? " selected" : ""}>${e(tag.name)}</option>`).join("")}</select></div>${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagId !== null ? '<div class="empty compact"><p>このタグが付いた項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
