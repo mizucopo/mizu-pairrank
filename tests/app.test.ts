@@ -115,6 +115,76 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it("shows score-based tiers from left to right while keeping the ranking and updating after an answer", async () => {
+    const { root, controller, api, state, pair } = setup();
+    const items = [50, 41, 39, 30, 20, 10].map((mu, index) => ({
+      ...state.items[0]!,
+      id: 10 + index,
+      name: `項目${index + 1}`,
+      rating: { mu, sigma: 8 },
+    }));
+    const ranked = { ...state, items };
+    api.getList.mockResolvedValueOnce(ranked);
+    api.resumeList.mockResolvedValueOnce(ranked);
+    await controller.initialize();
+
+    await click(root, controller, '.tabs [data-view="tier"]');
+    expect(controller.state.view).toBe("tier");
+    const namesByTier = () =>
+      [...root.querySelectorAll(".tier-row")].map((row) => [
+        row.querySelector(".tier-label")?.textContent,
+        [...row.querySelectorAll(".tier-name")].map((name) => name.textContent),
+      ]);
+    expect(namesByTier()).toEqual([
+      ["S", ["項目1"]],
+      ["A", ["項目2", "項目3"]],
+      ["B", ["項目4"]],
+      ["C", ["項目5"]],
+      ["D", ["項目6"]],
+    ]);
+    expect(
+      [...root.querySelectorAll(".tier-card .tier-rank")].map((rank) => rank.textContent),
+    ).toEqual(["1 位", "2 位", "3 位", "4 位", "5 位", "6 位"]);
+
+    await click(root, controller, '.tabs [data-view="ranking"]');
+    expect(
+      [...root.querySelectorAll(".ranking-list .rank-row h3")].map((name) => name.textContent),
+    ).toEqual(items.map((item) => item.name));
+    await click(root, controller, '.tabs [data-view="tier"]');
+    await click(root, controller, '.section-heading button[data-view="compare"]');
+    const updated = {
+      ...ranked,
+      revision: 6,
+      comparisonCount: 1,
+      items: [
+        items[0]!,
+        items[2]!,
+        { ...items[1]!, rating: { mu: 32, sigma: 8 } },
+        ...items.slice(3),
+      ],
+    };
+    api.answer.mockResolvedValueOnce(updated);
+    api.nextPair.mockResolvedValueOnce({ ...pair, revision: 6 });
+    await click(root, controller, '[data-answer="a_weak"]');
+    await controller.navigate("tier");
+    expect(namesByTier()).toEqual([
+      ["S", ["項目1"]],
+      ["A", ["項目3"]],
+      ["B", ["項目2", "項目4"]],
+      ["C", ["項目5"]],
+      ["D", ["項目6"]],
+    ]);
+  });
+
+  it("shows an empty Tier table prompt when the list has no items", async () => {
+    const { root, controller, api, state } = setup();
+    api.getList.mockResolvedValueOnce({ ...state, items: [] });
+    await controller.initialize();
+    await click(root, controller, '.tabs [data-view="tier"]');
+    expect(root.textContent).toContain("項目を追加すると、ここに Tier 表が表示されます。");
+    expect(root.querySelector(".tier-table")).toBeNull();
+  });
+
   it.each([
     [false, false, true, null, false],
     [true, false, false, "brave", false],

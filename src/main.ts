@@ -231,7 +231,13 @@ export function mountApp(
       return;
     }
     const view = button.dataset.view;
-    if (view === "items" || view === "compare" || view === "ranking" || view === "settings") {
+    if (
+      view === "items" ||
+      view === "compare" ||
+      view === "ranking" ||
+      view === "tier" ||
+      view === "settings"
+    ) {
       void controller.navigate(view);
       return;
     }
