@@ -578,3 +578,45 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.latest-state.outputs.release_tag }}
         run: gh release edit "$TAG" --latest
+
+  notify-homebrew:
+    needs: [preflight, promote-latest]
+    if: github.repository == 'mizucopo/mizu-pairrank' && github.ref == 'refs/heads/main' && needs.preflight.outputs.is_prerelease == 'false' && vars.HOMEBREW_TAP_NOTIFY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Create short-lived Tap notification token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: mizucopo
+          repositories: homebrew-tap
+          permission-actions: write
+
+      - name: Request Tap reconciliation after release publication
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # No release body, tag or URL is interpolated into commands or sent as authority.
+          # Tap independently checks the latest stable release of every registered app.
+          # A duplicate request is safe if the first response is lost.
+          for attempt in 1 2 3; do
+            if gh api --method POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              /repos/mizucopo/homebrew-tap/actions/workflows/update-casks.yml/dispatches \
+              --input - <<'JSON'
+          {"ref":"main","inputs":{"apply":true}}
+          JSON
+            then
+              echo 'Tap reconciliation requested; check its workflow run for the publication result.'
+              exit 0
+            fi
+            sleep "$((attempt * 2))"
+          done
+          echo '::error::Tap notification failed. Rerun this failed job or run the Tap workflow manually.'
+          exit 1
