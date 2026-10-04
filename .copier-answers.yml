@@ -1,4 +1,4 @@
-_commit: fa41199
+_commit: b81e7b1
 _src_path: git@github.com:mizucopo/repo-template.git
 author_email: mizu.copo@gmail.com
 author_name: みず
@@ -14,9 +14,9 @@ tauri_version: 0.7.0
 use_chrome_extension: false
 use_dependabot_github_actions: true
 use_docker: false
-use_gh_actions_pr_tag_check: false
 use_gh_actions_release: false
 use_gh_actions_tauri_build: true
+use_gh_actions_tauri_homebrew_notify: false
 use_mit_license: false
 use_python: false
 use_rust: false

@@ -34,111 +34,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+
           if [ -f package-lock.json ]; then
             npm ci
           else
             npm install
           fi
 
-      - name: Run Oxlint
-        id: oxlint
-        continue-on-error: true
-        run: npm run lint
-
-      - name: Run Prettier check
-        id: prettier
-        continue-on-error: true
-        run: npm run format:check
-
-      - name: Run TypeScript typecheck
-        id: typecheck
-        continue-on-error: true
-        run: npm run typecheck
-
-      - name: Run Vitest
-        id: vitest
-        continue-on-error: true
-        timeout-minutes: 10
-        run: npm run test:run
-
-      - name: Run frontend build
-        id: frontend-build
-        continue-on-error: true
-        run: npm run build
-
-      - name: Run rustfmt check
-        id: rustfmt
-        continue-on-error: true
-        run: npm run cargo:fmt
-
-      - name: Run Clippy
-        id: clippy
-        continue-on-error: true
-        run: npm run cargo:clippy
-
-      - name: Run cargo test
-        id: cargo-test
-        continue-on-error: true
-        timeout-minutes: 10
-        run: npm run cargo:test
-
-      - name: Build Tauri quality check summary
-        id: tauri-quality-report
-        if: ${{ !cancelled() }}
-        env:
-          OXLINT_OUTCOME: ${{ steps.oxlint.outcome }}
-          PRETTIER_OUTCOME: ${{ steps.prettier.outcome }}
-          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
-          VITEST_OUTCOME: ${{ steps.vitest.outcome }}
-          FRONTEND_BUILD_OUTCOME: ${{ steps.frontend-build.outcome }}
-          RUSTFMT_OUTCOME: ${{ steps.rustfmt.outcome }}
-          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
-          CARGO_TEST_OUTCOME: ${{ steps.cargo-test.outcome }}
-        run: |
-          format_result() {
-            case "$1" in
-              success) printf '✅ 成功' ;;
-              failure) printf '❌ 失敗' ;;
-              skipped) printf '⏭️ スキップ' ;;
-              *) printf '❓ %s' "${1:-unknown}" ;;
-            esac
-          }
-
-          cat > tauri_quality_report.md <<EOF
-          ## Tauri Quality Checks Result
-
-          | Item | Result |
-          |-------------|------|
-          | Oxlint | $(format_result "$OXLINT_OUTCOME") |
-          | Prettier | $(format_result "$PRETTIER_OUTCOME") |
-          | TypeScript | $(format_result "$TYPECHECK_OUTCOME") |
-          | Vitest | $(format_result "$VITEST_OUTCOME") |
-          | Frontend build | $(format_result "$FRONTEND_BUILD_OUTCOME") |
-          | rustfmt | $(format_result "$RUSTFMT_OUTCOME") |
-          | Clippy | $(format_result "$CLIPPY_OUTCOME") |
-          | cargo test | $(format_result "$CARGO_TEST_OUTCOME") |
-          EOF
-
-          cat tauri_quality_report.md >> "$GITHUB_STEP_SUMMARY"
-
-          HAS_FAILURE=false
-          for outcome in \
-            "$OXLINT_OUTCOME" \
-            "$PRETTIER_OUTCOME" \
-            "$TYPECHECK_OUTCOME" \
-            "$VITEST_OUTCOME" \
-            "$FRONTEND_BUILD_OUTCOME" \
-            "$RUSTFMT_OUTCOME" \
-            "$CLIPPY_OUTCOME" \
-            "$CARGO_TEST_OUTCOME"; do
-            if [ "$outcome" != "success" ]; then
-              HAS_FAILURE=true
-            fi
-          done
-          echo "has-failure=$HAS_FAILURE" >> "$GITHUB_OUTPUT"
-
-      - name: Enforce quality gate result
-        if: ${{ !cancelled() && steps.tauri-quality-report.outputs.has-failure == 'true' }}
-        run: |
-          echo "::error::One or more Tauri quality checks failed or were skipped."
-          exit 1
+      - name: Run quality gate
+        timeout-minutes: 20
+        run: npm run check

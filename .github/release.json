@@ -1,0 +1,32 @@
+{
+  "version": {
+    "scheme": "semver",
+    "sources": [
+      { "path": "package.json", "format": "json", "key": ["version"] },
+      { "path": "src-tauri/tauri.conf.json", "format": "json", "key": ["version"] },
+      { "path": "src-tauri/Cargo.toml", "format": "toml", "key": ["package", "version"] }
+    ],
+    "locks": [
+      { "path": "package-lock.json", "format": "json", "key": ["version"], "optional": true },
+      {
+        "path": "package-lock.json",
+        "format": "json",
+        "key": ["packages", "", "version"],
+        "optional": true
+      },
+      {
+        "path": "src-tauri/Cargo.lock",
+        "format": "toml-lock",
+        "package": "mizu-pairrank",
+        "optional": true
+      }
+    ]
+  },
+  "publication": {
+    "release_tag": "{version}",
+    "github_release": true,
+    "release_paths": ["version", "revision", "Dockerfile"],
+    "latest_image": null,
+    "images": []
+  }
+}
