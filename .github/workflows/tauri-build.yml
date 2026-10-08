@@ -17,17 +17,22 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: read
     outputs:
-      publish: ${{ steps.prepare.outputs.publish }}
+      publish: ${{ steps.prepare.outputs.publish || 'false' }}
       release_sha: ${{ steps.prepare.outputs.release_sha }}
       release_tag: ${{ steps.prepare.outputs.release_tag }}
       version: ${{ steps.prepare.outputs.version }}
     steps:
+      - name: Validate release branch
+        run: |
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo '::error::Release requires main. Select the main branch when running this workflow manually.'
+            exit 1
+          fi
       - name: Checkout control code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

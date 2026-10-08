@@ -15,10 +15,11 @@ from urllib import error, parse, request
 POLICY = ".github/release.json"
 LEVELS = {"patch", "minor", "major"}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+# The first nonnumeric prerelease character uniquely splits the identifier.
 SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(?:-((?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z"
 )
 
@@ -219,19 +220,33 @@ def choose(
             floor = revision_number(explicit_revision)
         revision = f"r{floor}"
     else:
-        if (
-            scheme == "semver"
-            and SEMVER.fullmatch(base_version).group(4)
-            and level != "patch"
-        ):
+        pre = SEMVER.fullmatch(base_version).group(4) if scheme == "semver" else None
+        if pre and level != "patch":
             require(
                 explicit_minimum is not None,
                 "Prerelease core/stable transition needs an explicit version minimum",
             )
-        version = bump(base_version, level, scheme)
+        if (
+            pre
+            and level == "patch"
+            and not pre.split(".")[-1].isdigit()
+            and explicit_minimum is not None
+        ):
+            # No automatic sequence exists; an explicit transition must exceed base.
+            version = base_version
+        else:
+            version = bump(base_version, level, scheme)
         if explicit_minimum is not None:
+            minimum_key = version_key(explicit_minimum, scheme)
+            required_key = version_key(version, scheme)
+            if scheme == "semver" and required_key[1] == 1:
+                # A core increment may start a prerelease at that same core.
+                # Existing prerelease patch sequences still use full precedence.
+                minimum_key, required_key = minimum_key[0], required_key[0]
             require(
-                version_key(explicit_minimum, scheme) >= version_key(version, scheme),
+                minimum_key >= required_key
+                and version_key(explicit_minimum, scheme)
+                > version_key(base_version, scheme),
                 f"Explicit minimum {explicit_minimum} does not meet {level} "
                 f"increment from {base_version}",
             )
@@ -271,6 +286,10 @@ def choose(
 
 def get_field(data, keys):
     for key in keys:
+        require(
+            isinstance(data, list) if isinstance(key, int) else isinstance(data, dict),
+            "Version path container does not match its key",
+        )
         data = data[key]
     return data
 
@@ -485,13 +504,33 @@ class Git:
         return self.command("mktag", data=data.encode()).decode().strip()
 
 
-def read_version(git, tree, policy):
+def read_version(git, tree, policy, allow_missing=False):
     specs = policy["version"]["sources"]
     require(specs, "No version sources declared")
-    values = [read_field(git.blob(tree, spec["path"]), spec) for spec in specs]
-    require(len(set(values)) == 1, "Declared version sources disagree")
     scheme = policy["version"]["scheme"]
-    version_key(values[0], "semver" if scheme == "upstream-revision" else scheme)
+    scheme = "semver" if scheme == "upstream-revision" else scheme
+    values = []
+    for spec in specs:
+        blob = git.blob(tree, spec["path"], allow_missing)
+        if blob is None:
+            continue
+        try:
+            value = read_field(blob, spec)
+        except (
+            KeyError,
+            IndexError,
+        ):
+            if not allow_missing:
+                raise
+            continue
+        if allow_missing:
+            # A new field may be absent; existing fields must still be valid.
+            version_key(value, scheme)
+        values.append(value)
+    require(len(set(values)) <= 1, "Declared version sources disagree")
+    if len(values) != len(specs):
+        return None
+    version_key(values[0], scheme)
     return values[0]
 
 
@@ -514,7 +553,11 @@ class GitHub:
         self.root = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
     def api(self, path, method="GET", payload=None, missing=False, raw=False):
-        url = self.root + path
+        url = (
+            os.environ.get("GITHUB_GRAPHQL_URL", self.root + path)
+            if path == "/graphql"
+            else self.root + path
+        )
         headers = {
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
             "Accept": "application/vnd.github+json",
@@ -556,6 +599,104 @@ class GitHub:
                 return result
         raise PreparationError("GitHub pagination exceeded 1000 pages")
 
+    def commit_prs(self, commits):
+        for _, candidates in self.commit_associations(commits):
+            yield from candidates
+
+    def commit_associations(self, commits):
+        owner, name = self.repository.split("/")
+        for start in range(0, len(commits), 50):
+            batch = commits[start : start + 50]
+            associations = {sha: [] for sha in batch}
+            pending = {f"c{index}": (sha, None) for index, sha in enumerate(batch)}
+            for _ in range(1000):
+                declarations = ["$owner:String!", "$name:String!"]
+                variables = {"owner": owner, "name": name}
+                fields = []
+                for alias, (sha, cursor) in pending.items():
+                    declarations.extend(
+                        [f"${alias}:GitObjectID!", f"${alias}After:String"]
+                    )
+                    variables.update({alias: sha, alias + "After": cursor})
+                    fields.append(
+                        f"{alias}:object(oid:${alias}) "
+                        "{ ... on Commit { "
+                        f"associatedPullRequests(first:100,after:${alias}After) "
+                        "{ nodes { number merged baseRefName } "
+                        "pageInfo { hasNextPage endCursor } } } }"
+                    )
+                query = (
+                    f"query({','.join(declarations)}) "
+                    "{ repository(owner:$owner,name:$name) { "
+                    + " ".join(fields)
+                    + " } }"
+                )
+                result = self.api(
+                    "/graphql",
+                    method="POST",
+                    payload={
+                        "query": query,
+                        "variables": variables,
+                    },
+                )
+                require(
+                    isinstance(result, dict) and not result.get("errors"),
+                    "GitHub commit association query failed",
+                )
+                data = result.get("data")
+                repository = data.get("repository") if isinstance(data, dict) else None
+                require(
+                    isinstance(repository, dict) and repository,
+                    "GitHub commit association repository unavailable",
+                )
+                following = {}
+                for alias, (sha, cursor) in pending.items():
+                    commit = repository.get(alias)
+                    connection = (
+                        commit.get("associatedPullRequests")
+                        if isinstance(commit, dict)
+                        else None
+                    )
+                    require(
+                        isinstance(connection, dict),
+                        f"Missing PR association evidence for {sha}",
+                    )
+                    nodes, page = connection.get("nodes"), connection.get("pageInfo")
+                    require(
+                        isinstance(nodes, list)
+                        and all(
+                            isinstance(node, dict)
+                            and type(node.get("number")) is int
+                            and node["number"] > 0
+                            and type(node.get("merged")) is bool
+                            and isinstance(node.get("baseRefName"), str)
+                            for node in nodes
+                        )
+                        and isinstance(page, dict)
+                        and type(page.get("hasNextPage")) is bool
+                        and "endCursor" in page,
+                        f"Incomplete PR association evidence for {sha}",
+                    )
+                    associations[sha].extend(nodes)
+                    if page["hasNextPage"]:
+                        after = page.get("endCursor")
+                        require(
+                            isinstance(after, str) and after and after != cursor,
+                            "Invalid PR association cursor",
+                        )
+                        following[alias] = (sha, after)
+                pending = following
+                if not pending:
+                    break
+            else:
+                raise PreparationError(
+                    "GitHub PR association pagination exceeded 1000 pages"
+                )
+            # Finish every page before selecting a PR. Preserve main ancestry
+            # order even when older commits need additional association pages.
+            for sha in batch:
+                yield sha, associations[sha]
+
 
 def policy_at(git, commit):
     policy = json.loads(git.blob(commit, POLICY))
@@ -570,12 +711,14 @@ def classification(pr):
     labels = [
         label["name"] for label in pr["labels"] if label["name"].startswith("release:")
     ]
+    if not labels:
+        return None
     require(
         len(labels) == 1 and labels[0][8:] in LEVELS,
         f"PR #{pr['number']} needs exactly one release:patch/minor/major label",
     )
     require(
-        bool((pr.get("body") or "").strip()),
+        bool(re.sub(r"<!--.*?(?:-->|$)", "", pr.get("body") or "", flags=re.S).strip()),
         f"PR #{pr['number']} needs a classification reason in its body",
     )
     return labels[0][8:]
@@ -583,10 +726,15 @@ def classification(pr):
 
 def record_at(git, commit):
     message = git.text("show", "-s", "--format=%B", commit)
-    if "Repo-Template-Release: 1" not in message.splitlines():
+    lines = message.splitlines()
+    # A marker quoted in ordinary prose is not a record. Once release fields
+    # appear, validate the entire record, including missing or invalid fields.
+    if "Repo-Template-Release: 1" not in lines or not any(
+        line.startswith("Release-") for line in lines
+    ):
         return None
     fields = {}
-    for line in message.splitlines():
+    for line in lines:
         if line.startswith("Release-"):
             key, sep, value = line.partition(":")
             require(sep and key[8:] not in fields, "Invalid release commit trailers")
@@ -635,7 +783,11 @@ def records(git, main):
         "--grep=^Repo-Template-Release: 1$",
         main,
     )
-    return [record_at(git, commit) for commit in commits.splitlines()]
+    return [
+        record
+        for commit in commits.splitlines()
+        if (record := record_at(git, commit)) is not None
+    ]
 
 
 def publication_at(git, commit, policy=None):
@@ -771,77 +923,138 @@ def prepared(git, record):
     }
 
 
-def prepare(git, gh, run_id, control_commit=None):
+def verify_squash_merge(git, gh, commit, pr):
+    parents = git.text("rev-list", "--parents", "-n", "1", commit).split()
+    require(len(parents) == 2, "Use squash merge only")
+    base = pr.get("base", {}).get("sha")
+    history = git.ancestors(commit)
+    require(
+        isinstance(base, str) and SHA.fullmatch(base) and base in history[1:],
+        f"PR #{pr['number']} needs a verifiable main base SHA",
+    )
+    # The recorded base can predate unrelated main updates. Only commits
+    # introduced by this PR after that base distinguish a multi-commit rebase.
+    # Associations at or before the base are not evidence of this merge.
+    require(
+        not any(
+            candidate["number"] == pr["number"]
+            and candidate["merged"]
+            and candidate["baseRefName"] == "main"
+            for candidate in gh.commit_prs(history[1 : history.index(base)])
+        ),
+        f"Use squash merge only: PR #{pr['number']} introduced multiple main commits",
+    )
+
+
+def preparation_input(git, gh, run_id, control_commit=None):
     require(str(run_id).isdigit(), "GITHUB_RUN_ID is required")
     require(
         gh.repo()["default_branch"] == "main", "Release requires default branch main"
     )
-    for _ in range(3):
-        main = git.fetch_main()
-        history = records(git, main)
-        prior = next((r for r in history if r["Run"] == str(run_id)), None)
-        if prior:
-            return prepared(git, prior)
-        if control_commit:
+    main = git.fetch_main()
+    history = records(git, main)
+    prior = next((r for r in history if r["Run"] == str(run_id)), None)
+    if prior:
+        return {"record": prior}
+    if control_commit:
 
-            def controls(commit):
-                return {
-                    path: entry
-                    for path, entry in git.entries(commit).items()
-                    if path == POLICY
-                    or path.startswith((".github/scripts/", ".github/workflows/"))
-                }
+        def controls(commit):
+            return {
+                path: entry
+                for path, entry in git.entries(commit).items()
+                if path == POLICY
+                or path.startswith((".github/scripts/", ".github/workflows/"))
+            }
 
-            if controls(control_commit) != controls(main):
-                # The newer push has its own queued run with the updated workflow.
-                return {"publish": "false"}
-        policy = policy_at(git, main)
-        last = history[0] if history else None
-        if last:
-            boundary = last["commit"]
-        else:
-            introductions = git.text(
-                "log",
-                "--first-parent",
-                "--diff-filter=A",
-                "--format=%H",
-                main,
-                "--",
-                POLICY,
-            ).splitlines()
-            require(introductions, "Cannot find release configuration introduction")
-            parents = git.text(
-                "rev-list", "--parents", "-n", "1", introductions[-1]
-            ).split()
-            boundary = parents[1] if len(parents) == 2 else None
-        commits = git.ancestors(main)
-        pending = list(
-            reversed(commits[: commits.index(boundary)] if boundary else commits)
-        )
-        if not pending:
-            return {"publish": "false"}
-        levels, numbers = [], []
-        for commit in pending:
-            require(
-                len(git.text("rev-list", "--parents", "-n", "1", commit).split()) <= 2,
-                "Use squash merge only",
-            )
-            matches = [
-                p
-                for p in gh.pages(f"/commits/{commit}/pulls")
-                if p.get("merged_at")
-                and p["base"]["ref"] == "main"
-                and p.get("merge_commit_sha") == commit
-            ]
-            if boundary is None and commit == commits[-1] and not matches:
-                # A new repository starts with its configured version.
+        if controls(control_commit) != controls(main):
+            # The newer push has its own queued run with the updated workflow.
+            return None
+    last = history[0] if history else None
+    introduction = None
+    if last:
+        boundary = last["commit"]
+    else:
+        introductions = git.text(
+            "log",
+            "--first-parent",
+            "--diff-filter=A",
+            "--format=%H",
+            main,
+            "--",
+            POLICY,
+        ).splitlines()
+        require(introductions, "Cannot find release configuration introduction")
+        introduction = introductions[-1]
+        parents = git.text("rev-list", "--parents", "-n", "1", introduction).split()
+        boundary = parents[1] if len(parents) == 2 else None
+    commits = git.ancestors(main)
+    pending = commits[: commits.index(boundary)] if boundary else commits
+    if not pending:
+        return None
+    # Stop at the newest merge on main; older PR classifications are irrelevant.
+    pr = None
+    for commit, candidates in gh.commit_associations(pending):
+        # API 2026-03-10 omits merge_commit_sha from PRs. The timeline's
+        # merged event still identifies the final merge commit.
+        matches = []
+        for candidate in candidates:
+            if not candidate["merged"] or candidate["baseRefName"] != "main":
                 continue
+            merges = [
+                event.get("commit_id")
+                for event in gh.pages(f"/issues/{candidate['number']}/timeline")
+                if event.get("event") == "merged"
+            ]
             require(
-                len(matches) == 1, f"Commit {commit} needs exactly one squash-merged PR"
+                len(merges) == 1
+                and isinstance(merges[0], str)
+                and SHA.fullmatch(merges[0]),
+                f"PR #{candidate['number']} needs a verifiable merge event",
             )
+            if merges[0] == commit:
+                matches.append(candidate)
+        require(
+            len(matches) <= 1, f"Commit {commit} needs exactly one squash-merged PR"
+        )
+        if matches:
             pr = gh.repo(f"/pulls/{matches[0]['number']}")
-            levels.append(classification(pr))
-            numbers.append(pr["number"])
+            verify_squash_merge(git, gh, commit, pr)
+            break
+    if pr is None:
+        return None
+    level = classification(pr)
+    if level is None:
+        return None
+    return {
+        "main": main,
+        "last": last,
+        "baseline": last["commit"] if last else boundary or commits[-1],
+        "introduction": introduction,
+        "pr": pr,
+        "level": level,
+    }
+
+
+def intent(git, gh, run_id, control_commit=None):
+    candidate = preparation_input(git, gh, run_id, control_commit)
+    if candidate is None:
+        return {"publish": "false"}
+    if "record" in candidate:
+        return prepared(git, candidate["record"])
+    return {"publish": "true"}
+
+
+def prepare(git, gh, run_id, control_commit=None):
+    for _ in range(3):
+        candidate = preparation_input(git, gh, run_id, control_commit)
+        if candidate is None:
+            return {"publish": "false"}
+        if "record" in candidate:
+            return prepared(git, candidate["record"])
+        main, last = candidate["main"], candidate["last"]
+        pr, level = candidate["pr"], candidate["level"]
+        numbers = [pr["number"]]
+        policy = policy_at(git, main)
         version = read_version(git, main, policy)
         revision_path = policy["version"].get("revision_path")
         revision = (
@@ -849,53 +1062,35 @@ def prepare(git, gh, run_id, control_commit=None):
             if revision_path
             else None
         )
-        level = (
-            max(levels, key=lambda v: ["patch", "minor", "major"].index(v))
-            if levels
-            else "patch"
+        baseline = candidate["baseline"]
+        base_version = (
+            read_version(git, baseline, policy, allow_missing=not last)
+            if baseline
+            else None
         )
-        baseline = last["commit"] if last else boundary
-        if baseline and not last:
-            entries = git.entries(baseline)
-            if any(
-                spec["path"] not in entries for spec in policy["version"]["sources"]
-            ):
-                baseline = None
-        base_version = read_version(git, baseline, policy) if baseline else version
+        if base_version is None:
+            # A newly introduced source has no parent value. Preserve its
+            # adoption value even when unlabeled PRs defer the first release.
+            baseline = candidate["introduction"]
+            base_version = read_version(git, baseline, policy_at(git, baseline))
         base_revision = (
             (git.blob(baseline, revision_path, True) or b"r0").decode().strip()
             if baseline and revision_path
             else revision
         )
         explicit = version if version != base_version and not revision_path else None
-        if not levels:
-            # choose() bumps its base; reserve the initial candidate directly instead.
-            candidate = publication(policy, version, revision)
-            if not remote_collisions(gh, candidate):
-                plan = candidate
-            else:
-                version, revision, plan = choose(
-                    policy,
-                    base_version,
-                    level,
-                    None,
-                    lambda p: remote_collisions(gh, p),
-                    base_revision=base_revision,
-                    input_version=version,
-                )
-        else:
-            version, revision, plan = choose(
-                policy,
-                base_version,
-                level,
-                explicit,
-                lambda p: remote_collisions(gh, p),
-                base_revision=base_revision,
-                input_version=version,
-                explicit_revision=revision
-                if revision_path and revision != base_revision
-                else None,
-            )
+        version, revision, plan = choose(
+            policy,
+            base_version,
+            level,
+            explicit,
+            lambda p: remote_collisions(gh, p),
+            base_revision=base_revision,
+            input_version=version,
+            explicit_revision=revision
+            if revision_path and revision != base_revision
+            else None,
+        )
         tree = update_versions(git, main, policy, version, revision)
         message = (
             f"chore(release): {plan['release_tag']}\n\nRepo-Template-Release: 1\n"
@@ -966,7 +1161,15 @@ def latest(git, gh, commit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=["prepare", "plan", "latest", "image-state", "classification"]
+        "action",
+        choices=[
+            "intent",
+            "prepare",
+            "plan",
+            "latest",
+            "image-state",
+            "classification",
+        ],
     )
     parser.add_argument("--root", default=".")
     args = parser.parse_args()
@@ -976,8 +1179,9 @@ def main():
         classification(gh.repo(f"/pulls/{event['number']}"))
         return
     require(os.environ.get("GITHUB_REF") == "refs/heads/main", "Release requires main")
-    if args.action == "prepare":
-        values = prepare(git, gh, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"])
+    if args.action in {"intent", "prepare"}:
+        action = intent if args.action == "intent" else prepare
+        values = action(git, gh, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_SHA"])
     else:
         plan = checkout_plan(git)
         if args.action == "plan":
