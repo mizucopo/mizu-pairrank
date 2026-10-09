@@ -628,9 +628,10 @@ mod tests {
         assert_ne!(asset.path, original.path);
         assert!(asset.source_url.is_none());
         let images = backend.images.as_ref().unwrap();
+        let mut pixels_left = u64::MAX;
         assert_eq!(
-            images.export_image(asset).unwrap(),
-            images.export_image(&original).unwrap()
+            images.export_image(asset, &mut pixels_left).unwrap(),
+            images.export_image(&original, &mut pixels_left).unwrap()
         );
         let service = images.clone();
         backend
@@ -652,9 +653,10 @@ mod tests {
         let (directory, backend) = backend();
         let (list_id, _, original) = list_with_image(&backend).await;
         let service = backend.images.as_ref().unwrap().clone();
+        let mut pixels_left = u64::MAX;
         let valid = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            service.export_image(&original).unwrap(),
+            service.export_image(&original, &mut pixels_left).unwrap(),
         );
         let path = directory.path().join("broken.zip");
         let mut value = serde_json::json!({"format":"mizu-pairrank-list","version":1,"name":"新規","tags":[],
@@ -702,18 +704,19 @@ mod tests {
         let service = ImageService::new(root.path().join("data")).unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png");
         let mut image = service.import_local(source.clone()).unwrap();
-        let bytes = service.export_image(&image).unwrap();
+        let mut pixels_left = u64::MAX;
+        let bytes = service.export_image(&image, &mut pixels_left).unwrap();
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         image.path = source.to_string_lossy().into_owned();
-        assert!(service.export_image(&image).is_err());
+        assert!(service.export_image(&image, &mut pixels_left).is_err());
         image.path = "../../icons/32x32.png".to_owned();
-        assert!(service.export_image(&image).is_err());
+        assert!(service.export_image(&image, &mut pixels_left).is_err());
         #[cfg(unix)]
         {
             image.path = format!("{}.png", uuid::Uuid::new_v4());
             std::os::unix::fs::symlink(source, root.path().join("data/images").join(&image.path))
                 .unwrap();
-            assert!(service.export_image(&image).is_err());
+            assert!(service.export_image(&image, &mut pixels_left).is_err());
         }
     }
 

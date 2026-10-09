@@ -24,7 +24,9 @@ pub struct PortableList {
     pub format: String,
     pub version: u32,
     pub name: String,
+    #[serde(deserialize_with = "read_tags")]
     pub tags: Vec<String>,
+    #[serde(deserialize_with = "read_items")]
     pub items: Vec<PortableItem>,
 }
 
@@ -32,9 +34,70 @@ pub struct PortableList {
 #[serde(deny_unknown_fields)]
 pub struct PortableItem {
     pub name: String,
+    #[serde(deserialize_with = "read_tags")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+}
+
+fn read_tags<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    read_bounded_sequence(deserializer, MAX_TAGS, MAX_TAGS, |_| 1)
+}
+
+fn read_items<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<PortableItem>, D::Error> {
+    read_bounded_sequence(deserializer, MAX_ITEMS, MAX_ASSIGNMENTS, |item| {
+        item.tags.len()
+    })
+}
+
+// Apply collection limits while parsing, before untrusted arrays can grow in memory.
+fn read_bounded_sequence<'de, D, T>(
+    deserializer: D,
+    maximum: usize,
+    budget: usize,
+    weight: fn(&T) -> usize,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedSequence<T> {
+        maximum: usize,
+        budget: usize,
+        weight: fn(&T) -> usize,
+    }
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for BoundedSequence<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an array within the list collection limits")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            mut self,
+            mut seq: A,
+        ) -> Result<Vec<T>, A::Error> {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element()? {
+                if values.len() == self.maximum {
+                    return Err(serde::de::Error::custom("list collection limit exceeded"));
+                }
+                self.budget = self
+                    .budget
+                    .checked_sub((self.weight)(&value))
+                    .ok_or_else(|| serde::de::Error::custom("list collection limit exceeded"))?;
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+    deserializer.deserialize_seq(BoundedSequence {
+        maximum,
+        budget,
+        weight,
+    })
 }
 
 impl PortableList {
@@ -169,13 +232,14 @@ pub fn encode(
         items: Vec::new(),
     };
     let mut image_bytes = 0;
+    let mut image_pixels_left = MAX_TOTAL_IMAGE_PIXELS;
     for item in list.items {
         let image = if include_images {
             item.image
                 .map(|image| {
                     let bytes = images
                         .ok_or_else(|| "画像の保存先を開けませんでした。".to_owned())?
-                        .export_image(&image)?;
+                        .export_image(&image, &mut image_pixels_left)?;
                     image_bytes += bytes.len().div_ceil(3) * 4;
                     if image_bytes > MAX_FILE_BYTES {
                         return Err(
@@ -460,6 +524,48 @@ mod tests {
     fn directory_offset(bytes: &[u8]) -> usize {
         let end = bytes.len() - 22;
         u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize
+    }
+
+    #[test]
+    fn deserialization_stops_at_collection_limits_before_reading_the_rest() {
+        for field in ["tags", "items"] {
+            let (count, value) = if field == "tags" {
+                (MAX_TAGS + 1, "\"tag\"")
+            } else {
+                (MAX_ITEMS + 1, "{\"name\":\"item\",\"tags\":[]}")
+            };
+            let mut json = format!(
+                "{{\"format\":\"mizu-pairrank-list\",\"version\":1,\"name\":\"list\",\"{field}\":["
+            );
+            json.push_str(&vec![value; count].join(","));
+            json.push_str(",malformed tail");
+            let error = serde_json::from_str::<PortableList>(&json).unwrap_err();
+            assert!(error.to_string().contains("collection limit"), "{error}");
+        }
+        let mut list = portable();
+        list.items[0].tags = vec!["tag".to_owned(); MAX_TAGS + 1];
+        let error = serde_json::from_slice::<PortableList>(&serde_json::to_vec(&list).unwrap())
+            .map(|_| ())
+            .expect_err("deserialization must stop at the collection limit");
+        assert!(error.to_string().contains("collection limit"));
+    }
+
+    #[test]
+    fn deserialization_bounds_total_tag_assignments_and_accepts_boundaries() {
+        let mut list = portable();
+        list.tags = (0..MAX_TAGS).map(|index| format!("tag{index}")).collect();
+        list.items[0].tags = list.tags.clone();
+        list.items = vec![list.items[0].clone(); MAX_ASSIGNMENTS / MAX_TAGS];
+        let parsed = parse(&serde_json::to_vec(&list).unwrap()).unwrap();
+        assert_eq!(parsed.items.len(), 50);
+        list.items.push(list.items[0].clone());
+        let error = serde_json::from_slice::<PortableList>(&serde_json::to_vec(&list).unwrap())
+            .map(|_| ())
+            .expect_err("deserialization must stop at the collection limit");
+        assert!(error.to_string().contains("collection limit"));
+        list.items[0].tags.clear();
+        list.items = vec![list.items[0].clone(); MAX_ITEMS];
+        assert!(parse(&serde_json::to_vec(&list).unwrap()).is_ok());
     }
 
     #[test]
