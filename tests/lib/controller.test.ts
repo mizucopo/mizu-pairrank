@@ -66,6 +66,8 @@ function backend(first = list(), second = list(2)) {
       .mockImplementation(async (id) => (id === first.id ? first : second)),
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(first),
     duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(first),
+    exportList: vi.fn<AppApi["exportList"]>().mockResolvedValue(true),
+    importList: vi.fn<AppApi["importList"]>().mockResolvedValue(first),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(first),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(first),
@@ -119,6 +121,192 @@ async function listSelection(context: "startup" | "after deletion") {
   const load = () => (context === "startup" ? controller.initialize() : controller.confirmDelete());
   return { api, controller, load };
 }
+
+describe("portable list transfer", () => {
+  it("requires an export modal and defaults images off whenever it opens", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.exportList();
+    expect(api.exportList).not.toHaveBeenCalled();
+
+    await controller.openModal({ kind: "export-list" });
+    expect(controller.state.exportIncludeImages).toBe(false);
+    controller.setExportIncludeImages(true);
+    controller.closeModal();
+    await controller.openModal({ kind: "export-list" });
+    expect(controller.state.exportIncludeImages).toBe(false);
+    await controller.exportList();
+    expect(api.exportList).toHaveBeenCalledExactlyOnceWith(1, false);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.notice).toBe("リストをエクスポートしました。");
+  });
+
+  it("retains explicit image selection after native save cancellation or an export error", async () => {
+    const initial = list();
+    const api = backend(initial);
+    api.exportList.mockResolvedValueOnce(false).mockRejectedValueOnce("保存に失敗しました。");
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "export-list" });
+    controller.setExportIncludeImages(true);
+
+    await controller.exportList();
+    expect(controller.state.modal?.kind).toBe("export-list");
+    expect(controller.state.notice).toBe("");
+    expect(controller.state.error).toBe("");
+    await controller.exportList();
+    expect(controller.state.error).toBe("保存に失敗しました。");
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.exportIncludeImages).toBe(true);
+    await controller.exportList();
+    expect(api.exportList.mock.calls).toEqual([
+      [1, true],
+      [1, true],
+      [1, true],
+    ]);
+    expect(controller.state.error).toBe("");
+    expect(controller.state.modal).toBeNull();
+  });
+
+  it.each(["export", "import"] as const)(
+    "gates %s writes and dismissal while a native operation is pending",
+    async (operation) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      let finish: (() => void) | undefined;
+      if (operation === "export")
+        api.exportList.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = () => resolve(false);
+            }),
+        );
+      else
+        api.importList.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = () => resolve(null);
+            }),
+        );
+      await controller.openModal({ kind: operation === "export" ? "export-list" : "import-list" });
+      const run = () =>
+        operation === "export" ? controller.exportList() : controller.importList();
+      const pending = run();
+      expect(controller.state.busy).toBe(true);
+      controller.closeModal();
+      controller.setExportIncludeImages(true);
+      await controller.navigate("ranking");
+      await controller.openModal({ kind: "create-list" });
+      await run();
+      expect(controller.state.modal?.kind).toBe(`${operation}-list`);
+      expect(controller.state.exportIncludeImages).toBe(false);
+      expect(controller.state.view).toBe("items");
+      expect(operation === "export" ? api.exportList : api.importList).toHaveBeenCalledTimes(1);
+      if (!finish) throw new Error("Native operation did not start");
+      finish();
+      await pending;
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it("leaves comparison, draft, and active list unchanged when import is cancelled or invalid", async () => {
+    const initial = list();
+    const api = backend(initial);
+    api.importList
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("対応していないファイルです。"));
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.startComparison();
+    const pair = controller.state.pair;
+    controller.state.drafts.items = "追加途中";
+    await controller.openModal({ kind: "import-list" });
+    await controller.importList();
+    expect(controller.state.error).toBe("");
+    expect(controller.state.notice).toBe("");
+    await controller.importList();
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.pair).toEqual(pair);
+    expect(controller.state.drafts.items).toBe("追加途中");
+    expect(controller.state.view).toBe("compare");
+    expect(controller.state.modal?.kind).toBe("import-list");
+    expect(controller.state.error).toBe("対応していないファイルです。");
+  });
+
+  it("opens an imported list with tags and images and clears state from the old list", async () => {
+    const initial = { ...list(), tags: [{ id: 1, listId: 1, name: "以前" }] };
+    const imported: ListState = {
+      ...list(3),
+      tags: [{ id: 2, listId: 3, name: "輸入" }],
+      items: list(3).items.map((item) => ({
+        ...item,
+        tagIds: [2],
+        image: { path: "imported.png", sourceUrl: null },
+      })),
+    };
+    const api = backend(initial);
+    api.importList.mockResolvedValueOnce(imported);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.selectTag(1);
+    controller.state.drafts.items = "古い項目の下書き";
+    controller.state.drafts.query = "古い検索";
+    await controller.startComparison();
+    await controller.openModal({ kind: "import-list" });
+    api.listSummaries.mockResolvedValueOnce([summary(initial), summary(imported)]);
+    await controller.importList();
+    expect(api.importList).toHaveBeenCalledExactlyOnceWith();
+    expect(controller.state.active).toEqual(imported);
+    expect(controller.state.lists).toEqual([summary(initial), summary(imported)]);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.view).toBe("items");
+    expect(controller.state.drafts.items).toBe("");
+    expect(controller.state.drafts.query).toBe("");
+    expect(controller.state.notice).toBe("新しいリストとしてインポートしました。");
+    expect(controller.state.error).toBe("");
+  });
+
+  it("keeps a committed imported list usable if refreshing the sidebar fails", async () => {
+    const initial = list();
+    const imported = list(3);
+    const api = backend(initial);
+    api.importList.mockResolvedValueOnce(imported);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "import-list" });
+    api.listSummaries.mockRejectedValueOnce(new Error("一覧を取得できません。"));
+    await controller.importList();
+    expect(controller.state.active).toEqual(imported);
+    expect(controller.state.lists).toContainEqual(summary(initial));
+    expect(controller.state.lists).toContainEqual(summary(imported));
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.notice).toBe("新しいリストとしてインポートしました。");
+    expect(controller.state.error).toBe(
+      "インポート後のリスト一覧を更新できませんでした: 一覧を取得できません。",
+    );
+    await controller.importList();
+    expect(api.importList).toHaveBeenCalledTimes(1);
+  });
+
+  it("imports into an empty app without creating or modifying another list", async () => {
+    const imported = list(3);
+    const api = backend();
+    api.listSummaries.mockResolvedValueOnce([]);
+    api.importList.mockResolvedValueOnce(imported);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "import-list" });
+    api.listSummaries.mockResolvedValueOnce([summary(imported)]);
+    await controller.importList();
+    expect(controller.state.active).toEqual(imported);
+    expect(api.createList).not.toHaveBeenCalled();
+    expect(api.deleteList).not.toHaveBeenCalled();
+  });
+});
 
 describe("tag management", () => {
   it("accepts 30 Unicode characters after trimming and rejects a longer new tag", async () => {

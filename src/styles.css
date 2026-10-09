@@ -206,6 +206,10 @@ small,
 .new-list {
   font-size: 0.8rem;
 }
+.sidebar-actions {
+  display: grid;
+  gap: 7px;
+}
 .sidebar-footer {
   margin-top: auto;
   padding-top: 20px;
@@ -864,6 +868,15 @@ dialog::backdrop {
   align-items: center;
   margin-top: 18px;
 }
+.export-image-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+}
+.export-image-option input {
+  width: auto;
+}
 .tag-editor-list {
   max-height: 42vh;
   overflow-y: auto;
@@ -1062,6 +1075,10 @@ dialog::backdrop {
   }
   .new-list {
     align-self: flex-start;
+  }
+  .sidebar-actions {
+    display: flex;
+    flex-wrap: wrap;
   }
   .sidebar-footer {
     display: flex;

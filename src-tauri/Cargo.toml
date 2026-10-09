@@ -31,6 +31,7 @@ base64 = "0.23"
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
 same-file = "1.0.6"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -41,4 +42,3 @@ windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_F
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["trace"] }
-tempfile = "3"

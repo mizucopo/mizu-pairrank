@@ -1025,6 +1025,45 @@ impl ImageService {
         verify_app_data(&self.app_data)?;
         save_image(&self.directory, &self.directory_identity, &bytes, None)
     }
+
+    pub fn import_bytes(&self, bytes: &[u8]) -> Result<ImageAsset, String> {
+        let _permit = self
+            .decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        verify_app_data(&self.app_data)?;
+        save_image(&self.directory, &self.directory_identity, bytes, None)
+    }
+
+    pub fn export_image(&self, image: &ImageAsset) -> Result<Vec<u8>, String> {
+        let _permit = self
+            .decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        let read = || -> std::io::Result<Vec<u8>> {
+            self.app_data.verify()?;
+            let names = managed_image_names([&image.path], &self.directory_identity)?;
+            let name = names
+                .iter()
+                .next()
+                .ok_or_else(|| std::io::Error::other("invalid managed image reference"))?;
+            let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
+            let file =
+                crate::storage::open_managed_image_file(&pinned, std::ffi::OsStr::new(name))?;
+            if file.metadata()?.len() > MAX_IMAGE_BYTES as u64 {
+                return Err(std::io::Error::other("image too large"));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let bytes = read().map_err(|_| {
+            "登録画像を読み取れませんでした。画像を含めずに再試行できます。".to_owned()
+        })?;
+        // Re-encoding removes embedded file metadata as well as normalizing legacy images.
+        normalize_image(&bytes, 1600)
+    }
 }
 
 #[cfg(not(unix))]

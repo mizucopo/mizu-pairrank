@@ -220,6 +220,8 @@ export function mountApp(
       controller.selectTag(target.value === "" ? null : Number(target.value));
     } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
       void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
+    } else if (target instanceof HTMLInputElement && target.id === "export-include-images") {
+      controller.setExportIncludeImages(target.checked);
     }
   });
   root.addEventListener("submit", (event) => {
@@ -286,6 +288,18 @@ export function mountApp(
         break;
       case "duplicate-list":
         void controller.duplicateList();
+        break;
+      case "export-list":
+        void openModal({ kind: "export-list" }, button);
+        break;
+      case "import-list":
+        void openModal({ kind: "import-list" }, button);
+        break;
+      case "confirm-export":
+        void controller.exportList();
+        break;
+      case "confirm-import":
+        void controller.importList();
         break;
       case "rename-list":
         void openModal({ kind: "rename-list" }, button);
