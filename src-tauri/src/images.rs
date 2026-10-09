@@ -22,7 +22,7 @@ use crate::models::ImageAsset;
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PIXELS: u64 = 32_000_000;
+pub(crate) const MAX_PIXELS: u64 = 32_000_000;
 const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
