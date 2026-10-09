@@ -131,6 +131,7 @@ describe("desktop app interaction", () => {
     opener.focus();
     await click(root, controller, '[data-action="export-list"]');
     expect(root.querySelector<HTMLInputElement>("#export-include-images")?.checked).toBe(false);
+    expect(root.querySelector("dialog")?.textContent).toContain("ZIP ファイルに保存します");
     expect(root.querySelector("dialog")?.textContent).toContain("比較履歴・評価は含みません");
     expect(root.querySelector("dialog")?.textContent).toContain("再配布できる権利のある画像");
     await click(root, controller, '[data-action="confirm-export"]');
@@ -238,6 +239,7 @@ describe("desktop app interaction", () => {
     expect(root.querySelector(".welcome")).not.toBeNull();
     button(root, '[data-action="import-list"]').focus();
     await click(root, controller, '[data-action="import-list"]');
+    expect(root.querySelector("dialog")?.textContent).toContain("エクスポートした ZIP ファイル");
     expect(root.querySelector("dialog")?.textContent).toContain("既存のリストは変更せず");
     await click(root, controller, '[data-action="confirm-import"]');
     expect(root.querySelector("dialog")).not.toBeNull();

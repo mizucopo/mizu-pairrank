@@ -238,8 +238,8 @@ async fn export_list(app: AppHandle, list_id: i64, include_images: bool) -> Resu
         picker
             .dialog()
             .file()
-            .add_filter("pairrank リスト", &["json"])
-            .set_file_name("list.pairrank.json")
+            .add_filter("pairrank リスト", &["zip"])
+            .set_file_name("list.pairrank.zip")
             .blocking_save_file()
             .map(|file| file.into_path().map_err(|error| error.to_string()))
             .transpose()
@@ -265,7 +265,7 @@ async fn import_list(app: AppHandle) -> Result<Option<ListState>, String> {
         picker
             .dialog()
             .file()
-            .add_filter("pairrank リスト", &["json"])
+            .add_filter("pairrank リスト", &["zip"])
             .blocking_pick_file()
             .map(|file| file.into_path().map_err(|error| error.to_string()))
             .transpose()
@@ -606,7 +606,7 @@ mod tests {
         let (directory, backend) = backend();
         let (list_id, item_id, original) = list_with_image(&backend).await;
         let service = backend.images.as_ref().unwrap().clone();
-        let path = directory.path().join("share.json");
+        let path = directory.path().join("share.zip");
         let destination = path.clone();
         let source_path = original.path.clone();
         let imported = backend
@@ -656,10 +656,10 @@ mod tests {
             &base64::engine::general_purpose::STANDARD,
             service.export_image(&original).unwrap(),
         );
-        let path = directory.path().join("broken.json");
+        let path = directory.path().join("broken.zip");
         let mut value = serde_json::json!({"format":"mizu-pairrank-list","version":1,"name":"新規","tags":[],
             "items":[{"name":"first","tags":[],"image":valid},{"name":"second","tags":[],"image":"bad!!!"}]});
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        transfer::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         let count_images = || {
             std::fs::read_dir(directory.path().join("images"))
                 .unwrap()
@@ -680,7 +680,7 @@ mod tests {
             .unwrap();
         assert_eq!(count_images(), 1);
         value["items"][1].as_object_mut().unwrap().remove("image");
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        transfer::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         database::test_connection(directory.path().join("test.sqlite3")).unwrap().execute_batch(
             "CREATE TRIGGER reject_import BEFORE INSERT ON items WHEN NEW.name = 'second' BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
         ).unwrap();

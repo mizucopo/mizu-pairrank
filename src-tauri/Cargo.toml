@@ -32,6 +32,7 @@ cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
 same-file = "1.0.6"
 tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
