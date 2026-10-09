@@ -1,7 +1,9 @@
-_commit: 6034b4646723dacacdac4b417eac3996bc73eb75
+_commit: 6034b46
 _src_path: git@github.com:mizucopo/repo-template.git
 author_email: mizu.copo@gmail.com
 author_name: みず
+homebrew_tap_repository: mizucopo/homebrew-tap
+homebrew_tap_workflow: update-casks.yml
 node_version: '26'
 project_description: 2つの候補を比較して順位付けするデスクトップアプリ
 project_name: mizu-pairrank
@@ -16,7 +18,7 @@ use_dependabot_github_actions: true
 use_docker: false
 use_gh_actions_release: false
 use_gh_actions_tauri_build: true
-use_gh_actions_tauri_homebrew_notify: false
+use_gh_actions_tauri_homebrew_notify: true
 use_mit_license: false
 use_python: false
 use_rust: false

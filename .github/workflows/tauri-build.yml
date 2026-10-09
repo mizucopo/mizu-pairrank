@@ -719,3 +719,48 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.latest-state.outputs.release_tag }}
         run: gh release edit "$TAG" --latest
+
+  notify-homebrew:
+    needs: [preflight, promote-latest]
+    if: github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.promote-latest.result == 'success' && needs.promote-latest.outputs.promoted == 'true' && !contains(needs.preflight.outputs.version, '-') && !contains(needs.preflight.outputs.version, '+') && vars.HOMEBREW_TAP_NOTIFY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Create short-lived Tap notification token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # The pinned v3 action prefers client-id; app-id is deprecated.
+          client-id: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: "mizucopo"
+          repositories: "homebrew-tap"
+          permission-actions: write
+
+      - name: Request Tap reconciliation after release publication
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_REPOSITORY: "mizucopo/homebrew-tap"
+          TAP_WORKFLOW: "update-casks.yml"
+        run: |
+          set -euo pipefail
+          # The Tap independently verifies all registered published releases.
+          # No release title, body, tag, URL or checksum is treated as authority.
+          # Duplicate requests are safe if the first response is lost.
+          for attempt in 1 2 3; do
+            if gh api --method POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/$TAP_REPOSITORY/actions/workflows/$TAP_WORKFLOW/dispatches" \
+              --input - <<'JSON'
+          {"ref":"main","inputs":{"apply":"true"}}
+          JSON
+            then
+              echo 'Tap reconciliation requested; check its workflow run for the publication result.'
+              exit 0
+            fi
+            sleep "$((attempt * 2))"
+          done
+          echo '::error::Tap notification failed. Rerun this failed job or run the Tap workflow manually.'
+          exit 1
