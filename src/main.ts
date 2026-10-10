@@ -280,6 +280,12 @@ export function mountApp(
     const id = Number(button.dataset.id);
     const provider: SearchProvider = button.dataset.provider === "ollama" ? "ollama" : "brave";
     switch (button.dataset.action) {
+      case "skip-comparison":
+        void controller.skipComparison();
+        break;
+      case "resume-skipped-comparisons":
+        void controller.resumeSkippedComparisons();
+        break;
       case "select-list":
         void controller.selectList(id);
         break;

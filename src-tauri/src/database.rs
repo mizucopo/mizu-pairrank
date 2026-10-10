@@ -988,21 +988,29 @@ fn read_list(connection: &Transaction<'_>, list_id: i64) -> Result<ListState, St
         )
         .map_err(db_error)?;
     let mut statement = connection
-        .prepare("SELECT ranking FROM rank_snapshots WHERE list_id = ?1 ORDER BY id")
+        .prepare("SELECT id, ranking FROM rank_snapshots WHERE list_id = ?1 ORDER BY id")
         .map_err(db_error)?;
     let snapshots = statement
-        .query_map([list_id], |row| row.get::<_, String>(0))
+        .query_map([list_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(db_error)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error)?
+        .map_err(db_error)?;
+    let comparison_window = [
+        snapshots.first().map_or(0, |(id, _)| *id),
+        snapshots.last().map_or(0, |(id, _)| *id),
+    ];
+    let snapshots = snapshots
         .into_iter()
-        .map(|json| serde_json::from_str::<Vec<i64>>(&json).map_err(|error| error.to_string()))
+        .map(|(_, json)| serde_json::from_str::<Vec<i64>>(&json).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let ratings: Vec<_> = items.iter().map(|item| (item.id, item.rating)).collect();
     Ok(ListState {
         id: list_id,
         name,
         revision,
+        comparison_window,
         items,
         tags,
         comparison_count,
@@ -3200,6 +3208,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept_row, 1);
+    }
+
+    #[test]
+    fn comparison_window_distinguishes_resets_from_ordinary_progress() {
+        let mut database = memory_database();
+        let initial = populated_list(&mut database, "First");
+        assert_eq!(initial.comparison_count, 0);
+        let reset = database.reset_comparisons(initial.id).unwrap();
+        assert_eq!(reset.comparison_count, 0);
+        assert!(reset.comparison_window[0] > initial.comparison_window[1]);
+        let mut current = reset;
+        for _ in 0..25 {
+            let previous = current;
+            // Snapshot IDs can have gaps due to another list's progress.
+            let other = populated_list(&mut database, "Other");
+            answer_once(&mut database, &other);
+            current = answer_once(&mut database, &previous);
+            assert_eq!(current.comparison_count, previous.comparison_count + 1);
+            assert!(current.comparison_window[0] <= previous.comparison_window[1]);
+            assert!(current.comparison_window[1] > previous.comparison_window[1]);
+        }
+        let renamed = database.rename_list(current.id, "Renamed".into()).unwrap();
+        assert_eq!(renamed.comparison_window, current.comparison_window);
+        let mut reset = database.reset_comparisons(current.id).unwrap();
+        for _ in 0..current.comparison_count {
+            reset = answer_once(&mut database, &reset);
+        }
+        assert_eq!(reset.comparison_count, current.comparison_count);
+        assert!(reset.comparison_window[0] > current.comparison_window[1]);
+        assert_eq!(
+            database.get_list(reset.id).unwrap().comparison_window,
+            reset.comparison_window
+        );
     }
 
     #[test]
