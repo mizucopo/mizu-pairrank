@@ -816,12 +816,268 @@ describe("mutations after concurrent deletion", () => {
   });
 });
 
-describe("image search validation", () => {
-  it("rejects whitespace-only queries without a request and permits correction", async () => {
+describe("explicit credential access", () => {
+  it("does not read credentials when entering settings or opening an image dialog", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
+    await controller.navigate("settings");
     await controller.openModal({ kind: "image", itemId: 11 });
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(controller.state.settings).toBeNull();
+    expect(api.searchImages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "sidebar",
+    "create-list",
+    "rename-list",
+    "rename-item",
+    "delete-list",
+    "delete-item",
+    "duplicate-list",
+    "import-list",
+    "export-list",
+    "add-items",
+    "local-image",
+    "remove-image",
+    "create-tag",
+    "comparison",
+    "answer",
+  ] as const)("does not read credentials during the ordinary %s operation", async (operation) => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    switch (operation) {
+      case "sidebar":
+        await controller.selectList(2);
+        expect(api.getList).toHaveBeenLastCalledWith(2);
+        break;
+      case "create-list":
+      case "rename-list":
+      case "rename-item":
+        await controller.openModal(
+          operation === "rename-item" ? { kind: operation, itemId: 11 } : { kind: operation },
+        );
+        controller.state.drafts.name = "新しい名前";
+        await controller.saveName();
+        if (operation === "create-list") expect(api.createList).toHaveBeenCalledOnce();
+        else if (operation === "rename-list") expect(api.renameList).toHaveBeenCalledOnce();
+        else expect(api.renameItem).toHaveBeenCalledOnce();
+        break;
+      case "delete-list":
+      case "delete-item":
+        await controller.openModal(
+          operation === "delete-item" ? { kind: operation, itemId: 11 } : { kind: operation },
+        );
+        await controller.confirmDelete();
+        expect(
+          operation === "delete-list" ? api.deleteList : api.deleteItem,
+        ).toHaveBeenCalledOnce();
+        break;
+      case "duplicate-list":
+        await controller.duplicateList();
+        expect(api.duplicateList).toHaveBeenCalledOnce();
+        break;
+      case "import-list":
+      case "export-list":
+        await controller.openModal({ kind: operation });
+        if (operation === "import-list") await controller.importList();
+        else {
+          controller.setExportIncludeImages(true);
+          await controller.exportList();
+        }
+        expect(
+          operation === "import-list" ? api.importList : api.exportList,
+        ).toHaveBeenCalledOnce();
+        break;
+      case "add-items":
+        controller.state.drafts.items = "新しい項目";
+        await controller.addItems();
+        expect(api.addItems).toHaveBeenCalledExactlyOnceWith(1, ["新しい項目"]);
+        break;
+      case "local-image":
+      case "remove-image":
+        await controller.openModal({ kind: "image", itemId: 11 });
+        await controller.changeImage(operation === "local-image" ? "local" : "none");
+        expect(
+          operation === "local-image" ? api.setLocalImage : api.removeImage,
+        ).toHaveBeenCalledOnce();
+        break;
+      case "create-tag":
+        await controller.openModal({ kind: "tags" });
+        controller.state.tagDraft = "分類";
+        await controller.saveTag();
+        expect(api.createTag).toHaveBeenCalledExactlyOnceWith(1, "分類", undefined);
+        break;
+      case "comparison":
+      case "answer":
+        await controller.startComparison();
+        expect(api.nextPair).toHaveBeenCalledOnce();
+        if (operation === "answer") {
+          await controller.answer("equal");
+          expect(api.answer).toHaveBeenCalledOnce();
+        }
+        break;
+    }
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(api.searchImages).not.toHaveBeenCalled();
+    expect(api.autoRegisterImage).not.toHaveBeenCalled();
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.checkedProviders).toEqual([]);
+  });
+
+  it("requires the explicit status check to be in a credential-related screen", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.checkSearchSettings();
+    await controller.navigate("ranking");
+    await controller.checkSearchSettings();
+    await controller.navigate("settings");
+    await controller.openModal({ kind: "create-list" });
+    await controller.checkSearchSettings();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    controller.closeModal();
+    await controller.checkSearchSettings();
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
+  });
+
+  it("keeps unknown, unset and denied status distinct and retries only on an explicit check", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("settings");
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.checkedProviders).toEqual([]);
+    await controller.checkSearchSettings();
+    expect(controller.state.settings?.braveConfigured).toBe(false);
+    expect(controller.state.settings?.errors?.brave).toBeUndefined();
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
+    api.searchSettings.mockRejectedValueOnce(new Error("OSでアクセスが拒否されました。"));
+    await controller.checkSearchSettings();
+    expect(controller.state.settings?.errors).toEqual({
+      brave: "OSでアクセスが拒否されました。",
+      ollama: "OSでアクセスが拒否されました。",
+    });
+    expect(controller.availableBulkProviders()).toEqual([]);
+    await controller.navigate("items");
+    await controller.startComparison();
+    await controller.answer("equal");
+    expect(api.answer).toHaveBeenCalledOnce();
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    await controller.navigate("settings");
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.checkSearchSettings();
+    expect(api.searchSettings).toHaveBeenCalledTimes(3);
+    expect(controller.state.settings?.errors?.brave).toBeUndefined();
+    expect(controller.availableBulkProviders()).toEqual(["brave"]);
+  });
+
+  it("allows local image selection and its cancellation after a denied credential check", async () => {
+    const initial = list();
+    const api = backend(initial);
+    api.searchSettings.mockRejectedValueOnce(new Error("アクセスをキャンセルしました。"));
+    api.setLocalImage.mockResolvedValueOnce(null);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    expect(controller.state.settings?.errors?.brave).toBe("アクセスをキャンセルしました。");
+    await controller.changeImage("local");
+    expect(controller.state.active).toEqual(initial);
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+    expect(controller.state.busy).toBe(false);
+    await controller.changeImage("local");
+    expect(api.setLocalImage).toHaveBeenCalledTimes(2);
+    expect(controller.state.modal).toBeNull();
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(api.searchImages).not.toHaveBeenCalled();
+  });
+
+  it("opens bulk registration without reading keys and waits for an explicit successful check", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: false,
+      ollamaConfigured: true,
+      defaultProvider: "ollama",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.openBulkImages();
+    expect(controller.state.modal).toEqual({ kind: "bulk-image" });
+    expect(controller.state.bulkProvider).toBeNull();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    await controller.runBulkImages();
+    expect(api.autoRegisterImage).not.toHaveBeenCalled();
+    await controller.checkSearchSettings();
+    expect(controller.state.bulkProvider).toBe("ollama");
+    await controller.runBulkImages();
+    expect(api.autoRegisterImage.mock.calls).toEqual([
+      [1, 11, "ollama"],
+      [1, 12, "ollama"],
+    ]);
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(controller.state.bulkRun?.done).toBe(2);
+  });
+
+  it("does not offer bulk registration when all items already have images", async () => {
+    const initial = list();
+    initial.items = initial.items.map((item) => ({
+      ...item,
+      image: { path: "fixture.png", sourceUrl: null },
+    }));
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    controller.openBulkImages();
+    expect(controller.state.modal).toBeNull();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+  });
+
+  it.each(["unknown", "unset", "error"] as const)(
+    "does not invoke image search when the selected provider is %s",
+    async (status) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.openModal({ kind: "image", itemId: 11 });
+      if (status !== "unknown") {
+        api.searchSettings.mockResolvedValueOnce({
+          braveConfigured: status === "error",
+          ollamaConfigured: false,
+          defaultProvider: "brave",
+          ...(status === "error" ? { errors: { brave: "アクセスが拒否されました。" } } : {}),
+        });
+        await controller.checkSearchSettings();
+      }
+      await controller.searchImages();
+      expect(api.searchImages).not.toHaveBeenCalled();
+      expect(api.searchSettings).toHaveBeenCalledTimes(status === "unknown" ? 0 : 1);
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+});
+
+describe("image search validation", () => {
+  it("rejects whitespace-only queries without a request and permits correction", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
     controller.state.drafts.query = " \t　 ";
     await controller.searchImages();
     expect(controller.state.error).toBe("検索語は1〜400文字、50語以内で入力してください。");
@@ -840,7 +1096,7 @@ describe("image search validation", () => {
 
 describe("settings navigation", () => {
   it.each(["success", "failure"] as const)(
-    "reloads unread settings after cancelling list creation and ignores the abandoned %s",
+    "requires an explicit retry after cancelling list creation and ignores the abandoned %s",
     async (outcome) => {
       const api = backend();
       const controller = new AppController(api, vi.fn());
@@ -862,7 +1118,8 @@ describe("settings navigation", () => {
             };
           }),
       );
-      const abandoned = controller.navigate("settings");
+      await controller.navigate("settings");
+      const abandoned = controller.checkSearchSettings();
       await controller.openModal({ kind: "create-list" });
       const settings = {
         braveConfigured: false,
@@ -878,6 +1135,7 @@ describe("settings navigation", () => {
       );
       controller.closeModal();
       expect(api.searchSettings).toHaveBeenCalledOnce();
+      const retry = controller.checkSearchSettings();
       expect(controller.state.modal).toBeNull();
       expect(controller.state.view).toBe("settings");
       finishOld();
@@ -888,7 +1146,7 @@ describe("settings navigation", () => {
       expect(controller.state.settings).toBeNull();
       expect(controller.state.error).toBe("");
       finishCurrent();
-      await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+      await retry;
       expect(controller.state.settings).toEqual(settings);
       expect(controller.state.provider).toBe("ollama");
       expect(controller.state.drafts.items).toBe("unsaved item");
@@ -904,20 +1162,27 @@ describe("settings navigation", () => {
       await controller.initialize();
       api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
       await controller.navigate("settings");
-      expect(controller.state.error).toBe("initial settings read failed");
+      await controller.checkSearchSettings();
+      expect(controller.state.settings?.errors).toEqual({
+        brave: "initial settings read failed",
+        ollama: "initial settings read failed",
+      });
       await controller.openModal({ kind: "create-list" });
       if (outcome === "failure") {
         api.searchSettings.mockRejectedValueOnce(new Error("retry settings read failed"));
       }
       controller.closeModal();
-      await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      await controller.checkSearchSettings();
       expect(api.searchSettings).toHaveBeenCalledTimes(2);
       expect(controller.state.modal).toBeNull();
       expect(controller.state.view).toBe("settings");
       expect(controller.state.error).toBe(
         outcome === "failure" ? "retry settings read failed" : "",
       );
-      expect(controller.state.settings === null).toBe(outcome === "failure");
+      expect(controller.state.settings?.errors?.brave).toBe(
+        outcome === "failure" ? "retry settings read failed" : undefined,
+      );
       await controller.selectList(1);
       expect(controller.state.view).toBe("items");
       expect(controller.state.busy).toBe(false);
@@ -930,7 +1195,7 @@ describe("settings navigation", () => {
     ["success", "write"],
     ["failure", "write"],
   ] as const)(
-    "ignores a post-write refresh %s after leaving settings for another %s",
+    "ignores an explicit post-write confirmation %s after leaving settings for another %s",
     async (outcome, destination) => {
       const api = backend();
       const controller = new AppController(api, vi.fn());
@@ -952,8 +1217,9 @@ describe("settings navigation", () => {
             };
           }),
       );
-      const saving = controller.saveKey("brave");
-      await vi.waitFor(() => expect(controller.state.notice).toBe("APIキーを保存しました。"));
+      await controller.saveKey("brave");
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      const checking = controller.checkSearchSettings();
       expect(controller.state.settings?.braveConfigured).toBe(true);
       await controller.navigate(destination === "screen" ? "ranking" : "items");
       expect(controller.state.view).toBe(destination === "screen" ? "ranking" : "items");
@@ -971,7 +1237,7 @@ describe("settings navigation", () => {
         current = controller.addItems();
       }
       finishOld();
-      await saving;
+      await checking;
       expect(controller.state.busy).toBe(destination === "write");
       expect(controller.state.settings?.braveConfigured).toBe(true);
       expect(controller.state.error).toBe("");
@@ -997,7 +1263,8 @@ describe("settings navigation", () => {
             resolve({ braveConfigured: false, ollamaConfigured: true, defaultProvider: "ollama" });
         }),
     );
-    const reading = controller.navigate("settings");
+    await controller.navigate("settings");
+    const reading = controller.checkSearchSettings();
     expect(controller.state.view).toBe("settings");
     await controller.navigate("ranking");
     expect(controller.state.view).toBe("ranking");
@@ -1035,7 +1302,8 @@ describe("settings navigation", () => {
             };
           }),
       );
-      const abandoned = controller.navigate("settings");
+      await controller.navigate("settings");
+      const abandoned = controller.checkSearchSettings();
       let finishNew: () => void = () => {};
       const pending = new Promise<void>((resolve) => {
         finishNew = resolve;
@@ -1052,7 +1320,8 @@ describe("settings navigation", () => {
           await pending;
           return currentSettings;
         });
-        current = controller.navigate("settings");
+        await controller.navigate("settings");
+        current = controller.checkSearchSettings();
       } else {
         await controller.openModal({ kind: "create-list" });
         controller.state.drafts.name = "new list";
@@ -1090,10 +1359,11 @@ describe("settings navigation", () => {
     },
   );
 
-  it("waits for a cancelled native settings worker before retrying through its single available slot", async () => {
+  it("waits for a cancelled native settings worker before an explicit retry through its single slot", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
+    await controller.navigate("settings");
     let occupied = false;
     let finish: () => void = () => {};
     api.searchSettings.mockImplementation(() => {
@@ -1107,16 +1377,17 @@ describe("settings navigation", () => {
         };
       });
     });
-    const reading = controller.navigate("settings");
-    await controller.navigate("settings");
-    await controller.navigate("settings");
+    const reading = controller.checkSearchSettings();
+    await controller.checkSearchSettings();
+    await controller.checkSearchSettings();
     expect(api.searchSettings).toHaveBeenCalledOnce();
     await controller.openModal({ kind: "create-list" });
     controller.closeModal();
-    await controller.openModal({ kind: "create-list" });
-    controller.closeModal();
+    expect(controller.state.readPending).toBeNull();
     expect(api.searchSettings).toHaveBeenCalledOnce();
+    const retry = controller.checkSearchSettings();
     expect(controller.state.readPending).toBe("settings");
+    expect(api.searchSettings).toHaveBeenCalledOnce();
     finish();
     await reading;
     await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
@@ -1124,8 +1395,9 @@ describe("settings navigation", () => {
     expect(controller.state.busy).toBe(true);
     expect(controller.state.error).toBe("");
     finish();
-    await vi.waitFor(() => expect(controller.state.busy).toBe(false));
+    await retry;
     expect(controller.state.settings?.braveConfigured).toBe(true);
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
     expect(controller.state.error).toBe("");
     expect(api.searchSettings).toHaveBeenCalledTimes(2);
   });
@@ -1146,9 +1418,11 @@ describe("settings navigation", () => {
             });
         }),
     );
-    const reading = controller.navigate("settings");
+    await controller.navigate("settings");
+    const reading = controller.checkSearchSettings();
     await controller.openModal({ kind: "create-list" });
     controller.closeModal();
+    const queued = controller.checkSearchSettings();
     await controller.openModal({ kind: "create-list" });
     controller.state.drafts.name = "new list";
     let finishWrite: () => void = () => {};
@@ -1161,6 +1435,7 @@ describe("settings navigation", () => {
     const writing = controller.saveName();
     finishRead();
     await reading;
+    await queued;
     expect(api.searchSettings).toHaveBeenCalledOnce();
     expect(controller.state.settings).toBeNull();
     expect(controller.state.busy).toBe(true);
@@ -1219,17 +1494,19 @@ describe("credential mutation acknowledgments", () => {
       expect(controller.state.drafts[field]).toBe(" \t　 ");
       expect(controller.state.busy).toBe(false);
       expect(api.setApiKey).not.toHaveBeenCalled();
-      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(api.searchSettings).not.toHaveBeenCalled();
       controller.state.drafts[field] = " saved-key ";
       await controller.saveKey(provider);
       expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, "saved-key");
       expect(controller.state.error).toBe("");
       expect(controller.state.drafts[field]).toBe("");
+      expect(controller.state.checkedProviders).toEqual([provider]);
+      expect(api.searchSettings).not.toHaveBeenCalled();
     },
   );
 
   it.each([false, true])(
-    "clears the acknowledged provider error before a failed refresh (remove=%s)",
+    "clears the acknowledged provider error without another credential read (remove=%s)",
     async (remove) => {
       const api = backend();
       api.searchSettings.mockResolvedValueOnce({
@@ -1240,18 +1517,23 @@ describe("credential mutation acknowledgments", () => {
       });
       const controller = new AppController(api, vi.fn());
       await controller.navigate("settings");
+      await controller.checkSearchSettings();
       controller.state.drafts.braveKey = "saved-key";
-      api.searchSettings.mockRejectedValueOnce(new Error("refresh failed"));
+      api.searchSettings.mockRejectedValueOnce(new Error("unexpected refresh"));
       await controller.saveKey("brave", remove);
       expect(controller.state.settings?.errors?.brave).toBeUndefined();
       expect(controller.state.settings?.braveConfigured).toBe(!remove);
       expect(controller.state.settings?.ollamaConfigured).toBe(true);
-      expect(controller.state.error).toContain("refresh failed");
+      expect(controller.state.checkedProviders).toEqual(
+        expect.arrayContaining(["brave", "ollama"]),
+      );
+      expect(controller.state.error).toBe("");
+      expect(api.searchSettings).toHaveBeenCalledOnce();
     },
   );
 
   it.each(["brave", "ollama"] as const)(
-    "preserves an acknowledged %s key across partial settings read failures",
+    "preserves an acknowledged %s key across a later explicit partial read failure",
     async (provider) => {
       const api = backend();
       api.searchSettings.mockResolvedValue({
@@ -1263,17 +1545,25 @@ describe("credential mutation acknowledgments", () => {
       const controller = new AppController(api, vi.fn());
       await controller.initialize();
       await controller.navigate("settings");
+      await controller.checkSearchSettings();
       const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
       expect(controller.state.settings?.[configured]).toBe(false);
+      expect(controller.state.checkedProviders).not.toContain(provider);
       controller.state.drafts[provider === "brave" ? "braveKey" : "ollamaKey"] = "saved-key";
       await controller.saveKey(provider);
       expect(controller.state.settings?.[configured]).toBe(true);
       expect(controller.state.provider).toBe(provider);
-      expect(controller.state.settings?.errors?.[provider]).toBe("keyring read failed");
+      expect(controller.state.settings?.errors?.[provider]).toBeUndefined();
       expect(controller.state.notice).toBe("APIキーを保存しました。");
-      await controller.openModal({ kind: "image", itemId: 10 });
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      await controller.openModal({ kind: "image", itemId: 11 });
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      await controller.checkSearchSettings();
       expect(controller.state.settings?.[configured]).toBe(true);
       expect(controller.state.provider).toBe(provider);
+      expect(controller.state.settings?.errors?.[provider]).toBe("keyring read failed");
+      await controller.searchImages();
+      expect(api.searchImages).not.toHaveBeenCalled();
     },
   );
 
@@ -1283,10 +1573,10 @@ describe("credential mutation acknowledgments", () => {
     ["ollama", false, false, true, "ollama"],
     ["ollama", true, false, false, "brave"],
   ] as const)(
-    "keeps successful %s key changes (remove=%s) when the initial settings read and refresh both fail",
+    "acknowledges successful %s key changes without reading the unchecked peer (remove=%s)",
     async (provider, remove, braveConfigured, ollamaConfigured, defaultProvider) => {
       const api = backend();
-      api.searchSettings.mockRejectedValue(new Error("keyring read failed"));
+      api.searchSettings.mockRejectedValue(new Error("must not read credentials"));
       const controller = new AppController(api, vi.fn());
       await controller.navigate("settings");
       expect(controller.state.settings).toBeNull();
@@ -1299,13 +1589,15 @@ describe("credential mutation acknowledgments", () => {
         ollamaConfigured,
         defaultProvider,
       });
+      expect(controller.state.checkedProviders).toEqual([provider]);
       expect(controller.state.provider).toBe(defaultProvider);
       expect(controller.state.drafts[field]).toBe("");
       expect(controller.state.notice).toBe(
         remove ? "APIキーを削除しました。" : "APIキーを保存しました。",
       );
-      expect(controller.state.error).toContain("設定状態を再取得できませんでした");
+      expect(controller.state.error).toBe("");
       expect(controller.state.busy).toBe(false);
+      expect(api.searchSettings).not.toHaveBeenCalled();
     },
   );
 
@@ -1315,7 +1607,7 @@ describe("credential mutation acknowledgments", () => {
     ["ollama", false, "ollama"],
     ["ollama", true, "brave"],
   ] as const)(
-    "keeps successful %s key changes (remove=%s) when refreshing settings fails",
+    "keeps successful %s key changes after an explicit confirmation fails (remove=%s)",
     async (provider, remove, defaultProvider) => {
       const api = backend();
       api.searchSettings.mockResolvedValue({
@@ -1325,22 +1617,26 @@ describe("credential mutation acknowledgments", () => {
       });
       const controller = new AppController(api, vi.fn());
       await controller.navigate("settings");
+      await controller.checkSearchSettings();
       const field = provider === "brave" ? "braveKey" : "ollamaKey";
       controller.state.drafts[field] = "saved-key";
       api.searchSettings.mockRejectedValueOnce(new Error("keyring read failed"));
       await controller.saveKey(provider, remove);
-      expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
-      expect(controller.state.drafts[field]).toBe("");
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(controller.state.error).toBe("");
       expect(controller.state.notice).toBe(
         remove ? "APIキーを削除しました。" : "APIキーを保存しました。",
       );
-      expect(controller.state.settings).toEqual({
+      await controller.checkSearchSettings();
+      expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
+      expect(controller.state.drafts[field]).toBe("");
+      expect(controller.state.settings).toMatchObject({
         braveConfigured: provider === "brave" ? !remove : remove,
         ollamaConfigured: provider === "ollama" ? !remove : remove,
         defaultProvider,
+        errors: { brave: "keyring read failed", ollama: "keyring read failed" },
       });
       expect(controller.state.provider).toBe(defaultProvider);
-      expect(controller.state.error).toContain("設定状態を再取得できませんでした");
       expect(controller.state.error).toContain("keyring read failed");
       expect(controller.state.busy).toBe(false);
     },
@@ -1356,31 +1652,39 @@ describe("credential mutation acknowledgments", () => {
     ["ollama", false, false],
     ["ollama", true, false],
   ] as const)(
-    "keeps the draft and settings when %s key mutation fails (remove=%s, settings loaded=%s)",
-    async (provider, remove, loaded) => {
+    "keeps the draft and settings when %s key mutation fails (remove=%s, settings checked=%s)",
+    async (provider, remove, checked) => {
       const api = backend();
       const settings = {
         braveConfigured: true,
         ollamaConfigured: true,
         defaultProvider: "brave" as const,
       };
-      if (loaded) api.searchSettings.mockResolvedValueOnce(settings);
-      else api.searchSettings.mockRejectedValueOnce(new Error("keyring read failed"));
+      api.searchSettings.mockResolvedValueOnce(settings);
       const controller = new AppController(api, vi.fn());
       await controller.navigate("settings");
+      if (checked) await controller.checkSearchSettings();
+      const before = controller.state.settings;
+      const known = [...controller.state.checkedProviders];
       const field = provider === "brave" ? "braveKey" : "ollamaKey";
       controller.state.drafts[field] = "retry-key";
       api.setApiKey.mockRejectedValueOnce(new Error("keyring write failed"));
       await controller.saveKey(provider, remove);
       expect(controller.state.drafts[field]).toBe("retry-key");
-      expect(controller.state.settings).toEqual(loaded ? settings : null);
+      expect(controller.state.settings).toEqual(before);
+      expect(controller.state.checkedProviders).toEqual(known);
       expect(controller.state.notice).toBe("");
       expect(controller.state.error).toBe("keyring write failed");
-      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(api.searchSettings).toHaveBeenCalledTimes(checked ? 1 : 0);
+      await controller.saveKey(provider, remove);
+      expect(api.setApiKey).toHaveBeenCalledTimes(2);
+      expect(controller.state.error).toBe("");
+      expect(controller.state.drafts[field]).toBe("");
+      expect(api.searchSettings).toHaveBeenCalledTimes(checked ? 1 : 0);
     },
   );
 
-  it("refreshes both providers after acknowledging a successful key mutation", async () => {
+  it("checks both providers only when explicitly requested after saving a key", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());
     await controller.navigate("settings");
@@ -1392,11 +1696,16 @@ describe("credential mutation acknowledgments", () => {
     };
     api.searchSettings.mockResolvedValueOnce(current);
     await controller.saveKey("ollama");
+    expect(controller.state.checkedProviders).toEqual(["ollama"]);
+    expect(controller.state.provider).toBe("ollama");
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    await controller.checkSearchSettings();
     expect(controller.state.settings).toEqual(current);
+    expect(controller.state.checkedProviders).toEqual(expect.arrayContaining(["brave", "ollama"]));
     expect(controller.state.provider).toBe("brave");
     expect(controller.state.drafts.ollamaKey).toBe("");
-    expect(controller.state.notice).toBe("APIキーを保存しました。");
     expect(controller.state.error).toBe("");
+    expect(api.searchSettings).toHaveBeenCalledOnce();
   });
 });
 
@@ -1454,7 +1763,7 @@ describe("comparison state and persistence boundaries", () => {
     expect(controller.state.lists).toHaveLength(2);
   });
 
-  it("loads bulk search eligibility when a sidebar selection enters items from ranking", async () => {
+  it("does not read bulk credentials when a sidebar selection enters items from ranking", async () => {
     const settled = {
       ...list(),
       convergence: { ...list().convergence, converged: true },
@@ -1471,10 +1780,11 @@ describe("comparison state and persistence boundaries", () => {
 
     await controller.selectList(2);
     expect(controller.state.view).toBe("items");
-    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+    expect(controller.availableBulkProviders()).toEqual([]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
-  it("loads bulk search eligibility when renaming a converged list enters items", async () => {
+  it("does not read bulk credentials when renaming a converged list enters items", async () => {
     const settled = {
       ...list(),
       convergence: { ...list().convergence, converged: true },
@@ -1494,10 +1804,11 @@ describe("comparison state and persistence boundaries", () => {
     controller.state.drafts.name = "改名後";
     await controller.saveName();
     expect(controller.state.view).toBe("items");
-    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+    expect(controller.availableBulkProviders()).toEqual([]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
-  it("loads bulk search eligibility when deleting a converged list enters items", async () => {
+  it("does not read bulk credentials when deleting a converged list enters items", async () => {
     const settled = {
       ...list(),
       convergence: { ...list().convergence, converged: true },
@@ -1519,10 +1830,11 @@ describe("comparison state and persistence boundaries", () => {
     await controller.confirmDelete();
     expect(controller.state.active).toEqual(remaining);
     expect(controller.state.view).toBe("items");
-    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+    expect(controller.availableBulkProviders()).toEqual([]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
-  it("loads bulk search eligibility when comparison returns to items", async () => {
+  it("does not read bulk credentials when comparison returns to items", async () => {
     const settled = {
       ...list(),
       convergence: { ...list().convergence, converged: true },
@@ -1541,10 +1853,11 @@ describe("comparison state and persistence boundaries", () => {
     api.nextPair.mockResolvedValue(null);
     await controller.startComparison();
     expect(controller.state.view).toBe("items");
-    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+    expect(controller.availableBulkProviders()).toEqual([]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
-  it("loads bulk search eligibility when a deleted ranking list is replaced", async () => {
+  it("does not read bulk credentials when a deleted ranking list is replaced", async () => {
     const settled = {
       ...list(),
       convergence: { ...list().convergence, converged: true },
@@ -1566,7 +1879,8 @@ describe("comparison state and persistence boundaries", () => {
     await controller.startComparison();
     expect(controller.state.active).toEqual(remaining);
     expect(controller.state.view).toBe("items");
-    await vi.waitFor(() => expect(controller.availableBulkProviders()).toEqual(["brave"]));
+    expect(controller.availableBulkProviders()).toEqual([]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
   it.each(["restart", "settled answer"] as const)(
@@ -2365,7 +2679,8 @@ describe("comparison state and persistence boundaries", () => {
           }),
       );
       await controller.initialize();
-      const oldOpen = controller.openModal({ kind: "image", itemId: 11 });
+      await controller.openModal({ kind: "image", itemId: 11 });
+      const oldOpen = controller.checkSearchSettings();
       controller.closeModal();
       const currentSettings = {
         braveConfigured: false,
@@ -2381,7 +2696,8 @@ describe("comparison state and persistence boundaries", () => {
               finishCurrent = () => resolve(currentSettings);
             }),
         );
-        pending = controller.openModal({ kind: "image", itemId: 12 });
+        await controller.openModal({ kind: "image", itemId: 12 });
+        pending = controller.checkSearchSettings();
       } else {
         await controller.openModal({ kind: "create-list" });
         controller.state.drafts.name = "new list";
@@ -2429,6 +2745,11 @@ describe("comparison state and persistence boundaries", () => {
     async (outcome, order) => {
       const initial = list();
       const api = backend(initial);
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: true,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+      });
       const controller = new AppController(api, vi.fn());
       const oldCandidate: ImageCandidate = {
         id: "old",
@@ -2457,6 +2778,7 @@ describe("comparison state and persistence boundaries", () => {
         );
       await controller.initialize();
       await controller.openModal({ kind: "image", itemId: 11 });
+      await controller.checkSearchSettings();
       const oldSearch = controller.searchImages();
       controller.closeModal();
       await controller.openModal({ kind: "image", itemId: 12 });

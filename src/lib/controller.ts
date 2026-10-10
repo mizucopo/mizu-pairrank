@@ -50,8 +50,7 @@ export type AppState = {
   tagEditingId: number | null;
   tagDeletingId: number | null;
   settings: SearchSettings | null;
-  bulkSettings: SearchSettings | null;
-  bulkSettingsLoading: boolean;
+  checkedProviders: SearchProvider[];
   bulkProvider: SearchProvider | null;
   bulkRun: BulkImageRun | null;
   candidates: ImageCandidate[];
@@ -70,6 +69,17 @@ export const answers: { value: Preference; label: string; key: string }[] = [
 ];
 
 export const tagNameMaxLength = 30;
+
+export function configuredSearchProviders(state: AppState): SearchProvider[] {
+  const settings = state.settings;
+  if (!settings) return [];
+  return (["brave", "ollama"] as const).filter(
+    (provider) =>
+      state.checkedProviders.includes(provider) &&
+      (provider === "brave" ? settings.braveConfigured : settings.ollamaConfigured) &&
+      settings.errors?.[provider] === undefined,
+  );
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -95,8 +105,7 @@ export class AppController {
     tagEditingId: null,
     tagDeletingId: null,
     settings: null,
-    bulkSettings: null,
-    bulkSettingsLoading: false,
+    checkedProviders: [],
     bulkProvider: null,
     bulkRun: null,
     candidates: [],
@@ -108,7 +117,6 @@ export class AppController {
 
   private readRequest: symbol | null = null;
   private settingsRead: Promise<SearchSettings> | null = null;
-  private bulkSettingsRequest: symbol | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -167,7 +175,6 @@ export class AppController {
   }
 
   async selectList(id: number): Promise<void> {
-    let selected = false;
     this.cancelRead("settings");
     await this.perform(async () => {
       const list = await this.api
@@ -177,9 +184,7 @@ export class AppController {
       this.acceptCommittedList(list);
       this.state.modal = null;
       this.state.view = list.convergence.converged ? "ranking" : "items";
-      selected = true;
     });
-    if (selected && this.state.view === "items") void this.refreshBulkSettings();
   }
 
   selectTag(tagId: number | null): void {
@@ -192,10 +197,6 @@ export class AppController {
     if (view === "settings" && this.state.readPending === "settings") return;
     this.cancelRead("settings");
     if (this.state.busy) return;
-    if (view === "settings") {
-      this.bulkSettingsRequest = null;
-      this.state.bulkSettingsLoading = false;
-    }
     if (view === "compare") {
       await this.startComparison();
       return;
@@ -203,55 +204,24 @@ export class AppController {
     this.state.view = view;
     this.state.modal = null;
     this.state.error = "";
-    if (view === "settings") await this.loadSettings("settings");
-    else {
-      this.changed();
-      if (view === "items") void this.refreshBulkSettings();
-    }
+    this.changed();
   }
 
   availableBulkProviders(): SearchProvider[] {
-    const settings = this.state.bulkSettings;
-    if (!settings) return [];
-    return (["brave", "ollama"] as const).filter(
-      (provider) =>
-        (provider === "brave" ? settings.braveConfigured : settings.ollamaConfigured) &&
-        settings.errors?.[provider] === undefined,
-    );
+    return configuredSearchProviders(this.state);
   }
 
-  async refreshBulkSettings(): Promise<void> {
-    const request = Symbol();
-    this.bulkSettingsRequest = request;
-    this.state.bulkSettings = null;
-    this.state.bulkSettingsLoading = true;
-    this.changed();
-    try {
-      if (this.settingsRead) await this.settingsRead.catch(() => undefined);
-      if (this.bulkSettingsRequest !== request) return;
-      const reading = this.api.searchSettings();
-      this.settingsRead = reading;
-      try {
-        const settings = await reading;
-        if (this.bulkSettingsRequest === request) this.state.bulkSettings = settings;
-      } finally {
-        if (this.settingsRead === reading) this.settingsRead = null;
-      }
-    } catch {
-      // An unknown credential status must keep bulk registration disabled.
-    } finally {
-      if (this.bulkSettingsRequest === request) {
-        this.state.bulkSettingsLoading = false;
-        this.changed();
-      }
-    }
+  async checkSearchSettings(): Promise<void> {
+    const modal = this.state.modal;
+    if (modal?.kind === "image" || modal?.kind === "bulk-image") await this.loadSettings("image");
+    else if (this.state.view === "settings" && !modal) await this.loadSettings("settings");
   }
 
   openBulkImages(): void {
     if (this.state.busy || this.state.view !== "items" || !this.state.active) return;
     const missing = this.state.active.items.filter((item) => !item.image);
     const providers = this.availableBulkProviders();
-    if (!missing.length || !providers.length || this.state.bulkSettingsLoading) return;
+    if (!missing.length) return;
     this.state.bulkProvider = providers.length === 1 ? providers[0]! : null;
     this.state.bulkRun = null;
     this.state.error = "";
@@ -328,10 +298,7 @@ export class AppController {
     }
   }
 
-  private async loadSettings(
-    kind: ReadKind,
-    messages: { notice?: string; errorPrefix?: string } = {},
-  ): Promise<void> {
+  private async loadSettings(kind: ReadKind): Promise<void> {
     await this.performRead(
       kind,
       async () => {
@@ -343,6 +310,17 @@ export class AppController {
         this.settingsRead = reading;
         try {
           return await reading;
+        } catch (error) {
+          if (this.readRequest === request) {
+            const message = errorMessage(error);
+            this.acceptSettings({
+              braveConfigured: false,
+              ollamaConfigured: false,
+              defaultProvider: "brave",
+              errors: { brave: message, ollama: message },
+            });
+          }
+          throw error;
         } finally {
           if (this.settingsRead === reading) this.settingsRead = null;
         }
@@ -350,11 +328,13 @@ export class AppController {
       (settings) => {
         if (settings) this.acceptSettings(settings);
       },
-      messages,
     );
   }
 
-  private acceptSettings(current: SearchSettings): void {
+  private acceptSettings(
+    current: SearchSettings,
+    checked: SearchProvider[] = ["brave", "ollama"],
+  ): void {
     const settings = { ...current };
     let hasErrors = false;
     for (const provider of ["brave", "ollama"] as const) {
@@ -374,7 +354,18 @@ export class AppController {
           settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
     }
     this.state.settings = settings;
+    this.state.checkedProviders = (["brave", "ollama"] as const).filter(
+      (provider) =>
+        this.state.checkedProviders.includes(provider) ||
+        (checked.includes(provider) && current.errors?.[provider] === undefined),
+    );
     this.state.provider = settings.defaultProvider;
+    if (this.state.modal?.kind === "bulk-image") {
+      const providers = this.availableBulkProviders();
+      if (providers.length === 1) this.state.bulkProvider = providers[0]!;
+      else if (!this.state.bulkProvider || !providers.includes(this.state.bulkProvider))
+        this.state.bulkProvider = null;
+    }
   }
 
   async openModal(modal: Exclude<Modal, null>): Promise<void> {
@@ -396,21 +387,17 @@ export class AppController {
     this.state.drafts.query = item?.name ?? "";
     this.state.candidates = [];
     this.state.searched = false;
-    if (modal.kind === "image") await this.loadSettings("image");
-    else this.changed();
+    this.changed();
   }
 
   closeModal(): void {
     if (this.state.busy && this.state.readPending !== "image") return;
     const wasBulkImages = this.state.modal?.kind === "bulk-image";
-    const reloadSettings =
-      this.state.modal !== null && this.state.view === "settings" && this.state.settings === null;
     this.cancelRead("image");
     this.state.modal = null;
     this.state.bulkRun = null;
     if (!wasBulkImages) this.state.error = "";
     this.changed();
-    if (reloadSettings) void this.navigate("settings");
   }
 
   private acceptCommittedList(list: ListState): void {
@@ -555,13 +542,11 @@ export class AppController {
   async duplicateList(): Promise<void> {
     const list = this.state.active;
     if (!list) return;
-    let copiedId: number | null = null;
     this.cancelRead("settings");
     await this.perform(async () => {
       const copy = await this.api
         .duplicateList(list.id)
         .catch((error: unknown) => this.handleListError(list.id, error));
-      copiedId = copy.id;
       this.state.modal = null;
       this.state.drafts.name = "";
       this.state.drafts.items = "";
@@ -574,8 +559,6 @@ export class AppController {
       this.state.view = "items";
       await this.acceptList(copy);
     });
-    if (this.state.active?.id === copiedId && this.state.view === "items")
-      void this.refreshBulkSettings();
   }
 
   setExportIncludeImages(includeImages: boolean): void {
@@ -600,11 +583,9 @@ export class AppController {
 
   async importList(): Promise<void> {
     if (this.state.modal?.kind !== "import-list") return;
-    let importedId: number | null = null;
     await this.perform(async () => {
       const imported = await this.api.importList();
       if (!imported) return;
-      importedId = imported.id;
       this.state.modal = null;
       this.state.drafts.name = "";
       this.state.drafts.items = "";
@@ -620,8 +601,6 @@ export class AppController {
         });
       }
     });
-    if (this.state.active?.id === importedId && this.state.view === "items")
-      void this.refreshBulkSettings();
   }
 
   async saveName(): Promise<void> {
@@ -660,8 +639,6 @@ export class AppController {
       this.state.view = "items";
       await this.acceptList(result);
     });
-    if (this.state.modal === null && this.state.active && this.state.view === "items")
-      void this.refreshBulkSettings();
   }
 
   async confirmDelete(): Promise<void> {
@@ -688,8 +665,6 @@ export class AppController {
       }
       this.state.view = "items";
     });
-    if (this.state.modal === null && this.state.active && this.state.view === "items")
-      void this.refreshBulkSettings();
   }
 
   async addItems(): Promise<void> {
@@ -747,8 +722,6 @@ export class AppController {
       }
       throw new Error(comparisonRetryMessage);
     });
-    if (this.state.active && this.state.view === "items" && !this.state.bulkSettingsLoading)
-      void this.refreshBulkSettings();
   }
 
   private async handleListError(listId: number, error: unknown): Promise<never> {
@@ -768,7 +741,6 @@ export class AppController {
       this.state.view = "items";
       this.state.active = await this.loadFirstAvailableList();
       this.state.view = this.state.active?.convergence.converged ? "ranking" : "items";
-      if (this.state.active && this.state.view === "items") void this.refreshBulkSettings();
     }
     throw error;
   }
@@ -851,6 +823,11 @@ export class AppController {
       this.changed();
       return;
     }
+    if (!this.availableBulkProviders().includes(this.state.provider)) {
+      this.state.error = "保存済みキーを確認するか、検索設定でAPIキーを登録してください。";
+      this.changed();
+      return;
+    }
     this.state.candidates = [];
     this.state.searched = false;
     await this.performRead(
@@ -874,7 +851,6 @@ export class AppController {
     kind: ReadKind,
     load: () => Promise<T>,
     accept: (result: T) => void,
-    messages: { notice?: string; errorPrefix?: string } = {},
   ): Promise<void> {
     if (this.state.busy) return;
     const request = Symbol();
@@ -882,14 +858,14 @@ export class AppController {
     this.state.busy = true;
     this.state.readPending = kind;
     this.state.error = "";
-    this.state.notice = messages.notice ?? "";
+    this.state.notice = "";
     this.changed();
     try {
       const result = await load();
       if (this.readRequest === request) accept(result);
     } catch (error) {
       if (this.readRequest === request) {
-        this.state.error = `${messages.errorPrefix ?? ""}${errorMessage(error)}`;
+        this.state.error = errorMessage(error);
       }
     } finally {
       // A dismissed read must not update a new screen or release a later operation.
@@ -922,7 +898,6 @@ export class AppController {
   async saveKey(provider: SearchProvider, remove = false): Promise<void> {
     const field = provider === "brave" ? "braveKey" : "ollamaKey";
     const key = remove ? "" : this.state.drafts[field].trim();
-    let committed = false;
     await this.perform(async () => {
       if (!remove && !key) throw new Error("APIキーの形式が正しくありません。");
       await this.api.setApiKey(provider, key);
@@ -942,14 +917,7 @@ export class AppController {
       }
       settings.defaultProvider =
         settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
-      this.acceptSettings(settings);
-      committed = true;
+      this.acceptSettings(settings, [provider]);
     });
-    if (committed && this.state.view === "settings" && !this.state.modal) {
-      await this.loadSettings("settings", {
-        notice: this.state.notice,
-        errorPrefix: "設定状態を再取得できませんでした: ",
-      });
-    }
   }
 }
