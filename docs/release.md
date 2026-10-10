@@ -36,6 +36,8 @@ Git tag、draft を含む Release、設定した image tag の未使用を確認
 
 全検証・配布物が完成してから Release を公開する。GitHub Latest・Docker latest は最新の完成済み安定版 Release にだけ更新する。汎用 GitHub Release、Docker、Docker project、Tauri の prerelease は Latest の照会・昇格対象外で、初回公開でも Latest を変更しない。過去に通常 Release として公開された prerelease も採番記録から除外する。Tauri の prerelease は Tap 通知の対象外。
 
+Release 作成応答の ID を後続の asset 添付・配布案内・draft 公開へ引き継ぐため、作成直後の一覧反映を待たずに完了できる。再実行時は全ページの一覧から既存 Release と重複を確認し、完成済み asset を保持する。
+
 Release の分類は共通公開計画で採番済み VERSION と方式から決める。build metadata は分類に影響しない。通常 SemVer の 1.2.3-r1 は prerelease。upstream-revision の上流 VERSION が 1.2.3 なら公開 tag 1.2.3-r1 は通常 Release・Latest 候補で、上流 VERSION が 1.2.3-rc.1 なら prerelease。公開 tag の revision suffix だけで分類しない。
 
 Docker image tag は展開後の `+` を `_` に変換する（例 `1.2.3+build.1` → `1.2.3_build.1`）。SemVer に `_` は使えないため prerelease の `-` と衝突せず、Git version・tag・Release 名は元の値を保持する。有効な既存 image tag は変わらない。変換後にも tag の長さ・形式・使用済み状態・所有者を検証する。

@@ -1155,6 +1155,58 @@ DOWNLOADS_START = "<!-- repo-template:downloads:start -->"
 DOWNLOADS_END = "<!-- repo-template:downloads:end -->"
 
 
+def checked_release_id(release, tag):
+    release_id = release.get("id")
+    require(
+        type(release_id) is int
+        and release_id > 0
+        and release.get("tag_name") == tag
+        and type(release.get("draft")) is bool,
+        "Invalid GitHub Release identity",
+    )
+    return release_id
+
+
+def create_release(gh, plan):
+    tag = plan["release_tag"]
+    matches = [r for r in gh.pages("/releases") if r["tag_name"] == tag]
+    require(len(matches) <= 1, "Multiple GitHub Releases match the tag")
+    if matches:
+        return checked_release_id(matches[0], tag)
+    require(
+        gh.repo(f"/git/ref/tags/{parse.quote(tag, safe='')}", missing=True),
+        "Git tag must exist before creating a GitHub Release",
+    )
+    notes_path = os.environ.get("RELEASE_NOTES_PATH")
+    if notes_path:
+        body = Path(notes_path).read_text()
+    else:
+        body = gh.repo(
+            "/releases/generate-notes", method="POST", payload={"tag_name": tag}
+        )["body"]
+    draft = os.environ.get("RELEASE_DRAFT") == "true"
+    release = gh.repo(
+        "/releases",
+        method="POST",
+        payload={
+            "tag_name": tag,
+            "name": tag,
+            "body": body,
+            "draft": draft,
+            "prerelease": plan["is_prerelease"],
+            "make_latest": "false",
+        },
+    )
+    release_id = checked_release_id(release, tag)
+    require(
+        release["draft"] == draft
+        and type(release.get("prerelease")) is bool
+        and release["prerelease"] == plan["is_prerelease"],
+        "Created GitHub Release metadata differs from publication plan",
+    )
+    return release_id
+
+
 def distribution_body(body, assets, images):
     lines = []
     downloads = [
@@ -1207,9 +1259,12 @@ def distribution_body(body, assets, images):
     return body + (newline * 2 if body and block else "") + block
 
 
-def rust_asset(gh, release, tag, assets):
-    package = tomllib.loads(Path("Cargo.toml").read_text())["package"]["name"]
-    metadata = json.loads(run("cargo", "metadata", "--no-deps", "--format-version=1"))
+def rust_asset(git, gh, release, tag, assets):
+    root = Path(git.root)
+    package = tomllib.loads((root / "Cargo.toml").read_text())["package"]["name"]
+    metadata = json.loads(
+        run("cargo", "metadata", "--no-deps", "--format-version=1", cwd=git.root)
+    )
     targets = next(p["targets"] for p in metadata["packages"] if p["name"] == package)
     if not any("bin" in target["kind"] for target in targets):
         return  # A library has no executable to distribute.
@@ -1230,6 +1285,7 @@ def rust_asset(gh, release, tag, assets):
         "--target",
         "x86_64-unknown-linux-gnu",
         "--message-format=json",
+        cwd=git.root,
     )
     binaries = []
     for line in build.decode().splitlines():
@@ -1239,7 +1295,7 @@ def rust_asset(gh, release, tag, assets):
             and "bin" in artifact["target"]["kind"]
             and artifact.get("executable")
         ):
-            binaries.append(Path(artifact["executable"]))
+            binaries.append(root / artifact["executable"])
     if not binaries:
         return  # All executable targets may require disabled optional features.
     require(release["draft"], "Published Rust distribution asset is missing")
@@ -1248,7 +1304,30 @@ def rust_asset(gh, release, tag, assets):
         with tarfile.open(archive, "w:gz") as bundle:
             for binary in binaries:
                 bundle.add(binary, arcname=binary.name)
-        run("gh", "release", "upload", tag, str(archive), "--clobber")
+        incomplete = [asset for asset in assets if asset["name"] == name]
+        require(
+            all(type(a.get("id")) is int and a["id"] > 0 for a in incomplete),
+            "Invalid release asset ID",
+        )
+        upload_url = release.get("upload_url")
+        require(
+            isinstance(upload_url, str) and upload_url, "Invalid release upload URL"
+        )
+        upload_url = upload_url.split("{")[0]
+        for asset in incomplete:
+            gh.repo(f"/releases/assets/{asset['id']}", method="DELETE")
+        run(
+            "gh",
+            "api",
+            "--method",
+            "POST",
+            f"{upload_url}?name={parse.quote(name, safe='')}",
+            "-H",
+            "Content-Type: application/gzip",
+            "--input",
+            str(archive),
+            cwd=git.root,
+        )
     uploaded = gh.pages(f"/releases/{release['id']}/assets")
     require(
         any(
@@ -1259,15 +1338,29 @@ def rust_asset(gh, release, tag, assets):
     )
 
 
-def distribution(gh, plan):
+def distribution(git, gh, plan):
     tag = plan["release_tag"]
     matches = [r for r in gh.pages("/releases") if r["tag_name"] == tag]
-    require(len(matches) == 1, "Expected one GitHub Release for distribution")
-    release = gh.repo(f"/releases/{matches[0]['id']}")
-    require(release["tag_name"] == tag, "Release tag differs from publication plan")
+    retained_id = os.environ.get("RELEASE_ID")
+    require(len(matches) <= 1, "Multiple GitHub Releases match the tag")
+    if retained_id:
+        require(
+            re.fullmatch(r"[1-9][0-9]*", retained_id),
+            "Invalid retained GitHub Release ID",
+        )
+        release_id = int(retained_id)
+        require(
+            not matches or checked_release_id(matches[0], tag) == release_id,
+            "Listed GitHub Release differs from retained ID",
+        )
+    else:
+        require(len(matches) == 1, "Expected one GitHub Release for distribution")
+        release_id = checked_release_id(matches[0], tag)
+    release = gh.repo(f"/releases/{release_id}")
+    require(checked_release_id(release, tag) == release_id, "GitHub Release ID differs")
     assets = gh.pages(f"/releases/{release['id']}/assets")
     if os.environ.get("BUILD_RUST_BINARY") == "true":
-        rust_asset(gh, release, tag, assets)
+        rust_asset(git, gh, release, tag, assets)
         assets = gh.pages(f"/releases/{release['id']}/assets")
     for image in plan["images"]:
         require(
@@ -1275,6 +1368,7 @@ def distribution(gh, plan):
             f"Published image is missing: {image['name']}",
         )
     release = gh.repo(f"/releases/{release['id']}")
+    require(checked_release_id(release, tag) == release_id, "GitHub Release ID differs")
     body = release.get("body") or ""
     updated = distribution_body(body, assets, plan["images"])
     payload = {}
@@ -1321,6 +1415,7 @@ def main():
             "image-state",
             "classification",
             "distribution",
+            "create",
         ],
     )
     parser.add_argument("--root", default=".")
@@ -1339,8 +1434,10 @@ def main():
         if args.action == "plan":
             Path(os.environ["RELEASE_PLAN_OUTPUT"]).write_bytes(canonical(plan))
             values = {"version": plan["generated_version"]}
+        elif args.action == "create":
+            values = {"release_id": create_release(gh, plan["publication"])}
         elif args.action == "distribution":
-            distribution(gh, plan["publication"])
+            distribution(git, gh, plan["publication"])
             values = {}
         elif args.action == "image-state":
             require(
