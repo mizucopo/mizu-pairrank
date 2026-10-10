@@ -103,10 +103,7 @@ jobs:
           # Preserve the original ZIP names when the same push is rerun after a rename.
           repository_name="${release_repository#*/}"
           echo "zip_prefix=$repository_name-$VERSION" >> "$GITHUB_OUTPUT"
-          is_prerelease=false
-          case "${VERSION%%+*}" in
-            *-*) is_prerelease=true ;;
-          esac
+          is_prerelease="$(jq -er '.publication.is_prerelease | select(type == "boolean") | tostring' "$RELEASE_PLAN_OUTPUT")"
           echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
 
       - name: Inspect release state
@@ -690,7 +687,8 @@ jobs:
     permissions:
       contents: write
     needs: [preflight, publish]
-    if: needs.preflight.outputs.is_prerelease == 'false'
+    # Completed assets skip quality/build on a full rerun.
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.publish.result == 'success' && needs.preflight.outputs.is_prerelease == 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -722,7 +720,7 @@ jobs:
 
   notify-homebrew:
     needs: [preflight, promote-latest]
-    if: github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.promote-latest.result == 'success' && needs.promote-latest.outputs.promoted == 'true' && !contains(needs.preflight.outputs.version, '-') && !contains(needs.preflight.outputs.version, '+') && vars.HOMEBREW_TAP_NOTIFY_ENABLED == 'true'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.preflight.result == 'success' && needs.promote-latest.result == 'success' && needs.promote-latest.outputs.promoted == 'true' && !contains(needs.preflight.outputs.version, '-') && !contains(needs.preflight.outputs.version, '+') && vars.HOMEBREW_TAP_NOTIFY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

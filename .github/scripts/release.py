@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from pathlib import Path
@@ -146,7 +147,8 @@ def publication(policy, version, revision=None):
     try:
         tag = spec["release_tag"].format_map(context)
         images = [
-            {**image, "tag": image["tag"].format_map(context)}
+            # SemVer cannot contain '_'; preserve metadata without aliasing '-'.
+            {**image, "tag": image["tag"].format_map(context).replace("+", "_")}
             for image in spec["images"]
         ]
     except (KeyError, ValueError) as exc:
@@ -188,6 +190,8 @@ def publication(policy, version, revision=None):
         "release_paths": spec["release_paths"],
         "latest_image": spec.get("latest_image"),
         "github_release": spec["github_release"],
+        "is_prerelease": policy["version"]["scheme"] != "chrome"
+        and version_key(version, "semver")[1] == 0,
     }
 
 
@@ -254,6 +258,10 @@ def choose(
         revision = None
     for _ in range(100):
         plan = publication(policy, version, revision)
+        require(
+            not plan["release_tag"].startswith("-"),
+            "Release tag must not start with '-'",
+        )
         collisions = occupied(plan)
         if not collisions:
             return version, revision, plan
@@ -910,6 +918,7 @@ def remote_collisions(gh, plan):
 
 
 def prepared(git, record):
+    require(not record["Tag"].startswith("-"), "Release tag must not start with '-'")
     require(
         git.text("rev-parse", "refs/tags/" + record["Tag"] + "^{commit}")
         == record["commit"],
@@ -1142,7 +1151,146 @@ def checkout_plan(git):
     }
 
 
+DOWNLOADS_START = "<!-- repo-template:downloads:start -->"
+DOWNLOADS_END = "<!-- repo-template:downloads:end -->"
+
+
+def distribution_body(body, assets, images):
+    lines = []
+    downloads = [
+        asset
+        for asset in assets
+        if asset.get("state") == "uploaded" and asset.get("size", 0) > 0
+    ]
+    if downloads:
+        lines = ["## Downloads", ""]
+        for asset in downloads:
+            name = asset["name"].replace("[", r"\[").replace("]", r"\]")
+            lines.append(f"- [{name}](<{asset['browser_download_url']}>)")
+    if images:
+        lines += ["", "## Docker Images", ""]
+        for image in images:
+            repository = image["repository"]
+            if image.get("registry", "dockerhub") == "ecr":
+                repository = (
+                    f"{image['account']}.dkr.ecr.{image['region']}.amazonaws.com/"
+                    + repository
+                )
+            else:
+                lines.append(f"- [Docker Hub](https://hub.docker.com/r/{repository})")
+            lines += ["", "```sh", f"docker pull {repository}:{image['tag']}", "```"]
+    newline = "\r\n" if "\r\n" in body else "\n"
+    block = (
+        DOWNLOADS_START
+        + newline
+        + newline.join(lines).strip()
+        + newline
+        + DOWNLOADS_END
+        if lines
+        else ""
+    )
+    pattern = re.compile(
+        "^"
+        + re.escape(DOWNLOADS_START)
+        + r"\r?$.*?^"
+        + re.escape(DOWNLOADS_END)
+        + r"(?=\r?$)",
+        re.MULTILINE | re.DOTALL,
+    )
+    if DOWNLOADS_START in body or DOWNLOADS_END in body:
+        require(
+            body.count(DOWNLOADS_START) == body.count(DOWNLOADS_END) == 1
+            and len(pattern.findall(body)) == 1,
+            "Malformed release downloads block",
+        )
+        return pattern.sub(lambda _: block, body)
+    return body + (newline * 2 if body and block else "") + block
+
+
+def rust_asset(gh, release, tag, assets):
+    package = tomllib.loads(Path("Cargo.toml").read_text())["package"]["name"]
+    metadata = json.loads(run("cargo", "metadata", "--no-deps", "--format-version=1"))
+    targets = next(p["targets"] for p in metadata["packages"] if p["name"] == package)
+    if not any("bin" in target["kind"] for target in targets):
+        return  # A library has no executable to distribute.
+    name = f"{package}-{parse.quote(tag, safe='')}-linux-x86_64.tar.gz"
+    if any(
+        a["name"] == name and a.get("state") == "uploaded" and a.get("size", 0) > 0
+        for a in assets
+    ):
+        return
+    build = run(
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--package",
+        package,
+        "--bins",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--message-format=json",
+    )
+    binaries = []
+    for line in build.decode().splitlines():
+        artifact = json.loads(line)
+        if (
+            artifact.get("reason") == "compiler-artifact"
+            and "bin" in artifact["target"]["kind"]
+            and artifact.get("executable")
+        ):
+            binaries.append(Path(artifact["executable"]))
+    if not binaries:
+        return  # All executable targets may require disabled optional features.
+    require(release["draft"], "Published Rust distribution asset is missing")
+    with tempfile.TemporaryDirectory() as directory:
+        archive = Path(directory) / name
+        with tarfile.open(archive, "w:gz") as bundle:
+            for binary in binaries:
+                bundle.add(binary, arcname=binary.name)
+        run("gh", "release", "upload", tag, str(archive), "--clobber")
+    uploaded = gh.pages(f"/releases/{release['id']}/assets")
+    require(
+        any(
+            a["name"] == name and a.get("state") == "uploaded" and a.get("size", 0) > 0
+            for a in uploaded
+        ),
+        "Rust distribution upload is incomplete",
+    )
+
+
+def distribution(gh, plan):
+    tag = plan["release_tag"]
+    matches = [r for r in gh.pages("/releases") if r["tag_name"] == tag]
+    require(len(matches) == 1, "Expected one GitHub Release for distribution")
+    release = gh.repo(f"/releases/{matches[0]['id']}")
+    require(release["tag_name"] == tag, "Release tag differs from publication plan")
+    assets = gh.pages(f"/releases/{release['id']}/assets")
+    if os.environ.get("BUILD_RUST_BINARY") == "true":
+        rust_asset(gh, release, tag, assets)
+        assets = gh.pages(f"/releases/{release['id']}/assets")
+    for image in plan["images"]:
+        require(
+            image_digest(image) is not None,
+            f"Published image is missing: {image['name']}",
+        )
+    release = gh.repo(f"/releases/{release['id']}")
+    body = release.get("body") or ""
+    updated = distribution_body(body, assets, plan["images"])
+    payload = {}
+    if updated != body:
+        payload["body"] = updated
+    if release["draft"]:
+        payload.update(
+            draft=False, prerelease=plan["is_prerelease"], make_latest="false"
+        )
+    if payload:
+        gh.repo(f"/releases/{release['id']}", method="PATCH", payload=payload)
+
+
 def latest(git, gh, commit):
+    if publication_at(git, commit)["is_prerelease"]:
+        return False
     completed = [
         r for r in gh.pages("/releases") if not r["draft"] and not r.get("prerelease")
     ]
@@ -1152,7 +1300,10 @@ def latest(git, gh, commit):
     )
     releases = {r["tag_name"]: r for r in completed}
     for record in records(git, git.fetch_main()):
-        if record["Tag"] in releases:
+        if (
+            record["Tag"] in releases
+            and not publication_at(git, record["commit"])["is_prerelease"]
+        ):
             prepared(git, record)
             return record["commit"] == commit
     raise PreparationError("No completed release exists on main")
@@ -1169,6 +1320,7 @@ def main():
             "latest",
             "image-state",
             "classification",
+            "distribution",
         ],
     )
     parser.add_argument("--root", default=".")
@@ -1187,6 +1339,9 @@ def main():
         if args.action == "plan":
             Path(os.environ["RELEASE_PLAN_OUTPUT"]).write_bytes(canonical(plan))
             values = {"version": plan["generated_version"]}
+        elif args.action == "distribution":
+            distribution(gh, plan["publication"])
+            values = {}
         elif args.action == "image-state":
             require(
                 len(plan["publication"]["images"]) == 1,
