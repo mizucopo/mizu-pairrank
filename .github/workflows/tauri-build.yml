@@ -181,6 +181,19 @@ jobs:
               echo "::error::Could not inspect draft GitHub Releases for $TAG."
               exit 1
             fi
+            if [ -n "${RELEASE_ID:-}" ]; then
+              if ! [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] \
+                || ! jq -e --argjson id "$RELEASE_ID" \
+                  '. == null or .id == $id' "$RELEASE_RESPONSE" > /dev/null; then
+                echo "::error::Listed GitHub Release differs from retained ID."
+                exit 1
+              fi
+              gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_RESPONSE"
+              if ! jq -e --argjson id "$RELEASE_ID" '.id == $id' "$RELEASE_RESPONSE" > /dev/null; then
+                echo "::error::GitHub Release ID differs from retained ID."
+                exit 1
+              fi
+            fi
             if [ "$(jq -r '. != null' "$RELEASE_RESPONSE")" = "true" ]; then
               release_exists=true
             fi
@@ -554,6 +567,19 @@ jobs:
                 echo "::error::Could not inspect draft GitHub Releases for $TAG."
                 exit 1
               fi
+              if [ -n "${RELEASE_ID:-}" ]; then
+                if ! [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] \
+                  || ! jq -e --argjson id "$RELEASE_ID" \
+                    '. == null or .id == $id' "$RELEASE_RESPONSE" > /dev/null; then
+                  echo "::error::Listed GitHub Release differs from retained ID."
+                  exit 1
+                fi
+                gh api "/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RELEASE_RESPONSE"
+                if ! jq -e --argjson id "$RELEASE_ID" '.id == $id' "$RELEASE_RESPONSE" > /dev/null; then
+                  echo "::error::GitHub Release ID differs from retained ID."
+                  exit 1
+                fi
+              fi
               if [ "$(jq -r '. != null' "$RELEASE_RESPONSE")" = "true" ]; then
                 release_exists=true
               fi
@@ -631,6 +657,7 @@ jobs:
               echo "::error::Git tag $TAG must exist before creating a GitHub Release."
               exit 1
             fi
+            gh api --silent "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"
             # Retain the created draft identity; it may not appear in the listing yet.
             gh api --method POST "/repos/$GITHUB_REPOSITORY/releases" \
               -f tag_name="$TAG" -f name="$TAG" \
@@ -655,7 +682,6 @@ jobs:
             exit 0
           fi
 
-          upload_url="$(jq -er '.upload_url | select(type == "string" and length > 0) | split("{")[0]' "$RELEASE_RESPONSE")"
           artifact_dir="$RUNNER_TEMP/release-assets"
           for platform in windows-x64 windows-arm64 macos-arm64; do
             asset_name="$ZIP_PREFIX-$platform.zip"
@@ -663,7 +689,8 @@ jobs:
               'any(.assets[]; .name == $name and .state == "uploaded" and
                 (.size | type == "number" and . > 0))' \
               "$RELEASE_RESPONSE")" != "true" ]; then
-              # Replace only incomplete assets, using IDs rather than another tag lookup.
+              # Replace only incomplete assets, without rediscovering the draft by tag.
+              upload_url="$(jq -er '.upload_url | select(type == "string" and length > 0) | split("{")[0]' "$RELEASE_RESPONSE")"
               asset_ids="$(jq -r --arg name "$asset_name" \
                 '[.assets[] | select(.name == $name) | .id] |
                  if all(.[]; type == "number" and . > 0 and floor == .)
