@@ -212,6 +212,146 @@ describe("desktop app interaction", () => {
     );
   });
 
+  it.each(["comparison", "select", "create", "duplicate", "import", "add"] as const)(
+    "does not read credentials during normal %s operations",
+    async (operation) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      if (operation === "comparison") {
+        await click(root, controller, '[data-view="compare"]');
+        await click(root, controller, '[data-answer="equal"]');
+        expect(api.answer).toHaveBeenCalledOnce();
+      } else if (operation === "select") {
+        await click(root, controller, '[data-action="select-list"][data-id="1"]');
+      } else if (operation === "create") {
+        await click(root, controller, '[data-action="create-list"]');
+        const input = root.querySelector<HTMLInputElement>("#name-input");
+        if (!input) throw new Error("Missing list name input");
+        input.value = "新しいリスト";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await click(root, controller, '[data-form="save-name"] button[type="submit"]');
+        expect(api.createList).toHaveBeenCalledOnce();
+      } else if (operation === "duplicate") {
+        await click(root, controller, '[data-action="duplicate-list"]');
+        expect(api.duplicateList).toHaveBeenCalledOnce();
+      } else if (operation === "import") {
+        await click(root, controller, '[data-action="import-list"]');
+        await click(root, controller, '[data-action="confirm-import"]');
+        expect(api.importList).toHaveBeenCalledOnce();
+      } else {
+        const input = root.querySelector<HTMLTextAreaElement>("textarea");
+        if (!input) throw new Error("Missing item input");
+        input.value = "ぶどう";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await click(root, controller, '[data-form="add-items"] button[type="submit"]');
+        expect(api.addItems).toHaveBeenCalledOnce();
+      }
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      expect(api.searchImages).not.toHaveBeenCalled();
+      expect(api.setApiKey).not.toHaveBeenCalled();
+    },
+  );
+
+  it("distinguishes a declined credential read and an unset key while leaving comparison usable", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="settings"]');
+    expect(
+      [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
+    ).toEqual(["未確認", "未確認"]);
+    expect(root.textContent).toContain("比較");
+    api.searchSettings.mockRejectedValueOnce(new Error("ユーザーが確認をキャンセルしました"));
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(
+      [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
+    ).toEqual(["確認できません", "確認できません"]);
+    expect(button(root, '[data-action="check-search-settings"]').disabled).toBe(false);
+    await click(root, controller, '[data-action="select-list"][data-id="1"]');
+    await click(root, controller, '[data-view="compare"]');
+    await click(root, controller, '[data-answer="equal"]');
+    expect(api.answer).toHaveBeenCalledOnce();
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    await click(root, controller, '[data-view="settings"]');
+    expect(
+      [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
+    ).toEqual(["確認できません", "確認できません"]);
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(
+      [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
+    ).toEqual(["未設定", "未設定"]);
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["result", "error"] as const)(
+    "serializes explicit image retries and ignores a cancelled native lookup's late %s",
+    async (outcome) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      let finishOld: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finishOld = () =>
+              outcome === "result"
+                ? resolve({
+                    braveConfigured: false,
+                    ollamaConfigured: true,
+                    defaultProvider: "ollama",
+                  })
+                : reject(new Error("古いキー確認に失敗しました"));
+          }),
+      );
+      const oldRead = controller.checkSearchSettings();
+      expect(controller.state.busy).toBe(true);
+      await click(root, controller, '[data-action="close-modal"]');
+      await click(root, controller, '[data-action="image"][data-id="11"]');
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(controller.state.checkedProviders).toEqual([]);
+      let finishCurrent: () => void = () => {};
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishCurrent = () =>
+              resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
+          }),
+      );
+      const currentRead = controller.checkSearchSettings();
+      expect(controller.state.busy).toBe(true);
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      finishOld();
+      await oldRead;
+      await vi.waitFor(() => expect(api.searchSettings).toHaveBeenCalledTimes(2));
+      expect(controller.state.checkedProviders).toEqual([]);
+      expect(controller.state.settings).toBeNull();
+      expect(root.querySelector("dialog")?.textContent).toContain("みかん");
+      expect(root.querySelector('dialog [role="alert"]')).toBeNull();
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+      finishCurrent();
+      await currentRead;
+      expect(controller.state.settings?.braveConfigured).toBe(true);
+      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(
+        false,
+      );
+      expect(api.searchImages).not.toHaveBeenCalled();
+    },
+  );
+
+  it("acknowledges key removal without rereading keys or marking the peer as configured", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await controller.navigate("settings");
+    controller.state.drafts.braveKey = "test-key";
+    await controller.saveKey("brave");
+    await click(root, controller, '[data-action="remove-key"][data-provider="brave"]');
+    expect(api.setApiKey).toHaveBeenLastCalledWith("brave", "");
+    expect(root.textContent).toContain("APIキーを削除しました。");
+    expect(
+      [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
+    ).toEqual(["未設定", "未確認"]);
+    expect(api.searchSettings).not.toHaveBeenCalled();
+  });
+
   it("exports without images by default, explains redistribution, and resets opt-in when reopened", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
@@ -467,9 +607,10 @@ describe("desktop app interaction", () => {
     expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
   });
 
-  it("keeps a Tier row's focus and horizontal scroll after a background settings refresh", async () => {
+  it("keeps Tier focus and scroll when a cancelled explicit credential read finishes", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
+    await controller.navigate("settings");
     let finishRead: (settings: Awaited<ReturnType<AppApi["searchSettings"]>>) => void = () => {};
     api.searchSettings.mockImplementationOnce(
       () =>
@@ -477,30 +618,30 @@ describe("desktop app interaction", () => {
           finishRead = resolve;
         }),
     );
-    const refreshing = controller.refreshBulkSettings();
+    const reading = controller.checkSearchSettings();
+    await click(root, controller, '[data-action="select-list"][data-id="1"]');
     await click(root, controller, '.tabs [data-view="tier"]');
     const row = root.querySelector<HTMLElement>(".tier-items");
     if (!row) throw new Error("Missing Tier row");
     row.focus();
     row.scrollLeft = 80;
-
     finishRead({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
-    await refreshing;
-
-    const refreshedRow = root.querySelector<HTMLElement>(".tier-items");
-    expect(refreshedRow).not.toBe(row);
-    expect(document.activeElement).toBe(refreshedRow);
-    expect(refreshedRow?.scrollLeft).toBe(80);
+    await reading;
+    expect(root.querySelector(".tier-items")).toBe(row);
+    expect(document.activeElement).toBe(row);
+    expect(row.scrollLeft).toBe(80);
+    expect(controller.state.settings).toBeNull();
+    expect(api.searchSettings).toHaveBeenCalledOnce();
   });
 
   it.each([
-    [false, false, true, null, false],
-    [true, false, false, "brave", false],
-    [false, true, false, "ollama", false],
-    [true, true, false, null, true],
+    [false, false, null, false],
+    [true, false, "brave", false],
+    [false, true, "ollama", false],
+    [true, true, null, true],
   ] as const)(
-    "offers bulk registration for Brave=%s and Ollama=%s",
-    async (braveConfigured, ollamaConfigured, disabled, selected, chooseProvider) => {
+    "offers explained bulk registration after explicitly checking Brave=%s and Ollama=%s",
+    async (braveConfigured, ollamaConfigured, selected, chooseProvider) => {
       const { root, controller, api } = setup();
       await controller.initialize();
       api.searchSettings.mockResolvedValueOnce({
@@ -508,11 +649,14 @@ describe("desktop app interaction", () => {
         ollamaConfigured,
         defaultProvider: "brave",
       });
-      await controller.refreshBulkSettings();
-      const open = button(root, '[data-action="bulk-images"]');
-      expect(open.disabled).toBe(disabled);
-      if (disabled) return;
+      expect(button(root, '[data-action="bulk-images"]').disabled).toBe(false);
       await click(root, controller, '[data-action="bulk-images"]');
+      expect(root.querySelector("dialog")?.textContent).toContain("APIキーを安全に保存・読み出す");
+      expect(root.querySelector("dialog")?.textContent).toContain("macOS");
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(true);
+      await click(root, controller, '[data-action="check-search-settings"]');
+      expect(api.searchSettings).toHaveBeenCalledOnce();
       expect(root.textContent).toContain("画像未登録 2 件");
       expect(controller.state.bulkProvider).toBe(selected);
       const selector = root.querySelector<HTMLSelectElement>("#bulk-provider");
@@ -522,37 +666,88 @@ describe("desktop app interaction", () => {
         selector.value = "ollama";
         selector.dispatchEvent(new Event("change", { bubbles: true }));
         expect(controller.state.bulkProvider).toBe("ollama");
-        expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
-      } else expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+      }
+      expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(
+        !braveConfigured && !ollamaConfigured,
+      );
+      expect(api.autoRegisterImage).not.toHaveBeenCalled();
     },
   );
 
-  it("refreshes bulk eligibility when returning from search settings", async () => {
+  it("reuses explicitly checked credentials when returning from settings without rereading", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
-    await controller.refreshBulkSettings();
-    expect(button(root, '[data-action="bulk-images"]').disabled).toBe(true);
+    expect(button(root, '[data-action="bulk-images"]').disabled).toBe(false);
     api.searchSettings.mockResolvedValue({
       braveConfigured: false,
       ollamaConfigured: true,
       defaultProvider: "ollama",
     });
     await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
     await controller.navigate("items");
-    await vi.waitFor(() =>
-      expect(button(root, '[data-action="bulk-images"]').disabled).toBe(false),
-    );
     await click(root, controller, '[data-action="bulk-images"]');
     expect(controller.state.bulkProvider).toBe("ollama");
+    expect(api.searchSettings).toHaveBeenCalledOnce();
+    expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
   });
 
-  it("disables bulk registration when credential state cannot be read", async () => {
+  it("keeps bulk credential failure distinct from unconfigured keys and permits an explicit retry", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
     api.searchSettings.mockRejectedValueOnce(new Error("keyring unavailable"));
-    await controller.refreshBulkSettings();
-    expect(button(root, '[data-action="bulk-images"]').disabled).toBe(true);
-    expect(button(root, '[data-action="refresh-bulk-settings"]').disabled).toBe(false);
+    await click(root, controller, '[data-action="bulk-images"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(root.querySelector("dialog")?.textContent).toContain("確認できません");
+    expect(root.querySelector("dialog")?.textContent).not.toContain("未設定");
+    expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(true);
+    expect(button(root, '[data-action="check-search-settings"]').disabled).toBe(false);
+    api.searchSettings.mockResolvedValueOnce({
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    expect(controller.state.bulkProvider).toBe("brave");
+    expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+  });
+
+  it("disables bulk start during an explicit credential recheck while keeping cancellation available", async () => {
+    const { root, controller, api } = setup();
+    const configured = {
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave" as const,
+    };
+    api.searchSettings.mockResolvedValue(configured);
+    await controller.initialize();
+    await click(root, controller, '[data-action="bulk-images"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(controller.state.bulkProvider).toBe("brave");
+    expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+
+    let finishRecheck: () => void = () => {};
+    api.searchSettings.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRecheck = () => resolve(configured);
+        }),
+    );
+    button(root, '[data-action="check-search-settings"]').click();
+    expect(controller.state.busy).toBe(true);
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    try {
+      expect(button(root, '[data-action="close-modal"]').disabled).toBe(false);
+      expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(true);
+      expect(api.autoRegisterImage).not.toHaveBeenCalled();
+    } finally {
+      finishRecheck();
+      await settle(controller);
+    }
+    expect(controller.state.bulkProvider).toBe("brave");
+    expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(false);
+    expect(api.autoRegisterImage).not.toHaveBeenCalled();
   });
 
   it("processes only missing images and reloads the list after registration", async () => {
@@ -564,7 +759,9 @@ describe("desktop app interaction", () => {
       ollamaConfigured: false,
       defaultProvider: "brave",
     });
-    await controller.refreshBulkSettings();
+    await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await controller.navigate("items");
     const updated = {
       ...withLocalImage(state),
       revision: state.revision + 1,
@@ -593,7 +790,9 @@ describe("desktop app interaction", () => {
       ollamaConfigured: false,
       defaultProvider: "brave",
     });
-    await controller.refreshBulkSettings();
+    await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await controller.navigate("items");
     let finish: (outcome: "registered") => void = () => {};
     api.autoRegisterImage.mockImplementationOnce(
       () => new Promise((resolve) => (finish = resolve)),
@@ -628,7 +827,9 @@ describe("desktop app interaction", () => {
       ollamaConfigured: false,
       defaultProvider: "brave",
     });
-    await controller.refreshBulkSettings();
+    await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await controller.navigate("items");
     api.autoRegisterImage
       .mockResolvedValueOnce("registered")
       .mockRejectedValueOnce(new Error("API利用上限"));
@@ -651,7 +852,9 @@ describe("desktop app interaction", () => {
       ollamaConfigured: false,
       defaultProvider: "brave",
     });
-    await controller.refreshBulkSettings();
+    await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await controller.navigate("items");
     api.autoRegisterImage.mockResolvedValueOnce("unavailable").mockResolvedValueOnce("skipped");
     await click(root, controller, '[data-action="bulk-images"]');
     await click(root, controller, '[data-action="start-bulk-images"]');
@@ -763,7 +966,8 @@ describe("desktop app interaction", () => {
               });
           }),
       );
-      const reading = controller.navigate("settings");
+      await controller.navigate("settings");
+      const reading = controller.checkSearchSettings();
       const navigation =
         destination === "existing list"
           ? '[data-action="select-list"][data-id="1"]'
@@ -789,7 +993,7 @@ describe("desktop app interaction", () => {
     ["pending", "button"],
     ["failed", "Escape"],
   ] as const)(
-    "recovers %s settings after cancelling list creation with %s and restores focus and drafts",
+    "retries %s settings explicitly after cancelling list creation with %s while preserving drafts",
     async (initial, dismissal) => {
       const { root, controller, api } = setup();
       await controller.initialize();
@@ -808,7 +1012,8 @@ describe("desktop app interaction", () => {
             }),
         );
       } else api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
-      const firstRead = controller.navigate("settings");
+      await controller.navigate("settings");
+      const firstRead = controller.checkSearchSettings();
       if (initial === "failed") await firstRead;
       const opener = '[data-action="create-list"]';
       await click(root, controller, opener);
@@ -831,8 +1036,14 @@ describe("desktop app interaction", () => {
         dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
       }
       expect(root.querySelector("dialog")).toBeNull();
-      expect(controller.state.readPending).toBe("settings");
+      expect(controller.state.readPending).toBeNull();
+      expect(api.searchSettings).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(button(root, opener));
       expect(button(root, '[data-action="select-list"][data-id="1"]').disabled).toBe(false);
+      const check = button(root, '[data-action="check-search-settings"]');
+      check.focus();
+      check.click();
+      expect(controller.state.readPending).toBe("settings");
       if (initial === "pending") {
         expect(api.searchSettings).toHaveBeenCalledTimes(1);
         finishOld();
@@ -842,7 +1053,7 @@ describe("desktop app interaction", () => {
       finishCurrent();
       await settle(controller);
       expect(root.querySelector(".settings-card .badge")?.textContent).toBe("設定済み");
-      expect(document.activeElement).toBe(button(root, opener));
+      expect(document.activeElement).toBe(button(root, '[data-action="check-search-settings"]'));
       const key = root.querySelector("#braveKey");
       if (!(key instanceof HTMLInputElement)) throw new Error("Missing API key input");
       expect(key.value).toBe("unsaved key");
@@ -850,26 +1061,30 @@ describe("desktop app interaction", () => {
     },
   );
 
-  it("allows leaving the settings reload after modal cancellation without losing navigation focus or drafts", async () => {
+  it("allows leaving an explicit retry after modal cancellation without losing focus or drafts", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
     controller.state.drafts.items = "unsaved item";
     api.searchSettings.mockRejectedValueOnce(new Error("initial settings read failed"));
     await controller.navigate("settings");
+    await click(root, controller, '[data-action="check-search-settings"]');
     await click(root, controller, '[data-action="create-list"]');
     let failRead: () => void = () => {};
     api.searchSettings.mockImplementationOnce(
       () =>
         new Promise((_resolve, reject) => {
-          failRead = () => reject(new Error("abandoned reload failed"));
+          failRead = () => reject(new Error("abandoned retry failed"));
         }),
     );
     button(root, '[data-action="close-modal"]').click();
+    expect(controller.state.readPending).toBeNull();
+    expect(api.searchSettings).toHaveBeenCalledTimes(1);
+    const retry = controller.checkSearchSettings();
     expect(controller.state.readPending).toBe("settings");
     const navigation = '[data-action="select-list"][data-id="1"]';
     await click(root, controller, navigation);
     failRead();
-    await Promise.resolve();
+    await retry;
     expect(controller.state.view).toBe("items");
     expect(controller.state.busy).toBe(false);
     expect(root.querySelector("dialog")).toBeNull();
@@ -880,7 +1095,7 @@ describe("desktop app interaction", () => {
     expect(input.value).toBe("unsaved item");
   });
 
-  it("protects a credential write and enables navigation during its post-write refresh", async () => {
+  it("protects a credential write and acknowledges it without reading either key", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
     await controller.navigate("settings");
@@ -892,28 +1107,20 @@ describe("desktop app interaction", () => {
           finishWrite = resolve;
         }),
     );
-    let failRead: (error: Error) => void = () => {};
-    api.searchSettings.mockImplementationOnce(
-      () =>
-        new Promise((_resolve, reject) => {
-          failRead = reject;
-        }),
-    );
     const saving = controller.saveKey("brave");
     const navigation = '[data-action="select-list"][data-id="1"]';
     expect(button(root, navigation).disabled).toBe(true);
     await controller.navigate("items");
     expect(controller.state.view).toBe("settings");
     finishWrite();
-    await vi.waitFor(() => {
-      expect(root.textContent).toContain("APIキーを保存しました。");
-      expect(button(root, navigation).disabled).toBe(false);
-      expect(button(root, '[data-form="save-key"] button[type="submit"]').disabled).toBe(true);
-    });
-    await click(root, controller, navigation);
-    expect(controller.state.view).toBe("items");
-    failRead(new Error("old post-write read failed"));
     await saving;
+    expect(root.textContent).toContain("APIキーを保存しました。");
+    expect(button(root, navigation).disabled).toBe(false);
+    expect(button(root, '[data-form="save-key"] button[type="submit"]').disabled).toBe(false);
+    expect(root.querySelectorAll(".settings-card .badge")[0]?.textContent).toBe("設定済み");
+    expect(root.querySelectorAll(".settings-card .badge")[1]?.textContent).toBe("未確認");
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    await click(root, controller, navigation);
     expect(root.querySelector("h1")?.textContent).toBe("好きな果物");
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect(controller.state.settings?.braveConfigured).toBe(true);
@@ -1103,7 +1310,8 @@ describe("desktop app interaction", () => {
           return second;
         });
       } else if (operation === "settings") {
-        selector = '[data-view="settings"]';
+        await controller.navigate("settings");
+        selector = '[data-action="check-search-settings"]';
         api.searchSettings.mockImplementationOnce(async () => {
           await pending;
           return { braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" };
@@ -1132,7 +1340,7 @@ describe("desktop app interaction", () => {
       before.click();
       expect(controller.state.busy).toBe(true);
       expect(before.isConnected).toBe(false);
-      expect(button(root, selector).disabled).toBe(operation !== "settings");
+      expect(button(root, selector).disabled).toBe(true);
       finish();
       await settle(controller);
       expect(document.activeElement).toBe(button(root, selector));
@@ -1180,6 +1388,8 @@ describe("desktop app interaction", () => {
     });
     await controller.initialize();
     await click(root, controller, opener);
+    if (method === "searchImages")
+      await click(root, controller, '[data-action="check-search-settings"]');
     const modal = controller.state.modal;
     if (method === "renameItem") {
       const input = root.querySelector("#name-input");
@@ -1447,6 +1657,7 @@ describe("desktop app interaction", () => {
       });
       await controller.initialize();
       await controller.navigate("settings");
+      await click(root, controller, '[data-action="check-search-settings"]');
       const cards = [...root.querySelectorAll(".settings-card")];
       expect(cards[unreadable === "brave" ? 0 : 1]?.textContent).toContain("確認できません");
       const errorMessage = readError || "資格情報ストアから読み取れませんでした。";
@@ -1474,6 +1685,7 @@ describe("desktop app interaction", () => {
       api.searchSettings.mockRejectedValue(new Error("keyring read failed"));
       await controller.initialize();
       await click(root, controller, '[data-view="settings"]');
+      await click(root, controller, '[data-action="check-search-settings"]');
       const input = root.querySelector(`[data-draft="${provider}Key"]`);
       if (!(input instanceof HTMLInputElement)) throw new Error("Missing API key input");
       input.value = "saved-key";
@@ -1488,9 +1700,17 @@ describe("desktop app interaction", () => {
           ?.closest(".settings-card")
           ?.querySelector(".badge")?.textContent,
       ).toBe("設定済み");
-      expect(root.querySelector('[role="alert"]')?.textContent).toContain(
-        "設定状態を再取得できませんでした",
-      );
+      expect(controller.state.error).toBe("");
+      expect(
+        root
+          .querySelector(`[data-form="save-key"][data-provider="${provider}"]`)
+          ?.closest(".settings-card")
+          ?.querySelector('[role="alert"]'),
+      ).toBeNull();
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(
+        root.querySelectorAll(".settings-card .badge")[provider === "brave" ? 1 : 0]?.textContent,
+      ).toBe("確認できません");
 
       await controller.navigate("items");
       await click(root, controller, '[data-action="image"][data-id="10"]');
@@ -1534,18 +1754,15 @@ describe("desktop app interaction", () => {
     expect(api.setApiKey).not.toHaveBeenCalled();
     restored.value = "saved-key";
     restored.dispatchEvent(new Event("input", { bubbles: true }));
-    api.searchSettings.mockResolvedValueOnce({
-      braveConfigured: true,
-      ollamaConfigured: false,
-      defaultProvider: "brave",
-    });
     await click(root, controller, selector);
     expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith("brave", "saved-key");
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect(controller.state.settings?.braveConfigured).toBe(true);
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(root.querySelectorAll(".settings-card .badge")[1]?.textContent).toBe("未確認");
   });
 
-  it("disables the settings button until the image dialog's credential read finishes", async () => {
+  it("disables the settings button only during an explicit image credential check", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();
     let finish: () => void = () => {};
@@ -1556,7 +1773,9 @@ describe("desktop app interaction", () => {
             resolve({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
         }),
     );
-    const reading = controller.openModal({ kind: "image", itemId: 10 });
+    await controller.openModal({ kind: "image", itemId: 10 });
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    const reading = controller.checkSearchSettings();
     const selector = 'dialog [data-view="settings"]';
     expect(button(root, selector).disabled).toBe(true);
     button(root, selector).click();
@@ -1602,6 +1821,7 @@ describe("desktop app interaction", () => {
     await click(root, controller, '[data-action="image"][data-id="10"]');
     expect(button(root, '[data-action="no-image"]').disabled).toBe(true);
     expect(api.searchImages).not.toHaveBeenCalled();
+    expect(api.searchSettings).not.toHaveBeenCalled();
     expect(api.setApiKey).not.toHaveBeenCalled();
   });
 
@@ -1621,6 +1841,7 @@ describe("desktop app interaction", () => {
     api.searchImages.mockResolvedValueOnce([candidate]);
     await controller.initialize();
     await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
     controller.state.drafts.query = "red apple";
     await controller.searchImages();
     api.listSummaries.mockClear();
@@ -1662,6 +1883,7 @@ describe("desktop app interaction", () => {
       });
       await controller.initialize();
       await click(root, controller, '[data-action="image"][data-id="10"]');
+      await click(root, controller, '[data-action="check-search-settings"]');
       const input = root.querySelector("#image-query");
       if (!(input instanceof HTMLInputElement)) throw new Error("Missing query input");
       input.value = "   ";
@@ -1715,6 +1937,7 @@ describe("desktop app interaction", () => {
       .mockRejectedValueOnce(new Error("検索サービスに接続できません"));
     await controller.initialize();
     await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
     const search = () => {
       const form = root.querySelector('[data-form="search-images"]');
       if (!form) throw new Error("Missing image search");
@@ -1765,11 +1988,12 @@ describe("desktop app interaction", () => {
         rejectRead = reject;
       });
       let pending: Promise<void>;
+      await click(root, controller, '[data-action="image"][data-id="10"]');
       if (request === "settings lookup") {
         api.searchSettings.mockReturnValueOnce(read);
-        pending = controller.openModal({ kind: "image", itemId: 10 });
+        pending = controller.checkSearchSettings();
       } else {
-        await click(root, controller, '[data-action="image"][data-id="10"]');
+        await click(root, controller, '[data-action="check-search-settings"]');
         api.searchImages.mockReturnValueOnce(read);
         pending = controller.searchImages();
       }
@@ -1798,8 +2022,14 @@ describe("desktop app interaction", () => {
     "keeps an image write protected when a dismissed search returns a late %s",
     async (outcome) => {
       const { root, controller, api, state } = setup();
+      api.searchSettings.mockResolvedValue({
+        braveConfigured: true,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+      });
       await controller.initialize();
       await click(root, controller, '[data-action="image"][data-id="10"]');
+      await click(root, controller, '[data-action="check-search-settings"]');
       let finishSearch: (() => void) | undefined;
       api.searchImages.mockImplementationOnce(
         () =>

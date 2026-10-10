@@ -1,7 +1,7 @@
-import { answers, tagNameMaxLength } from "./controller.js";
+import { answers, configuredSearchProviders, tagNameMaxLength } from "./controller.js";
 import type { AppState, View } from "./controller.js";
 import { tierRows } from "./tier.js";
-import type { Item } from "./types.js";
+import type { Item, SearchProvider } from "./types.js";
 
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => {
@@ -23,6 +23,16 @@ const e = escapeHtml;
 const disabled = (state: AppState): string => (state.busy ? " disabled" : "");
 const number = (value: number): string => value.toFixed(2);
 
+function keyStatus(s: AppState, provider: SearchProvider): string {
+  if (s.settings?.errors?.[provider] !== undefined) return "確認できません";
+  if (!s.checkedProviders.includes(provider)) return "未確認";
+  return (provider === "brave" ? s.settings?.braveConfigured : s.settings?.ollamaConfigured)
+    ? "設定済み"
+    : "未設定";
+}
+function credentialAccess(s: AppState): string {
+  return `<div class="settings-note"><p>画像検索のAPIキーを安全に保存・読み出すため、OSの資格情報ストアを使います。macOSではキーチェーンの確認が出ることがあります。</p><p class="muted small">画像検索を使わなくても、比較やファイルからの画像登録を続けられます。</p><p class="small">Brave: ${keyStatus(s, "brave")} · Ollama: ${keyStatus(s, "ollama")}</p><button type="button" class="secondary" data-action="check-search-settings"${disabled(s)}>保存済みキーを確認</button></div>`;
+}
 function picture(item: Item, assetUrl: (path: string) => string, large = false): string {
   return item.image
     ? `<img class="item-image${large ? " large" : ""}" src="${e(assetUrl(item.image.path))}" alt="${e(item.name)}" ${large ? "" : 'loading="lazy"'} /><span class="image-fallback" hidden>画像を表示できません</span>`
@@ -53,23 +63,8 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
   const missing = list.items.filter((item) => !item.image).length;
-  const providers = (["brave", "ollama"] as const).filter(
-    (provider) =>
-      (provider === "brave" ? s.bulkSettings?.braveConfigured : s.bulkSettings?.ollamaConfigured) &&
-      s.bulkSettings?.errors?.[provider] === undefined,
-  );
-  const bulkDisabled = s.busy || !missing || !providers.length || s.bulkSettingsLoading;
-  let bulkHelp = "";
-  if (s.bulkSettingsLoading) {
-    bulkHelp = "検索設定を確認しています…";
-  } else if (!s.bulkSettings) {
-    bulkHelp =
-      '検索設定を確認できませんでした。<button class="text-button" data-action="refresh-bulk-settings">再確認</button>';
-  } else if (!providers.length) {
-    bulkHelp =
-      '一括登録には検索設定が必要です。<button class="text-button" data-view="settings">検索設定を開く</button>';
-  }
-  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件${bulkHelp ? ` · ${bulkHelp}` : ""}</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div>${
+  const bulkDisabled = s.busy || !missing;
+  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div>${
     list.items.length === 0
       ? '<div class="empty compact"><span class="empty-symbol">＋</span><h3>最初の2項目を追加しましょう</h3><p>どちらが好きかを答えると、少しずつ順位が見えてきます。</p></div>'
       : `<div class="item-list">${[...list.items]
@@ -123,7 +118,7 @@ function tierView(s: AppState, assetUrl: (path: string) => string): string {
   return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && rows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div>${list.items.length >= 2 ? `<button data-view="compare"${disabled(s)}>${list.convergence.converged ? "比較を続ける" : "比較する"} →</button>` : ""}</div>${list.items.length ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item, rank }) => `<li class="tier-card"><span class="tier-rank">${rank} 位</span>${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
-  return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header><section class="settings-grid">${(
+  return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header>${credentialAccess(s)}<section class="settings-grid">${(
     ["brave", "ollama"] as const
   )
     .map((provider) => {
@@ -133,8 +128,7 @@ function settingsView(s: AppState): string {
       const error = s.settings?.errors?.[provider];
       const readError =
         error === undefined ? undefined : error || "資格情報ストアから読み取れませんでした。";
-      let status = configured ? "設定済み" : "未設定";
-      if (readError) status = "確認できません";
+      const status = keyStatus(s, provider);
       return `<article class="settings-card"><div class="section-heading"><h2>${provider === "brave" ? "Brave Search" : "Ollama Web Search"}</h2><span class="badge ${configured && !readError ? "ready" : ""}">${status}</span></div>${readError ? `<p class="error" role="alert">${e(readError)}</p>` : ""}<p>${provider === "brave" ? "Web上の画像を検索し、候補を表示します。" : "検索したWebページから代表画像を取得します。"}</p><p class="muted small">${provider === "brave" ? "api-dashboard.search.brave.com" : "ollama.com/settings/keys"} でAPIキーを取得できます。各サービスの料金・利用制限が適用されます。</p><form data-form="save-key" data-provider="${provider}"><label for="${draft}">APIキー</label><input type="password" id="${draft}" data-draft="${draft}" data-focus="${draft}" value="${e(s.drafts[draft])}" autocomplete="off" placeholder="${configured ? "変更する場合は新しいキーを入力" : "APIキーを入力"}" required${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>保存</button>${configured || readError ? `<button class="text-button danger-text" type="button" data-action="remove-key" data-provider="${provider}"${disabled(s)}>キーを削除</button>` : ""}</div></form></article>`;
     })
     .join(
@@ -164,21 +158,19 @@ function modalView(s: AppState): string {
   } else if (modal.kind === "bulk-image") {
     title = "未登録画像を一括登録";
     const run = s.bulkRun;
-    const providers = (["brave", "ollama"] as const).filter(
-      (provider) =>
-        (provider === "brave"
-          ? s.bulkSettings?.braveConfigured
-          : s.bulkSettings?.ollamaConfigured) && s.bulkSettings?.errors?.[provider] === undefined,
-    );
+    const providers = configuredSearchProviders(s);
     const missing = s.active?.items.filter((entry) => !entry.image).length ?? 0;
-    const providerChoice =
-      providers.length > 1
-        ? `<label for="bulk-provider">検索元</label><select id="bulk-provider" data-focus="bulk-provider"${run ? " disabled" : ""}><option value=""${s.bulkProvider ? "" : " selected"}>選択してください</option>${providers.map((provider) => `<option value="${provider}"${s.bulkProvider === provider ? " selected" : ""}>${provider === "brave" ? "Brave" : "Ollama"}</option>`).join("")}</select>`
-        : `<p>検索元: ${providers[0] === "ollama" ? "Ollama" : "Brave"}</p>`;
+    let providerChoice =
+      '<p class="muted">設定済みの検索元がまだ確認できていません。<button type="button" class="text-button" data-view="settings">検索設定を開く</button></p>';
+    if (providers.length > 1) {
+      providerChoice = `<label for="bulk-provider">検索元</label><select id="bulk-provider" data-focus="bulk-provider"${run || s.busy ? " disabled" : ""}><option value=""${s.bulkProvider ? "" : " selected"}>選択してください</option>${providers.map((provider) => `<option value="${provider}"${s.bulkProvider === provider ? " selected" : ""}>${provider === "brave" ? "Brave" : "Ollama"}</option>`).join("")}</select>`;
+    } else if (providers.length === 1) {
+      providerChoice = `<p>検索元: ${providers[0] === "ollama" ? "Ollama" : "Brave"}</p>`;
+    }
     const summary = run
       ? `<div class="bulk-progress" role="status"><p>${run.done} / ${run.total} 件を処理 · 登録 ${run.registered} 件 · 見送り ${run.skipped} 件</p><progress max="${run.total}" value="${run.done}" aria-label="画像登録の進捗"></progress>${run.running ? `<p class="muted">${run.stopping ? "現在の項目が終わり次第停止します…" : "画像を検索して登録しています…"}</p>` : `<p>${run.stopped ? "停止しました。" : s.error ? "途中で停止しました。" : "一括処理が完了しました。"}</p>`}</div>`
       : "";
-    body = `<p>開いているリストの画像未登録 ${run?.total ?? missing} 件を処理します。各サービスの料金・利用制限が適用されます。</p>${run ? "" : providerChoice}${summary}<div class="form-actions">${run?.running ? `<button type="button" class="secondary" data-action="stop-bulk-images"${run.stopping ? " disabled" : ""}>${run.stopping ? "停止待ち" : "停止"}</button>` : run ? '<button type="button" class="secondary" data-action="close-modal">閉じる</button>' : `<button type="button" data-action="start-bulk-images"${s.bulkProvider ? "" : " disabled"}>一括登録を開始</button><button type="button" class="secondary" data-action="close-modal">キャンセル</button>`}</div>`;
+    body = `<p>開いているリストの画像未登録 ${run?.total ?? missing} 件を処理します。各サービスの料金・利用制限が適用されます。</p>${run ? "" : credentialAccess(s) + providerChoice}${summary}<div class="form-actions">${run?.running ? `<button type="button" class="secondary" data-action="stop-bulk-images"${run.stopping ? " disabled" : ""}>${run.stopping ? "停止待ち" : "停止"}</button>` : run ? '<button type="button" class="secondary" data-action="close-modal">閉じる</button>' : `<button type="button" data-action="start-bulk-images"${s.busy || !s.bulkProvider ? " disabled" : ""}>一括登録を開始</button><button type="button" class="secondary" data-action="close-modal">キャンセル</button>`}</div>`;
   } else if (modal.kind === "tags") {
     title = modal.itemId === undefined ? "タグを管理" : `${item?.name ?? "項目"} のタグ`;
     const tags = s.active?.tags ?? [];
@@ -203,15 +195,14 @@ function modalView(s: AppState): string {
     }</div><form data-form="save-tag" class="tag-form"><label for="tag-name">${s.tagEditingId === null ? "新しいタグ名" : "タグ名を変更"}</label><input id="tag-name" data-tag-draft data-focus="tag-draft" aria-describedby="tag-name-limit" value="${e(s.tagDraft)}" required${disabled(s)} /><p id="tag-name-limit" class="muted small">${tagNameMaxLength}文字以内</p><div class="form-actions"><button type="submit"${disabled(s)}>${s.tagEditingId === null ? "タグを追加" : "変更を保存"}</button>${s.tagEditingId !== null ? `<button type="button" class="secondary" data-action="cancel-tag-edit"${disabled(s)}>キャンセル</button>` : ""}</div></form>${modal.itemId === undefined ? "" : '<p class="muted small">ここで作成したタグは、この項目にも付きます。</p>'}`;
   } else if (modal.kind === "image") {
     title = `${item?.name ?? "項目"} の画像`;
-    const configured =
-      s.provider === "brave" ? s.settings?.braveConfigured : s.settings?.ollamaConfigured;
+    const configured = configuredSearchProviders(s).includes(s.provider);
     const error = s.settings?.errors?.[s.provider];
     const readError =
       error === undefined ? undefined : error || "資格情報ストアから読み取れませんでした。";
     const settingsMessage = readError
       ? `APIキーの状態を確認できません: ${e(readError)}`
-      : "APIキーが未設定です。";
-    body = `<div class="image-options"><button class="secondary" data-action="local-image"${disabled(s)}>ファイルから登録</button><button class="text-button" data-action="no-image"${s.busy || !item?.image ? " disabled" : ""}>画像なしにする</button></div><div class="divider"></div><h3>ネットで画像を探す</h3><form data-form="search-images" class="image-search"><label class="sr-only" for="search-provider">検索元</label><select id="search-provider" data-focus="provider"${disabled(s)}><option value="brave"${s.provider === "brave" ? " selected" : ""}>Brave</option><option value="ollama"${s.provider === "ollama" ? " selected" : ""}>Ollama</option></select><label class="sr-only" for="image-query">検索語</label><input id="image-query" data-draft="query" data-focus="query" value="${e(s.drafts.query)}" required${disabled(s)} /><button type="submit"${disabled(s)}${!configured ? " disabled" : ""}>検索</button></form>${readError || !configured ? `<p class="muted">${settingsMessage}<button class="text-button" data-view="settings"${disabled(s)}>検索設定を開く</button></p>` : ""}${s.busy ? '<p role="status">処理中です…</p>' : ""}${s.searched && !s.candidates.length ? '<p class="empty compact">画像が見つかりませんでした。検索語や検索元を変えてみてください。</p>' : ""}<div class="image-results">${s.candidates.map((candidate, index) => `<button class="image-result" data-action="choose-image" data-index="${index}"${disabled(s)}><img src="${e(candidate.previewUrl)}" alt="${e(candidate.title)}" loading="lazy" /><span>${e(candidate.title)}</span><small title="${e(candidate.sourceUrl)}">${e(sourceHost(candidate.sourceUrl))}</small></button>`).join("")}</div>${item?.image?.sourceUrl ? `<p class="muted source-url">現在の画像の出典：${e(item.image.sourceUrl)}</p>` : ""}`;
+      : `APIキーは${keyStatus(s, s.provider)}です。`;
+    body = `<div class="image-options"><button class="secondary" data-action="local-image"${disabled(s)}>ファイルから登録</button><button class="text-button" data-action="no-image"${s.busy || !item?.image ? " disabled" : ""}>画像なしにする</button></div><div class="divider"></div><h3>ネットで画像を探す</h3>${credentialAccess(s)}<form data-form="search-images" class="image-search"><label class="sr-only" for="search-provider">検索元</label><select id="search-provider" data-focus="provider"${disabled(s)}><option value="brave"${s.provider === "brave" ? " selected" : ""}>Brave</option><option value="ollama"${s.provider === "ollama" ? " selected" : ""}>Ollama</option></select><label class="sr-only" for="image-query">検索語</label><input id="image-query" data-draft="query" data-focus="query" value="${e(s.drafts.query)}" required${disabled(s)} /><button type="submit"${disabled(s)}${!configured ? " disabled" : ""}>検索</button></form>${readError || !configured ? `<p class="muted">${settingsMessage}<button class="text-button" data-view="settings"${disabled(s)}>検索設定を開く</button></p>` : ""}${s.busy ? '<p role="status">処理中です…</p>' : ""}${s.searched && !s.candidates.length ? '<p class="empty compact">画像が見つかりませんでした。検索語や検索元を変えてみてください。</p>' : ""}<div class="image-results">${s.candidates.map((candidate, index) => `<button class="image-result" data-action="choose-image" data-index="${index}"${disabled(s)}><img src="${e(candidate.previewUrl)}" alt="${e(candidate.title)}" loading="lazy" /><span>${e(candidate.title)}</span><small title="${e(candidate.sourceUrl)}">${e(sourceHost(candidate.sourceUrl))}</small></button>`).join("")}</div>${item?.image?.sourceUrl ? `<p class="muted source-url">現在の画像の出典：${e(item.image.sourceUrl)}</p>` : ""}`;
   } else if (modal.kind === "reset-comparisons") {
     title = "比較をリセット";
     body = `<p>「${e(s.active?.name ?? "")}」の比較を最初からやり直しますか？</p><p>比較履歴・評価・比較回数・順位ほぼ確定の判定履歴を初期化します。この操作は元に戻せません。</p><p class="muted">リスト名・項目・タグ・画像は残ります。順位は登録順に戻ります。</p><div class="form-actions"><button class="danger" data-action="confirm-reset-comparisons"${disabled(s)}>リセットする</button><button class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;

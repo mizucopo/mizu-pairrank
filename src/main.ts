@@ -370,8 +370,8 @@ export function mountApp(
         restoreModalFocus = false;
         controller.openBulkImages();
         break;
-      case "refresh-bulk-settings":
-        void controller.refreshBulkSettings();
+      case "check-search-settings":
+        void controller.checkSearchSettings();
         break;
       case "start-bulk-images":
         void controller.runBulkImages();
@@ -433,10 +433,7 @@ const root = document.querySelector<HTMLElement>("#app");
 if (root) {
   if (isTauri()) {
     const controller = mountApp(root, api);
-    void controller.initialize().then(() => {
-      if (controller.state.initialized && controller.state.view === "items")
-        void controller.refreshBulkSettings();
-    });
+    void controller.initialize();
   } else
     root.innerHTML =
       '<main class="startup"><h1>pairrank</h1><p>デスクトップアプリで起動してください。</p><code>npm run tauri dev</code></main>';
