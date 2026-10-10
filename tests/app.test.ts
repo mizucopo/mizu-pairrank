@@ -124,6 +124,25 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it("explains Keychain access before any credential read on settings and image opening", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    await click(root, controller, '[data-view="settings"]');
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("APIキーを安全に保存・読み出す");
+    expect(root.textContent).toContain("macOS");
+    expect(root.textContent).toContain("未確認");
+    expect(button(root, '[data-action="check-search-settings"]').disabled).toBe(false);
+    await controller.navigate("items");
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(root.querySelector("dialog")?.textContent).toContain("APIキーを安全に保存・読み出す");
+    expect(root.querySelector("dialog")?.textContent).toContain("macOS");
+    expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+    expect(button(root, '[data-action="local-image"]').disabled).toBe(false);
+  });
+
   it("exports without images by default, explains redistribution, and resets opt-in when reopened", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();

@@ -718,6 +718,19 @@ describe("mutations after concurrent deletion", () => {
   });
 });
 
+describe("explicit credential access", () => {
+  it("does not read credentials when entering settings or opening an image dialog", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("settings");
+    await controller.openModal({ kind: "image", itemId: 11 });
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(controller.state.settings).toBeNull();
+    expect(api.searchImages).not.toHaveBeenCalled();
+  });
+});
+
 describe("image search validation", () => {
   it("rejects whitespace-only queries without a request and permits correction", async () => {
     const api = backend();
