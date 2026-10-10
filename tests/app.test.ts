@@ -611,7 +611,7 @@ describe("desktop app interaction", () => {
       "6",
     ]);
     await click(root, controller, '.tabs [data-view="tier"]');
-    await click(root, controller, '.section-heading button[data-view="compare"]');
+    await click(root, controller, '.tabs [data-view="compare"]');
     const updated = {
       ...ranked,
       revision: 6,
@@ -647,19 +647,39 @@ describe("desktop app interaction", () => {
     expect(root.querySelector(".tier-table")).toBeNull();
   });
 
-  it("restores focus to the Compare tab after opening comparison from the Tier view", async () => {
-    const { root, controller } = setup();
-    await controller.initialize();
-    await click(root, controller, '.tabs [data-view="tier"]');
+  it.each([
+    ["ranking", false],
+    ["ranking", true],
+    ["tier", false],
+    ["tier", true],
+  ] as const)(
+    "uses only the Compare tab from %s when converged is %s and preserves answering and focus",
+    async (view, converged) => {
+      const { root, controller, api, state } = setup();
+      api.getList.mockResolvedValueOnce({
+        ...state,
+        convergence: { ...state.convergence, converged },
+      });
+      await controller.initialize();
+      await click(root, controller, `.tabs [data-view="${view}"]`);
 
-    const cta = button(root, '.section-heading [data-view="compare"]');
-    cta.focus();
-    cta.click();
-    await settle(controller);
+      expect(root.querySelectorAll('[data-view="compare"]')).toHaveLength(1);
+      expect(root.querySelector('section [data-view="compare"]')).toBeNull();
+      const tab = button(root, '.tabs [data-view="compare"]');
+      expect(tab.textContent).toBe("比較する");
+      expect(tab.disabled).toBe(false);
+      tab.focus();
+      tab.click();
+      await settle(controller);
 
-    expect(controller.state.view).toBe("compare");
-    expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
-  });
+      expect(controller.state.view).toBe("compare");
+      expect(document.activeElement).toBe(button(root, '.tabs [data-view="compare"]'));
+      expect(root.querySelectorAll("[data-answer]")).toHaveLength(5);
+      expect(root.querySelector('[data-action="skip-comparison"]')).not.toBeNull();
+      await click(root, controller, '[data-answer="a_weak"]');
+      expect(api.answer).toHaveBeenCalledOnce();
+    },
+  );
 
   it("keeps Tier focus and scroll when a cancelled explicit credential read finishes", async () => {
     const { root, controller, api } = setup();
