@@ -573,6 +573,22 @@ impl Database {
             .map_err(db_error)
     }
 
+    pub fn reset_comparisons(&mut self, list_id: i64) -> Result<ListState, String> {
+        self.mutate_list(list_id, |transaction| {
+            let initial = Rating::default();
+            transaction
+                .execute(
+                    "UPDATE items SET mu = ?1, sigma = ?2, comparison_count = 0 WHERE list_id = ?3",
+                    params![initial.mu, initial.sigma, list_id],
+                )
+                .map_err(db_error)?;
+            transaction
+                .execute("DELETE FROM comparisons WHERE list_id = ?1", [list_id])
+                .map_err(db_error)?;
+            reset_snapshots(transaction, list_id)
+        })
+    }
+
     pub fn resume_list(&mut self, list_id: i64) -> Result<ListState, String> {
         let transaction = self.write_transaction()?;
         let mut state = read_list(&transaction, list_id)?;
@@ -1213,6 +1229,7 @@ mod tests {
         ImportList,
         DuplicateList,
         DeleteList,
+        ResetComparisons,
         ResumeList,
         RenameList,
         AddItems,
@@ -1228,19 +1245,21 @@ mod tests {
     }
 
     impl WriteOperation {
-        const ENTRY_POINTS: [Self; 6] = [
+        const ENTRY_POINTS: [Self; 7] = [
             Self::CreateList,
             Self::ImportList,
             Self::DuplicateList,
             Self::DeleteList,
+            Self::ResetComparisons,
             Self::ResumeList,
             Self::RenameList,
         ];
-        const ALL: [Self; 16] = [
+        const ALL: [Self; 17] = [
             Self::CreateList,
             Self::ImportList,
             Self::DuplicateList,
             Self::DeleteList,
+            Self::ResetComparisons,
             Self::ResumeList,
             Self::RenameList,
             Self::AddItems,
@@ -1264,6 +1283,7 @@ mod tests {
                     .map(|_| ()),
                 Self::DuplicateList => database.duplicate_list(state.id).map(|_| ()),
                 Self::DeleteList => database.delete_list(state.id).map(|_| ()),
+                Self::ResetComparisons => database.reset_comparisons(state.id).map(|_| ()),
                 Self::ResumeList => database.resume_list(state.id).map(|_| ()),
                 Self::RenameList => database.rename_list(state.id, "Changed".into()).map(|_| ()),
                 Self::AddItems => database.add_items(state.id, vec!["New".into()]).map(|_| ()),
@@ -3183,6 +3203,210 @@ mod tests {
     }
 
     #[test]
+    fn reset_comparisons_preserves_content_and_restarts_ranking_progress() {
+        let mut database = memory_database();
+        let state = database.create_list("好きな果物".into()).unwrap();
+        let state = database
+            .add_items(state.id, vec!["A".into(), "B".into(), "Removed".into()])
+            .unwrap();
+        let [a, b, removed] = [state.items[0].id, state.items[1].id, state.items[2].id];
+        let state = database
+            .create_tag(state.id, "Group".into(), Some(a))
+            .unwrap();
+        let state = database
+            .set_item_tag(state.id, b, state.tags[0].id, true)
+            .unwrap();
+        let state = database
+            .set_image(
+                state.id,
+                a,
+                Some(ImageAsset {
+                    path: "saved.png".into(),
+                    source_url: Some("https://example.org/saved".into()),
+                }),
+            )
+            .unwrap()
+            .value;
+        let state = database
+            .answer(state.id, a, removed, Preference::AWeak, state.revision)
+            .unwrap();
+        let state = database.delete_item(state.id, removed).unwrap().value;
+        let before = database
+            .answer(state.id, a, b, Preference::BStrong, state.revision)
+            .unwrap();
+        assert_eq!(before.items[0].id, b);
+        assert_eq!(before.comparison_count, 2);
+        assert_eq!(before.convergence.observed_answers, 1);
+        let other = populated_list(&mut database, "Other");
+        let other = answer_once(&mut database, &other);
+        let other_before = serde_json::to_value(&other).unwrap();
+
+        let reset = database.reset_comparisons(before.id).unwrap();
+        assert_eq!(reset.id, before.id);
+        assert_eq!(reset.name, before.name);
+        assert_eq!(reset.revision, before.revision + 1);
+        assert_eq!(
+            serde_json::to_value(&reset.tags).unwrap(),
+            serde_json::to_value(&before.tags).unwrap()
+        );
+        assert_eq!(
+            reset.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        for item in &reset.items {
+            let previous = before.items.iter().find(|old| old.id == item.id).unwrap();
+            assert_eq!(item.list_id, previous.list_id);
+            assert_eq!(item.name, previous.name);
+            assert_eq!(
+                serde_json::to_value(&item.image).unwrap(),
+                serde_json::to_value(&previous.image).unwrap()
+            );
+            assert_eq!(item.tag_ids, previous.tag_ids);
+            assert_eq!(item.rating, Rating::default());
+            assert_eq!(item.comparison_count, 0);
+        }
+        assert_eq!(reset.comparison_count, 0);
+        assert!(!reset.convergence.converged);
+        assert_eq!(reset.convergence.observed_answers, 0);
+        assert_eq!(reset.convergence.max_sigma, Rating::default().sigma);
+        assert_eq!(snapshot_count(&database, before.id), 1);
+        let baseline: String = database
+            .connection
+            .query_row(
+                "SELECT ranking FROM rank_snapshots WHERE list_id = ?1",
+                [before.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<i64>>(&baseline).unwrap(),
+            vec![a, b]
+        );
+        assert!(
+            database
+                .comparison_state(before.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
+        let deleted: i64 = database
+            .connection
+            .query_row(
+                "SELECT deleted FROM items WHERE id = ?1",
+                [removed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            serde_json::to_value(database.get_list(other.id).unwrap()).unwrap(),
+            other_before
+        );
+        assert_eq!(snapshot_count(&database, other.id), 2);
+        assert!(
+            database
+                .answer(before.id, a, b, Preference::Equal, before.revision)
+                .is_err()
+        );
+        let answered = database
+            .answer(reset.id, a, b, Preference::AWeak, reset.revision)
+            .unwrap();
+        assert_eq!(answered.comparison_count, 1);
+        assert!(answered.items.iter().all(|item| item.comparison_count == 1));
+        assert_eq!(answered.convergence.observed_answers, 1);
+        assert_eq!(
+            database.comparison_state(reset.id).unwrap().pair_counts[&(a, b)],
+            1
+        );
+        assert_eq!(
+            database.reset_comparisons(i64::MAX).unwrap_err(),
+            "リストが見つかりません。"
+        );
+    }
+
+    #[test]
+    fn reset_comparisons_persists_after_reopening_a_settled_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reset.sqlite3");
+        let mut database = Database::open(&path).unwrap();
+        let before = settled_list_with_image(&mut database);
+        assert!(before.convergence.converged);
+        let reset = database.reset_comparisons(before.id).unwrap();
+        assert!(!reset.convergence.converged);
+        assert_eq!(reset.convergence.observed_answers, 0);
+        assert_eq!(reset.comparison_count, 0);
+        let expected = serde_json::to_value(&reset).unwrap();
+        drop(database);
+
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_list(reset.id).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(snapshot_count(&reopened, reset.id), 1);
+        assert!(
+            reopened
+                .comparison_state(reset.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
+        let summary = reopened.list_summaries().unwrap().remove(0);
+        assert_eq!(summary.comparison_count, 0);
+        assert!(!summary.converged);
+        assert_eq!(answer_once(&mut reopened, &reset).comparison_count, 1);
+    }
+
+    #[test]
+    fn failed_reset_rolls_back_ratings_history_snapshots_and_revision() {
+        let mut database = memory_database();
+        let before = settled_list_with_image(&mut database);
+        let expected = serde_json::to_value(&before).unwrap();
+        let counts = database.comparison_state(before.id).unwrap().pair_counts;
+        database.connection.execute_batch(
+            "CREATE TRIGGER reject_reset BEFORE INSERT ON rank_snapshots BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        assert!(database.reset_comparisons(before.id).is_err());
+        assert_eq!(
+            serde_json::to_value(database.get_list(before.id).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(snapshot_count(&database, before.id), 21);
+        assert_eq!(
+            database.comparison_state(before.id).unwrap().pair_counts,
+            counts
+        );
+        assert!(database.connection.is_autocommit());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_comparisons_rejects_replaced_storage_without_changing_either_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        let original = root.path().join("original");
+        std::fs::create_dir(&storage).unwrap();
+        let mut database = Database::open(&storage.join("rankings.sqlite3")).unwrap();
+        let before = populated_list(&mut database, "Saved");
+        let before = answer_once(&mut database, &before);
+        let expected = serde_json::to_value(&before).unwrap();
+        std::fs::rename(&storage, &original).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+
+        assert_eq!(
+            database.reset_comparisons(before.id).unwrap_err(),
+            "保存先が変更されました。アプリを再起動してください。"
+        );
+        assert!(std::fs::read_dir(&storage).unwrap().next().is_none());
+        drop(database);
+        let reopened = Database::open(&original.join("rankings.sqlite3")).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.get_list(before.id).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn resume_uses_current_convergence_and_preserves_another_instances_progress() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resume.sqlite3");
@@ -3270,6 +3494,12 @@ mod tests {
                 .rename_list(state.id, "changed".to_owned())
                 .is_err()
         );
+        assert!(
+            database
+                .reset_comparisons(state.id)
+                .unwrap_err()
+                .contains("評価モデル")
+        );
         database
             .connection
             .execute(
@@ -3284,6 +3514,12 @@ mod tests {
                 .contains("評価モデル")
         );
         assert!(database.list_summaries().is_err());
+        assert!(
+            database
+                .reset_comparisons(state.id)
+                .unwrap_err()
+                .contains("評価モデル")
+        );
     }
     thread_local! {
         static WRITE_AFTER_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };

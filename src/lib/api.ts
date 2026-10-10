@@ -21,6 +21,7 @@ export const api: AppApi = {
   setItemTag: (listId, itemId, tagId, assigned) =>
     invoke("set_item_tag", { listId, itemId, tagId, assigned }),
   resumeList: (listId) => invoke("resume_list", { listId }),
+  resetComparisons: (listId) => invoke("reset_comparisons", { listId }),
   nextPair: (listId) => invoke("next_pair", { listId }),
   answer: (pair, preference) =>
     invoke("answer", {

@@ -71,6 +71,7 @@ export type AppApi = {
     assigned: boolean,
   ) => Promise<ListState>;
   resumeList: (listId: number) => Promise<ListState>;
+  resetComparisons: (listId: number) => Promise<ListState>;
   nextPair: (listId: number) => Promise<PairProposal | null>;
   answer: (pair: PairProposal, preference: Preference) => Promise<ListState>;
   searchSettings: () => Promise<SearchSettings>;

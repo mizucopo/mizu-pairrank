@@ -307,6 +307,12 @@ export function mountApp(
       case "delete-list":
         void openModal({ kind: "delete-list" }, button);
         break;
+      case "reset-comparisons":
+        void openModal({ kind: "reset-comparisons" }, button);
+        break;
+      case "confirm-reset-comparisons":
+        void controller.resetComparisons();
+        break;
       case "rename-item":
         void openModal({ kind: "rename-item", itemId: id }, button);
         break;
