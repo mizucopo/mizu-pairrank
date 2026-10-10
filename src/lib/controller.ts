@@ -88,6 +88,7 @@ function errorMessage(error: unknown): string {
 }
 
 const comparisonRetryMessage = "リストが更新されています。もう一度比較を開始してください。";
+const staleComparisonMessage = "リストが更新されています。最新の比較を読み直してください。";
 
 export class AppController {
   readonly state: AppState = {
@@ -406,11 +407,24 @@ export class AppController {
 
   private acceptCommittedList(list: ListState): void {
     // Keep committed state usable even if a later sidebar refresh fails.
-    if (this.state.active?.id !== list.id) this.skippedPairs = [];
-    else
-      this.skippedPairs = this.skippedPairs.filter(({ ids }) =>
-        ids.every((id) => list.items.some((item) => item.id === id)),
-      );
+    const previous = this.state.active;
+    // Replacing the ranking window also detects resets with unchanged answer counts.
+    if (
+      previous?.id !== list.id ||
+      list.comparisonCount < previous.comparisonCount ||
+      list.comparisonWindow[0] > previous.comparisonWindow[1]
+    )
+      this.skippedPairs = [];
+    else {
+      // Saved progress also includes answers committed by another window.
+      const savedAnswers = list.comparisonCount - previous.comparisonCount;
+      this.skippedPairs = this.skippedPairs
+        .map((entry) => ({ ...entry, remainingAnswers: entry.remainingAnswers - savedAnswers }))
+        .filter(
+          ({ ids, remainingAnswers }) =>
+            remainingAnswers > 0 && ids.every((id) => list.items.some((item) => item.id === id)),
+        );
+    }
     if (
       this.state.active?.id !== list.id ||
       (this.state.selectedTagId !== null &&
@@ -723,13 +737,17 @@ export class AppController {
           .catch((error: unknown) => this.handleListError(list.id, error));
         this.acceptCommittedList(current);
         const skipped = retrySkipped ? [] : this.skippedPairs;
-        const pair = await this.api
-          .nextPair(
+        let pair: PairProposal | null;
+        try {
+          pair = await this.api.nextPair(
             list.id,
             skipped.map(({ ids }) => ids),
             current.revision,
-          )
-          .catch((error: unknown) => this.handleListError(list.id, error));
+          );
+        } catch (error) {
+          if (errorMessage(error) === staleComparisonMessage) continue;
+          return this.handleListError(list.id, error);
+        }
         if (pair && pair.revision !== current.revision) continue;
         if (!pair && current.items.length >= 2 && !skipped.length) continue;
         await this.refreshListSummaries(list.id);
@@ -764,9 +782,7 @@ export class AppController {
           pair.revision,
         )
         .catch((error: unknown) => {
-          if (
-            errorMessage(error) === "リストが更新されています。最新の比較を読み直してください。"
-          ) {
+          if (errorMessage(error) === staleComparisonMessage) {
             this.state.pair = null;
             throw new Error(comparisonRetryMessage, { cause: error });
           }
@@ -852,16 +868,13 @@ export class AppController {
       try {
         result = await this.api.answer(pair, preference);
       } catch (error) {
-        if (errorMessage(error) === "リストが更新されています。最新の比較を読み直してください。") {
+        if (errorMessage(error) === staleComparisonMessage) {
           this.state.pair = null;
           throw new Error(comparisonRetryMessage, { cause: error });
         }
         return this.handleListError(pair.listId, error);
       }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
-      this.skippedPairs = this.skippedPairs
-        .map((entry) => ({ ...entry, remainingAnswers: entry.remainingAnswers - 1 }))
-        .filter((entry) => entry.remainingAnswers > 0);
       this.acceptCommittedList(result);
       if (result.convergence.converged) {
         this.state.view = "ranking";

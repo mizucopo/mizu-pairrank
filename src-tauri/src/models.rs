@@ -45,6 +45,7 @@ pub struct ListState {
     pub id: i64,
     pub name: String,
     pub revision: u64,
+    pub comparison_window: [i64; 2],
     pub items: Vec<Item>,
     pub tags: Vec<Tag>,
     pub comparison_count: u64,

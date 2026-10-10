@@ -29,6 +29,7 @@ function setup(
     id: 1,
     name: "好きな果物",
     revision: 5,
+    comparisonWindow: [1, 1],
     items: [first, second],
     tags: [],
     comparisonCount: 0,

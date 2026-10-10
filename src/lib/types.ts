@@ -31,6 +31,7 @@ export type ListState = {
   id: number;
   name: string;
   revision: number;
+  comparisonWindow: [firstSnapshotId: number, lastSnapshotId: number];
   items: Item[];
   tags: Tag[];
   comparisonCount: number;
