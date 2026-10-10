@@ -550,14 +550,21 @@ describe("desktop app interaction", () => {
     expect(scrollableRow.getAttribute("role")).toBe("list");
     scrollableRow.focus();
     expect(document.activeElement).toBe(scrollableRow);
-    expect(
-      [...root.querySelectorAll(".tier-card .tier-rank")].map((rank) => rank.textContent),
-    ).toEqual(["1 位", "2 位", "3 位", "4 位", "5 位", "6 位"]);
+    expect(root.querySelector(".tier-rank")).toBeNull();
+    expect(root.querySelector(".tier-table")?.textContent).not.toMatch(/\d+ 位/);
 
     await click(root, controller, '.tabs [data-view="ranking"]');
     expect(
       [...root.querySelectorAll(".ranking-list .rank-row h3")].map((name) => name.textContent),
     ).toEqual(items.map((item) => item.name));
+    expect([...root.querySelectorAll(".rank-number")].map((rank) => rank.textContent)).toEqual([
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+    ]);
     await click(root, controller, '.tabs [data-view="tier"]');
     await click(root, controller, '.section-heading button[data-view="compare"]');
     const updated = {
@@ -582,6 +589,8 @@ describe("desktop app interaction", () => {
       ["C", ["項目5"]],
       ["D", ["項目6"]],
     ]);
+    expect(root.querySelector(".tier-rank")).toBeNull();
+    expect(root.querySelector(".tier-table")?.textContent).not.toMatch(/\d+ 位/);
   });
 
   it("shows an empty Tier table prompt when the list has no items", async () => {
