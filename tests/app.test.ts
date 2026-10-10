@@ -2171,6 +2171,71 @@ describe("desktop app interaction", () => {
     ]);
   });
 
+  it.each(["tag name", "checkbox"] as const)(
+    "toggles only the matching item tag through its %s",
+    async (target) => {
+      const { root, controller, api, state } = setup();
+      state.tags = [
+        { id: 1, listId: 1, name: "甘い" },
+        { id: 2, listId: 1, name: '<赤い "タグ" &>' },
+      ];
+      api.setItemTag.mockImplementation(async (_listId, itemId, tagId, assigned) => {
+        const item = state.items.find((entry) => entry.id === itemId)!;
+        item.tagIds = assigned ? [...item.tagIds, tagId] : item.tagIds.filter((id) => id !== tagId);
+        return state;
+      });
+      await controller.initialize();
+      await click(root, controller, '[data-action="tags"][data-id="10"]');
+
+      for (const assigned of [true, false]) {
+        const checkbox = root.querySelector<HTMLInputElement>('[data-tag-id="2"]');
+        if (!checkbox) throw new Error("Missing tag checkbox");
+        const name = checkbox
+          .closest(".tag-editor-row")
+          ?.querySelector<HTMLElement>(".tag-editor-name");
+        if (!name) throw new Error("Missing tag name");
+        expect(name.textContent).toContain(state.tags[1]!.name);
+        (target === "tag name" ? name : checkbox).click();
+        await settle(controller);
+        expect(api.setItemTag).toHaveBeenLastCalledWith(1, 10, 2, assigned);
+        expect(root.querySelector<HTMLInputElement>('[data-tag-id="2"]')?.checked).toBe(assigned);
+        expect(root.querySelector<HTMLInputElement>('[data-tag-id="1"]')?.checked).toBe(false);
+        expect(state.items[1]!.tagIds).toEqual([]);
+      }
+      expect(api.setItemTag).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("does not toggle item tags through their names while saving", async () => {
+    const { root, controller, api, state } = setup();
+    state.tags = [
+      { id: 1, listId: 1, name: "甘い" },
+      { id: 2, listId: 1, name: "赤い" },
+    ];
+    let finish: () => void = () => {};
+    api.setItemTag.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve(state);
+        }),
+    );
+    await controller.initialize();
+    await click(root, controller, '[data-action="tags"][data-id="10"]');
+    const checkbox = root.querySelector<HTMLInputElement>('[data-tag-id="1"]');
+    if (!checkbox) throw new Error("Missing tag checkbox");
+    checkbox.click();
+    try {
+      expect(controller.state.busy).toBe(true);
+      const other = root.querySelector<HTMLInputElement>('[data-tag-id="2"]');
+      expect(other?.disabled).toBe(true);
+      other?.closest(".tag-editor-row")?.querySelector<HTMLElement>(".tag-editor-name")?.click();
+      expect(api.setItemTag).toHaveBeenCalledExactlyOnceWith(1, 10, 1, true);
+    } finally {
+      finish();
+      await settle(controller);
+    }
+  });
+
   it("creates from item tags, changes assignment, and manages rename and deletion from the items screen", async () => {
     const { root, controller, api, state } = setup();
     api.createTag.mockImplementation(async (_listId, name, itemId) => {

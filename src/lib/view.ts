@@ -183,12 +183,13 @@ function modalView(s: AppState): string {
               const assignment =
                 modal.itemId === undefined
                   ? ""
-                  : `<label class="tag-assignment"><input type="checkbox" data-tag-id="${tag.id}" data-focus="tag-${tag.id}"${item?.tagIds.includes(tag.id) ? " checked" : ""}${disabled(s)} /><span class="sr-only">${e(item?.name ?? "")} に ${e(tag.name)} を付ける</span></label>`;
+                  : `<label class="tag-assignment"><input id="item-tag-${tag.id}" type="checkbox" data-tag-id="${tag.id}" data-focus="tag-${tag.id}"${item?.tagIds.includes(tag.id) ? " checked" : ""}${disabled(s)} /><span class="sr-only">${e(item?.name ?? "")} に ${e(tag.name)} を付ける</span></label>`;
               const actions =
                 s.tagDeletingId === tag.id
                   ? `<div class="tag-delete-confirm"><span>「${e(tag.name)}」を削除しますか？項目からも外れます。</span><button type="button" class="danger small" data-action="confirm-tag-delete"${disabled(s)}>削除する</button><button type="button" class="secondary small" data-action="cancel-tag-delete"${disabled(s)}>キャンセル</button></div>`
                   : `<button type="button" class="text-button small" data-action="edit-tag" data-id="${tag.id}" aria-label="${e(tag.name)} の名前を変更"${disabled(s)}>名前</button><button type="button" class="text-button small danger-text" data-action="delete-tag" data-id="${tag.id}" aria-label="${e(tag.name)} を削除"${disabled(s)}>削除</button>`;
-              return `<div class="tag-editor-row">${assignment}<span class="tag-editor-name">${e(tag.name)} <small>${count} 件</small></span><div class="tag-editor-actions">${actions}</div></div>`;
+              const nameElement = modal.itemId === undefined ? "span" : "label";
+              return `<div class="tag-editor-row">${assignment}<${nameElement} class="tag-editor-name"${modal.itemId === undefined ? "" : ` for="item-tag-${tag.id}"`}>${e(tag.name)} <small>${count} 件</small></${nameElement}><div class="tag-editor-actions">${actions}</div></div>`;
             })
             .join("")
         : '<p class="muted">タグはまだありません。</p>'
