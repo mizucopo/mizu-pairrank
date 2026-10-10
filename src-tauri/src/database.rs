@@ -158,6 +158,69 @@ impl Database {
         Ok(state)
     }
 
+    pub fn import_list(
+        &mut self,
+        list: crate::transfer::PortableList,
+        images: Vec<Option<ImageAsset>>,
+    ) -> Result<ListState, String> {
+        list.validate()?;
+        if images.len() != list.items.len() {
+            return Err("インポートする画像と項目の数が一致しません。".to_owned());
+        }
+        let transaction = self.write_transaction()?;
+        transaction
+            .execute(
+                "INSERT INTO lists (name, model_version, model_parameters) VALUES (?1, ?2, ?3)",
+                params![list.name, MODEL_VERSION, MODEL_PARAMETERS_JSON],
+            )
+            .map_err(db_error)?;
+        let list_id = transaction.last_insert_rowid();
+
+        let mut tag_ids = HashMap::new();
+        for name in list.tags {
+            transaction
+                .execute(
+                    "INSERT INTO tags (list_id, name) VALUES (?1, ?2)",
+                    params![list_id, name],
+                )
+                .map_err(db_error)?;
+            tag_ids.insert(name, transaction.last_insert_rowid());
+        }
+
+        let initial = Rating::default();
+        for (item, image) in list.items.into_iter().zip(images) {
+            transaction
+                .execute(
+                    "INSERT INTO items (list_id, name, image_path, mu, sigma)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        list_id,
+                        item.name,
+                        image.as_ref().map(|asset| asset.path.as_str()),
+                        initial.mu,
+                        initial.sigma,
+                    ],
+                )
+                .map_err(db_error)?;
+            let item_id = transaction.last_insert_rowid();
+            for name in item.tags {
+                let tag_id = tag_ids
+                    .get(&name)
+                    .ok_or_else(|| "インポートするタグが見つかりません。".to_owned())?;
+                transaction
+                    .execute(
+                        "INSERT INTO item_tags (list_id, item_id, tag_id) VALUES (?1, ?2, ?3)",
+                        params![list_id, item_id, tag_id],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        reset_snapshots(&transaction, list_id)?;
+        let state = read_list(&transaction, list_id)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(state)
+    }
+
     pub fn duplicate_list(&mut self, source_id: i64) -> Result<ListState, String> {
         let transaction = self.write_transaction()?;
         let source = read_list(&transaction, source_id)?;
@@ -1147,6 +1210,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum WriteOperation {
         CreateList,
+        ImportList,
         DuplicateList,
         DeleteList,
         ResumeList,
@@ -1164,15 +1228,17 @@ mod tests {
     }
 
     impl WriteOperation {
-        const ENTRY_POINTS: [Self; 5] = [
+        const ENTRY_POINTS: [Self; 6] = [
             Self::CreateList,
+            Self::ImportList,
             Self::DuplicateList,
             Self::DeleteList,
             Self::ResumeList,
             Self::RenameList,
         ];
-        const ALL: [Self; 15] = [
+        const ALL: [Self; 16] = [
             Self::CreateList,
+            Self::ImportList,
             Self::DuplicateList,
             Self::DeleteList,
             Self::ResumeList,
@@ -1193,6 +1259,9 @@ mod tests {
             let item_id = state.items[0].id;
             match self {
                 Self::CreateList => database.create_list("New list".into()).map(|_| ()),
+                Self::ImportList => database
+                    .import_list(portable_list(state), vec![None; state.items.len()])
+                    .map(|_| ()),
                 Self::DuplicateList => database.duplicate_list(state.id).map(|_| ()),
                 Self::DeleteList => database.delete_list(state.id).map(|_| ()),
                 Self::ResumeList => database.resume_list(state.id).map(|_| ()),
@@ -2756,6 +2825,237 @@ mod tests {
             };
             assert_eq!(count, expected, "{table}");
         }
+    }
+
+    fn portable_list(state: &ListState) -> crate::transfer::PortableList {
+        let names: HashMap<_, _> = state
+            .tags
+            .iter()
+            .map(|tag| (tag.id, tag.name.clone()))
+            .collect();
+        let mut items: Vec<_> = state.items.iter().collect();
+        items.sort_by_key(|item| item.id);
+        crate::transfer::PortableList {
+            format: "mizu-pairrank-list".into(),
+            version: 1,
+            name: state.name.clone(),
+            tags: state.tags.iter().map(|tag| tag.name.clone()).collect(),
+            items: items
+                .into_iter()
+                .map(|item| crate::transfer::PortableItem {
+                    name: item.name.clone(),
+                    tags: item.tag_ids.iter().map(|id| names[id].clone()).collect(),
+                    image: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn import_list_round_trip_preserves_content_and_starts_comparisons_from_scratch() {
+        let mut database = memory_database();
+        let source = database.create_list("好きな果物".into()).unwrap();
+        let source = database
+            .add_items(source.id, vec!["A".into(), "B".into(), "Removed".into()])
+            .unwrap();
+        let a_id = source.items[0].id;
+        let b_id = source.items[1].id;
+        let removed_id = source.items[2].id;
+        let source = database
+            .create_tag(source.id, "Group".into(), Some(a_id))
+            .unwrap();
+        let group_id = source.tags[0].id;
+        let source = database
+            .create_tag(source.id, "A only".into(), Some(a_id))
+            .unwrap();
+        let source = database
+            .create_tag(source.id, "Unused".into(), None)
+            .unwrap();
+        let source = database
+            .set_item_tag(source.id, b_id, group_id, true)
+            .unwrap();
+        let source = database
+            .set_image(
+                source.id,
+                a_id,
+                Some(ImageAsset {
+                    path: "source.png".into(),
+                    source_url: Some("https://example.org/private-source".into()),
+                }),
+            )
+            .unwrap()
+            .value;
+        let source = database.delete_item(source.id, removed_id).unwrap().value;
+        let source = database
+            .answer(source.id, a_id, b_id, Preference::BStrong, source.revision)
+            .unwrap();
+        assert_eq!(source.items[0].id, b_id);
+        assert_ne!(source.items[0].rating, Rating::default());
+        let source_before = serde_json::to_value(&source).unwrap();
+        let json =
+            crate::transfer::encode(database.get_list(source.id).unwrap(), false, None).unwrap();
+        let portable = serde_json::from_slice(&json).unwrap();
+
+        let imported = database
+            .import_list(
+                portable,
+                vec![
+                    Some(ImageAsset {
+                        path: "imported.png".into(),
+                        source_url: Some("https://example.org/private-source".into()),
+                    }),
+                    None,
+                ],
+            )
+            .unwrap();
+        assert_eq!(imported.name, source.name);
+        assert_ne!(imported.id, source.id);
+        assert_eq!(imported.revision, 0);
+        assert_eq!(imported.comparison_count, 0);
+        assert!(!imported.convergence.converged);
+        assert_eq!(imported.convergence.observed_answers, 0);
+        assert_eq!(snapshot_count(&database, imported.id), 1);
+        assert_eq!(imported.items.len(), 2);
+        assert_eq!(imported.items[0].name, "A");
+        assert_eq!(imported.items[1].name, "B");
+        let image = imported.items[0].image.as_ref().unwrap();
+        assert_eq!(image.path, "imported.png");
+        assert!(image.source_url.is_none());
+        assert!(imported.items[1].image.is_none());
+        assert!(imported.items.iter().all(|item| {
+            item.list_id == imported.id
+                && item.id != a_id
+                && item.id != b_id
+                && item.rating == Rating::default()
+                && item.comparison_count == 0
+        }));
+        assert_eq!(imported.tags.len(), 3);
+        assert!(imported.tags.iter().all(|tag| {
+            tag.list_id == imported.id && !source.tags.iter().any(|old| old.id == tag.id)
+        }));
+        let tag_ids: HashMap<_, _> = imported
+            .tags
+            .iter()
+            .map(|tag| (tag.name.as_str(), tag.id))
+            .collect();
+        assert_eq!(
+            imported.items[0].tag_ids,
+            vec![tag_ids["Group"], tag_ids["A only"]]
+        );
+        assert_eq!(imported.items[1].tag_ids, vec![tag_ids["Group"]]);
+        assert!(
+            !imported
+                .items
+                .iter()
+                .any(|item| item.tag_ids.contains(&tag_ids["Unused"]))
+        );
+        assert!(
+            database
+                .comparison_state(imported.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(database.get_list(source.id).unwrap()).unwrap(),
+            source_before
+        );
+
+        database
+            .rename_item(imported.id, imported.items[0].id, "Changed".into())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(database.get_list(source.id).unwrap()).unwrap(),
+            source_before
+        );
+    }
+
+    #[test]
+    fn import_list_can_repeat_the_same_name_and_import_an_empty_list() {
+        let mut database = memory_database();
+        let source = database.create_list("Same".into()).unwrap();
+        let first = database
+            .import_list(portable_list(&source), vec![])
+            .unwrap();
+        let second = database
+            .import_list(portable_list(&source), vec![])
+            .unwrap();
+        assert_eq!(first.name, "Same");
+        assert_eq!(second.name, "Same");
+        assert_ne!(first.id, source.id);
+        assert_ne!(second.id, first.id);
+        assert!(first.items.is_empty());
+        assert_eq!(snapshot_count(&database, first.id), 1);
+        assert_eq!(database.list_summaries().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn import_list_rejects_invalid_data_and_image_count_before_writing() {
+        let mut database = memory_database();
+        let source = populated_list(&mut database, "Source");
+        let mut invalid = portable_list(&source);
+        invalid.items[0].tags.push("Missing".into());
+        assert!(database.import_list(invalid, vec![None; 2]).is_err());
+        assert!(
+            database
+                .import_list(portable_list(&source), vec![None])
+                .is_err()
+        );
+        assert!(database.connection.is_autocommit());
+        assert_eq!(database.list_summaries().unwrap().len(), 1);
+        assert_eq!(database.get_list(source.id).unwrap().items.len(), 2);
+    }
+
+    #[test]
+    fn import_list_rolls_back_all_rows_if_a_later_membership_insert_fails() {
+        let mut database = memory_database();
+        let source = populated_list(&mut database, "Source");
+        let source = database
+            .create_tag(source.id, "Group".into(), Some(source.items[0].id))
+            .unwrap();
+        let source = database
+            .set_item_tag(source.id, source.items[1].id, source.tags[0].id, true)
+            .unwrap();
+        database
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_import_membership BEFORE INSERT ON item_tags
+                 WHEN NEW.list_id != {} AND (SELECT name FROM items WHERE id = NEW.item_id) = 'B'
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                source.id
+            ))
+            .unwrap();
+        let tables = [
+            "lists",
+            "items",
+            "tags",
+            "item_tags",
+            "rank_snapshots",
+            "comparisons",
+            "sqlite_sequence",
+        ];
+        let read_rows = |database: &Database| {
+            tables.map(|table| {
+                let mut statement = database
+                    .connection
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                    .unwrap()
+                    .collect::<rusqlite::Result<StoredRows>>()
+                    .unwrap()
+            })
+        };
+        let before = read_rows(&database);
+        assert!(
+            database
+                .import_list(portable_list(&source), vec![None; 2])
+                .is_err()
+        );
+        assert_eq!(read_rows(&database), before);
+        assert!(database.connection.is_autocommit());
     }
 
     #[test]

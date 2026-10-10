@@ -15,6 +15,8 @@ export type Modal =
   | { kind: "create-list" }
   | { kind: "rename-list" }
   | { kind: "delete-list" }
+  | { kind: "export-list" }
+  | { kind: "import-list" }
   | { kind: "rename-item"; itemId: number }
   | { kind: "delete-item"; itemId: number }
   | { kind: "tags"; itemId?: number }
@@ -42,6 +44,7 @@ export type AppState = {
   error: string;
   notice: string;
   modal: Modal;
+  exportIncludeImages: boolean;
   tagDraft: string;
   tagEditingId: number | null;
   tagDeletingId: number | null;
@@ -86,6 +89,7 @@ export class AppController {
     error: "",
     notice: "",
     modal: null,
+    exportIncludeImages: false,
     tagDraft: "",
     tagEditingId: null,
     tagDeletingId: null,
@@ -375,8 +379,10 @@ export class AppController {
   async openModal(modal: Exclude<Modal, null>): Promise<void> {
     this.cancelRead("settings");
     if (this.state.busy) return;
+    if (modal.kind === "export-list" && !this.state.active) return;
     this.state.modal = modal;
     this.state.error = "";
+    this.state.exportIncludeImages = false;
     this.state.tagDraft = "";
     this.state.tagEditingId = null;
     this.state.tagDeletingId = null;
@@ -568,6 +574,52 @@ export class AppController {
       await this.acceptList(copy);
     });
     if (this.state.active?.id === copiedId && this.state.view === "items")
+      void this.refreshBulkSettings();
+  }
+
+  setExportIncludeImages(includeImages: boolean): void {
+    if (this.state.busy || this.state.modal?.kind !== "export-list") return;
+    this.state.exportIncludeImages = includeImages;
+    this.changed();
+  }
+
+  async exportList(): Promise<void> {
+    const list = this.state.active;
+    if (!list || this.state.modal?.kind !== "export-list") return;
+    const includeImages = this.state.exportIncludeImages;
+    await this.perform(async () => {
+      const saved = await this.api
+        .exportList(list.id, includeImages)
+        .catch((error: unknown) => this.handleListError(list.id, error));
+      if (!saved) return;
+      this.state.modal = null;
+      this.state.notice = "リストをエクスポートしました。";
+    });
+  }
+
+  async importList(): Promise<void> {
+    if (this.state.modal?.kind !== "import-list") return;
+    let importedId: number | null = null;
+    await this.perform(async () => {
+      const imported = await this.api.importList();
+      if (!imported) return;
+      importedId = imported.id;
+      this.state.modal = null;
+      this.state.drafts.name = "";
+      this.state.drafts.items = "";
+      this.state.drafts.query = "";
+      this.state.view = "items";
+      this.state.notice = "新しいリストとしてインポートしました。";
+      this.acceptCommittedList(imported);
+      try {
+        await this.refreshListSummaries(imported.id);
+      } catch (error) {
+        throw new Error(`インポート後のリスト一覧を更新できませんでした: ${errorMessage(error)}`, {
+          cause: error,
+        });
+      }
+    });
+    if (this.state.active?.id === importedId && this.state.view === "items")
       void this.refreshBulkSettings();
   }
 

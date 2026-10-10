@@ -22,7 +22,7 @@ use crate::models::ImageAsset;
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PIXELS: u64 = 32_000_000;
+pub(crate) const MAX_PIXELS: u64 = 32_000_000;
 const MAX_REDIRECTS: usize = 4;
 const SEARCH_PARALLELISM: usize = 4;
 const MAX_BUFFERED_IMAGES: usize = 4;
@@ -1025,6 +1025,49 @@ impl ImageService {
         verify_app_data(&self.app_data)?;
         save_image(&self.directory, &self.directory_identity, &bytes, None)
     }
+
+    pub fn import_bytes(&self, bytes: &[u8]) -> Result<ImageAsset, String> {
+        let _permit = self
+            .decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        verify_app_data(&self.app_data)?;
+        save_image(&self.directory, &self.directory_identity, bytes, None)
+    }
+
+    pub fn export_image(
+        &self,
+        image: &ImageAsset,
+        pixels_left: &mut u64,
+    ) -> Result<Vec<u8>, String> {
+        let _permit = self
+            .decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        let read = || -> std::io::Result<Vec<u8>> {
+            self.app_data.verify()?;
+            let names = managed_image_names([&image.path], &self.directory_identity)?;
+            let name = names
+                .iter()
+                .next()
+                .ok_or_else(|| std::io::Error::other("invalid managed image reference"))?;
+            let pinned = verified_image_directory(&self.directory, &self.directory_identity)?;
+            let file =
+                crate::storage::open_managed_image_file(&pinned, std::ffi::OsStr::new(name))?;
+            if file.metadata()?.len() > MAX_IMAGE_BYTES as u64 {
+                return Err(std::io::Error::other("image too large"));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let bytes = read().map_err(|_| {
+            "登録画像を読み取れませんでした。画像を含めずに再試行できます。".to_owned()
+        })?;
+        // Re-encoding removes embedded file metadata as well as normalizing legacy images.
+        normalize_image_with_budget(&bytes, 1600, pixels_left)
+    }
 }
 
 #[cfg(not(unix))]
@@ -1320,6 +1363,15 @@ fn representative_image(bytes: &[u8], page_url: &str) -> Option<String> {
 }
 
 fn normalize_image(bytes: &[u8], max_edge: u32) -> Result<Vec<u8>, String> {
+    let mut pixels_left = u64::MAX;
+    normalize_image_with_budget(bytes, max_edge, &mut pixels_left)
+}
+
+fn normalize_image_with_budget(
+    bytes: &[u8],
+    max_edge: u32,
+    pixels_left: &mut u64,
+) -> Result<Vec<u8>, String> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err("20MiB以下の画像ファイルを選択してください。".to_owned());
     }
@@ -1341,9 +1393,13 @@ fn normalize_image(bytes: &[u8], max_edge: u32) -> Result<Vec<u8>, String> {
         .into_decoder()
         .map_err(|_| "画像サイズを読み取れませんでした。".to_owned())?;
     let (width, height) = decoder.dimensions();
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
+    let pixels = u64::from(width) * u64::from(height);
+    if width == 0 || height == 0 || pixels > MAX_PIXELS {
         return Err("画像の画素数が上限（3,200万画素）を超えています。".to_owned());
     }
+    *pixels_left = pixels_left.checked_sub(pixels).ok_or_else(|| {
+        "画像は合計1億画素まで含められます。画像を含めずにエクスポートしてください。".to_owned()
+    })?;
     let orientation = decoder.orientation().map_err(|_| {
         "画像を読み取れませんでした。画像が破損していないか確認してください。".to_owned()
     })?;
@@ -3727,6 +3783,52 @@ mod tests {
         assert_eq!((normalized.width(), normalized.height()), (1600, 800));
         let tiny = image::load_from_memory(&normalize_image(&png(2, 1), 320).unwrap()).unwrap();
         assert_eq!((tiny.width(), tiny.height()), (2, 1));
+    }
+
+    #[test]
+    fn export_pixel_budget_rejects_before_decoding_corrupt_pixels() {
+        let mut bytes = png(3, 2);
+        let idat = bytes.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
+        bytes.truncate(idat + 4);
+        let decoder = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
+            .into_decoder()
+            .unwrap();
+        assert_eq!(decoder.dimensions(), (3, 2));
+        assert!(normalize_image(&bytes, 320).is_err());
+
+        let mut pixels_left = 5;
+        assert_eq!(
+            normalize_image_with_budget(&bytes, 320, &mut pixels_left).unwrap_err(),
+            "画像は合計1億画素まで含められます。画像を含めずにエクスポートしてください。"
+        );
+        assert_eq!(pixels_left, 5);
+    }
+
+    #[test]
+    fn export_pixel_budget_counts_source_pixels_before_resizing() {
+        let mut pixels_left = 1_300;
+        let normalized = normalize_image_with_budget(&png(40, 30), 2, &mut pixels_left).unwrap();
+        assert_eq!(pixels_left, 100);
+        let resized = image::load_from_memory(&normalized).unwrap();
+        assert!(resized.width() <= 2 && resized.height() <= 2);
+    }
+
+    #[test]
+    fn export_images_share_a_pixel_budget_and_preserve_remaining_capacity_on_rejection() {
+        let (_directory, service, _) = service(Ok(Vec::new()), vec![]);
+        let first = service.import_bytes(&png(3, 2)).unwrap();
+        let second = service.import_bytes(&png(2, 2)).unwrap();
+        let third = service.import_bytes(&png(1, 3)).unwrap();
+        let mut pixels_left = 9;
+        service.export_image(&first, &mut pixels_left).unwrap();
+        assert_eq!(pixels_left, 3);
+        assert_eq!(
+            service.export_image(&second, &mut pixels_left).unwrap_err(),
+            "画像は合計1億画素まで含められます。画像を含めずにエクスポートしてください。"
+        );
+        assert_eq!(pixels_left, 3);
+        service.export_image(&third, &mut pixels_left).unwrap();
+        assert_eq!(pixels_left, 0);
     }
 
     #[tokio::test]

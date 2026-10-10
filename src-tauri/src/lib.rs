@@ -5,6 +5,7 @@ mod models;
 mod rating;
 mod sqlite_vfs;
 mod storage;
+mod transfer;
 
 use database::{Database, ImageChange};
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
@@ -228,6 +229,84 @@ async fn create_list(app: AppHandle, name: String) -> Result<ListState, String> 
 #[tauri::command]
 async fn duplicate_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
     database_job(app, move |db| db.duplicate_list(list_id)).await
+}
+
+#[tauri::command]
+async fn export_list(app: AppHandle, list_id: i64, include_images: bool) -> Result<bool, String> {
+    let picker = app.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .add_filter("pairrank リスト", &["zip"])
+            .set_file_name("list.pairrank.zip")
+            .blocking_save_file()
+            .map(|file| file.into_path().map_err(|error| error.to_string()))
+            .transpose()
+    })
+    .await
+    .map_err(|_| "保存先の選択を完了できませんでした。".to_owned())??;
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let images = app.state::<Backend>().images.clone().ok();
+    database_job(app, move |db| {
+        let bytes = transfer::encode(db.get_list(list_id)?, include_images, images.as_deref())?;
+        transfer::write(&path, &bytes)?;
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn import_list(app: AppHandle) -> Result<Option<ListState>, String> {
+    let picker = app.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .add_filter("pairrank リスト", &["zip"])
+            .blocking_pick_file()
+            .map(|file| file.into_path().map_err(|error| error.to_string()))
+            .transpose()
+    })
+    .await
+    .map_err(|_| "ファイルの選択を完了できませんでした。".to_owned())??;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let images = app.state::<Backend>().images.clone().ok();
+    database_job(app, move |db| {
+        import_list_file(db, images.as_deref(), &path).map(Some)
+    })
+    .await
+}
+
+fn import_list_file(
+    db: &mut Database,
+    images: Option<&ImageService>,
+    path: &std::path::Path,
+) -> Result<ListState, String> {
+    let list = transfer::read(path)?;
+    let mut imported = Vec::new();
+    let result = transfer::import_images(&list, images, &mut imported).and_then(|()| {
+        if let Some(images) = images {
+            for image in imported.iter().flatten() {
+                images.validate_import(image)?;
+            }
+        }
+        db.import_list(list, imported.clone())
+    });
+    if result.is_err()
+        && let Some(images) = images
+    {
+        remove_unused_images(
+            db,
+            images,
+            imported.into_iter().flatten().map(|image| image.path),
+        );
+    }
+    result
 }
 #[tauri::command]
 async fn rename_list(app: AppHandle, list_id: i64, name: String) -> Result<ListState, String> {
@@ -491,6 +570,8 @@ pub fn run() {
             get_list,
             create_list,
             duplicate_list,
+            export_list,
+            import_list,
             rename_list,
             delete_list,
             add_items,
@@ -519,6 +600,125 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn portable_lists_round_trip_images_without_private_data() {
+        let (directory, backend) = backend();
+        let (list_id, item_id, original) = list_with_image(&backend).await;
+        let service = backend.images.as_ref().unwrap().clone();
+        let path = directory.path().join("share.zip");
+        let destination = path.clone();
+        let source_path = original.path.clone();
+        let imported = backend
+            .database_job(move |db| {
+                let list = db.get_list(list_id)?;
+                let bytes = transfer::encode(list, true, Some(&service))?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value.as_object().unwrap().len(), 5);
+                assert_eq!(value["items"][0].as_object().unwrap().len(), 3);
+                assert!(!String::from_utf8_lossy(&bytes).contains(&source_path));
+                transfer::write(&destination, &bytes)?;
+                import_list_file(db, Some(&service), &destination)
+            })
+            .await
+            .unwrap();
+        assert_ne!(imported.id, list_id);
+        assert_eq!(imported.comparison_count, 0);
+        let asset = imported.items[0].image.as_ref().unwrap();
+        assert_ne!(asset.path, original.path);
+        assert!(asset.source_url.is_none());
+        let images = backend.images.as_ref().unwrap();
+        let mut pixels_left = u64::MAX;
+        assert_eq!(
+            images.export_image(asset, &mut pixels_left).unwrap(),
+            images.export_image(&original, &mut pixels_left).unwrap()
+        );
+        let service = images.clone();
+        backend
+            .database_job(move |db| {
+                let bytes = transfer::encode(db.get_list(list_id)?, false, None)?;
+                transfer::write(&path, &bytes)?;
+                let imported = import_list_file(db, Some(&service), &path)?;
+                assert!(imported.items.iter().all(|item| item.image.is_none()));
+                assert_eq!(db.get_list(list_id)?.items[0].id, item_id);
+                assert_eq!(db.list_summaries()?.len(), 3);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_import_cleans_images_after_corruption_and_database_failure() {
+        let (directory, backend) = backend();
+        let (list_id, _, original) = list_with_image(&backend).await;
+        let service = backend.images.as_ref().unwrap().clone();
+        let mut pixels_left = u64::MAX;
+        let valid = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            service.export_image(&original, &mut pixels_left).unwrap(),
+        );
+        let path = directory.path().join("broken.zip");
+        let mut value = serde_json::json!({"format":"mizu-pairrank-list","version":1,"name":"新規","tags":[],
+            "items":[{"name":"first","tags":[],"image":valid},{"name":"second","tags":[],"image":"bad!!!"}]});
+        transfer::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let count_images = || {
+            std::fs::read_dir(directory.path().join("images"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+                .count()
+        };
+        assert_eq!(count_images(), 1);
+        let source = path.clone();
+        let images = service.clone();
+        backend
+            .database_job(move |db| {
+                assert!(import_list_file(db, Some(&images), &source).is_err());
+                assert_eq!(db.list_summaries()?.len(), 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_images(), 1);
+        value["items"][1].as_object_mut().unwrap().remove("image");
+        transfer::write(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        database::test_connection(directory.path().join("test.sqlite3")).unwrap().execute_batch(
+            "CREATE TRIGGER reject_import BEFORE INSERT ON items WHEN NEW.name = 'second' BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        backend
+            .database_job(move |db| {
+                assert!(import_list_file(db, Some(&service), &path).is_err());
+                assert_eq!(db.list_summaries()?.len(), 1);
+                assert_eq!(db.get_list(list_id)?.items.len(), 2);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_images(), 1);
+    }
+
+    #[test]
+    fn portable_image_export_rejects_external_references_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ImageService::new(root.path().join("data")).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/32x32.png");
+        let mut image = service.import_local(source.clone()).unwrap();
+        let mut pixels_left = u64::MAX;
+        let bytes = service.export_image(&image, &mut pixels_left).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        image.path = source.to_string_lossy().into_owned();
+        assert!(service.export_image(&image, &mut pixels_left).is_err());
+        image.path = "../../icons/32x32.png".to_owned();
+        assert!(service.export_image(&image, &mut pixels_left).is_err());
+        #[cfg(unix)]
+        {
+            image.path = format!("{}.png", uuid::Uuid::new_v4());
+            std::os::unix::fs::symlink(source, root.path().join("data/images").join(&image.path))
+                .unwrap();
+            assert!(service.export_image(&image, &mut pixels_left).is_err());
+        }
+    }
 
     fn image_request(path: &str, method: &str) -> tauri::http::Request<Vec<u8>> {
         tauri::http::Request::builder()

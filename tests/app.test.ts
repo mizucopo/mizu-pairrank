@@ -58,6 +58,8 @@ function setup(
     getList: vi.fn<AppApi["getList"]>().mockResolvedValue(state),
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(state),
     duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(state),
+    exportList: vi.fn<AppApi["exportList"]>().mockResolvedValue(true),
+    importList: vi.fn<AppApi["importList"]>().mockResolvedValue(state),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(state),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
     addItems: vi.fn<AppApi["addItems"]>().mockResolvedValue(state),
@@ -122,6 +124,171 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it("exports without images by default, explains redistribution, and resets opt-in when reopened", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    const opener = button(root, '[data-action="export-list"]');
+    opener.focus();
+    await click(root, controller, '[data-action="export-list"]');
+    expect(root.querySelector<HTMLInputElement>("#export-include-images")?.checked).toBe(false);
+    expect(root.querySelector("dialog")?.textContent).toContain("ZIP ファイルに保存します");
+    expect(root.querySelector("dialog")?.textContent).toContain("比較履歴・評価は含みません");
+    expect(root.querySelector("dialog")?.textContent).toContain("再配布できる権利のある画像");
+    await click(root, controller, '[data-action="confirm-export"]');
+    expect(api.exportList).toHaveBeenCalledExactlyOnceWith(1, false);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(document.activeElement).toBe(button(root, '[data-action="export-list"]'));
+    expect(root.querySelector(".notice")?.textContent).toBe("リストをエクスポートしました。");
+
+    await click(root, controller, '[data-action="export-list"]');
+    const checkbox = root.querySelector<HTMLInputElement>("#export-include-images");
+    if (!checkbox) throw new Error("Missing image option");
+    checkbox.focus();
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.activeElement).toBe(root.querySelector("#export-include-images"));
+    await click(root, controller, '[data-action="confirm-export"]');
+    expect(api.exportList).toHaveBeenLastCalledWith(1, true);
+    await click(root, controller, '[data-action="export-list"]');
+    expect(root.querySelector<HTMLInputElement>("#export-include-images")?.checked).toBe(false);
+  });
+
+  it.each(["close button", "Escape"] as const)(
+    "returns focus after %s cancels a transfer modal without opening a native dialog",
+    async (dismissal) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      for (const action of ["export-list", "import-list"] as const) {
+        button(root, `[data-action="${action}"]`).focus();
+        await click(root, controller, `[data-action="${action}"]`);
+        if (dismissal === "close button") button(root, '[data-action="close-modal"]').click();
+        else root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+        expect(root.querySelector("dialog")).toBeNull();
+        expect(document.activeElement).toBe(button(root, `[data-action="${action}"]`));
+      }
+      expect(api.exportList).not.toHaveBeenCalled();
+      expect(api.importList).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the export dialog retryable after native cancellation and escaped errors", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    api.exportList
+      .mockResolvedValueOnce(false)
+      .mockRejectedValueOnce(new Error("<保存できません>"));
+    await click(root, controller, '[data-action="export-list"]');
+    await click(root, controller, '[data-action="confirm-export"]');
+    expect(root.querySelector("dialog")).not.toBeNull();
+    expect(root.querySelector(".notice, [role=alert]")).toBeNull();
+    expect(document.activeElement).toBe(button(root, '[data-action="confirm-export"]'));
+    await click(root, controller, '[data-action="confirm-export"]');
+    expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe("<保存できません>");
+    expect(root.querySelector("保存できません")).toBeNull();
+    expect(controller.state.active).toEqual(state);
+    await click(root, controller, '[data-action="confirm-export"]');
+    expect(api.exportList).toHaveBeenCalledTimes(3);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each(["export", "import"] as const)(
+    "disables transfer controls and prevents dismissal during a pending %s",
+    async (operation) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      let finish: (() => void) | undefined;
+      if (operation === "export")
+        api.exportList.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = () => resolve(false);
+            }),
+        );
+      else
+        api.importList.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = () => resolve(null);
+            }),
+        );
+      await click(root, controller, `[data-action="${operation}-list"]`);
+      button(root, `[data-action="confirm-${operation}"]`).click();
+      expect(controller.state.busy).toBe(true);
+      for (const action of [`confirm-${operation}`, "close-modal", "import-list", "export-list"])
+        expect(button(root, `[data-action="${action}"]`).disabled).toBe(true);
+      if (operation === "export")
+        expect(root.querySelector<HTMLInputElement>("#export-include-images")?.disabled).toBe(true);
+      root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+      expect(root.querySelector("dialog")).not.toBeNull();
+      if (!finish) throw new Error("Native operation did not start");
+      finish();
+      await settle(controller);
+      expect(button(root, `[data-action="confirm-${operation}"]`).disabled).toBe(false);
+      expect(document.activeElement).toBe(button(root, `[data-action="confirm-${operation}"]`));
+    },
+  );
+
+  it("imports from the empty app after picker cancellation and an invalid file, preserving retry and focus", async () => {
+    const { root, controller, api, state } = setup();
+    api.listSummaries.mockResolvedValueOnce([]);
+    api.importList
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("ファイルが破損しています。"));
+    await controller.initialize();
+    expect(root.querySelector(".welcome")).not.toBeNull();
+    button(root, '[data-action="import-list"]').focus();
+    await click(root, controller, '[data-action="import-list"]');
+    expect(root.querySelector("dialog")?.textContent).toContain("エクスポートした ZIP ファイル");
+    expect(root.querySelector("dialog")?.textContent).toContain("既存のリストは変更せず");
+    await click(root, controller, '[data-action="confirm-import"]');
+    expect(root.querySelector("dialog")).not.toBeNull();
+    expect(root.querySelector(".notice, [role=alert]")).toBeNull();
+    await click(root, controller, '[data-action="confirm-import"]');
+    expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe(
+      "ファイルが破損しています。",
+    );
+    expect(controller.state.active).toBeNull();
+    await click(root, controller, '[data-action="confirm-import"]');
+    expect(api.importList).toHaveBeenCalledTimes(3);
+    expect(api.createList).not.toHaveBeenCalled();
+    expect(root.querySelector("h1")?.textContent).toBe(state.name);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector(".notice")?.textContent).toBe(
+      "新しいリストとしてインポートしました。",
+    );
+    expect(document.activeElement).toBe(button(root, '[data-action="import-list"]'));
+  });
+
+  it("shows the committed imported list and existing sidebar list when the later refresh fails", async () => {
+    const { root, controller, api, state } = setup();
+    const imported = {
+      ...state,
+      id: 2,
+      name: "取り込んだ果物",
+      items: state.items.map((item) => ({ ...item, id: item.id + 10, listId: 2 })),
+    };
+    await controller.initialize();
+    api.importList.mockResolvedValueOnce(imported);
+    api.listSummaries.mockRejectedValueOnce(new Error("一覧の取得に失敗しました。"));
+    await click(root, controller, '[data-action="import-list"]');
+    await click(root, controller, '[data-action="confirm-import"]');
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector("h1")?.textContent).toBe(imported.name);
+    expect(root.querySelectorAll('[data-action="select-list"]')).toHaveLength(2);
+    expect(
+      root.querySelector('[data-action="select-list"][data-id="2"]')?.getAttribute("aria-current"),
+    ).toBe("true");
+    expect(root.querySelector(".notice")?.textContent).toBe(
+      "新しいリストとしてインポートしました。",
+    );
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain(
+      "インポート後のリスト一覧を更新できませんでした",
+    );
+    expect(root.querySelector("#item-names")).not.toBeNull();
+    expect(api.importList).toHaveBeenCalledTimes(1);
+  });
+
   it("shows score-based tiers from left to right while keeping the ranking and updating after an answer", async () => {
     const { root, controller, api, state, pair } = setup();
     const items = [50, 41, 39, 30, 20, 10].map((mu, index) => ({

@@ -30,7 +30,7 @@ function picture(item: Item, assetUrl: (path: string) => string, large = false):
 }
 function sidebar(s: AppState): string {
   const navigationDisabled = s.readPending === "settings" ? "" : disabled(s);
-  return `<aside class="sidebar"><div class="brand"><span class="brand-mark" aria-hidden="true">p<span>r</span></span><div>pairrank<small>あなたの好みを、順番に。</small></div></div><div class="sidebar-heading"><h2>マイリスト</h2><span>${s.lists.length}</span></div><nav class="lists" aria-label="リスト">${s.lists.map((list) => `<button class="list-link${list.id === s.active?.id ? " selected" : ""}" data-action="select-list" data-id="${list.id}"${navigationDisabled} ${list.id === s.active?.id ? 'aria-current="true"' : ""}><span class="list-name">${e(list.name)}</span><small>${list.itemCount} 項目<span>${list.converged ? "ほぼ確定 ✓" : `${list.comparisonCount} 回比較`}</span></small></button>`).join("")}</nav><button class="new-list secondary" data-action="create-list"${navigationDisabled}>＋ リストを作成</button><div class="sidebar-footer"><span class="local-dot"></span>この端末に自動保存<button class="text-button" data-view="settings"${navigationDisabled}>検索設定</button></div></aside>`;
+  return `<aside class="sidebar"><div class="brand"><span class="brand-mark" aria-hidden="true">p<span>r</span></span><div>pairrank<small>あなたの好みを、順番に。</small></div></div><div class="sidebar-heading"><h2>マイリスト</h2><span>${s.lists.length}</span></div><nav class="lists" aria-label="リスト">${s.lists.map((list) => `<button class="list-link${list.id === s.active?.id ? " selected" : ""}" data-action="select-list" data-id="${list.id}"${navigationDisabled} ${list.id === s.active?.id ? 'aria-current="true"' : ""}><span class="list-name">${e(list.name)}</span><small>${list.itemCount} 項目<span>${list.converged ? "ほぼ確定 ✓" : `${list.comparisonCount} 回比較`}</span></small></button>`).join("")}</nav><div class="sidebar-actions"><button class="new-list secondary" data-action="create-list"${navigationDisabled}>＋ リストを作成</button><button class="new-list secondary" data-action="import-list"${navigationDisabled}>リストをインポート</button></div><div class="sidebar-footer"><span class="local-dot"></span>この端末に自動保存<button class="text-button" data-view="settings"${navigationDisabled}>検索設定</button></div></aside>`;
 }
 function progress(s: AppState): string {
   const list = s.active;
@@ -47,7 +47,7 @@ function listHeader(s: AppState): string {
     { view: "ranking", label: "ランキング" },
     { view: "tier", label: "Tier 表" },
   ];
-  return `<header class="page-header"><div><p class="eyebrow">MY RANKING</p><h1>${e(list.name)}</h1><p class="muted">${list.items.length} 項目 · ${list.comparisonCount} 回の比較</p></div><div class="header-actions"><button class="text-button" data-action="duplicate-list"${disabled(s)}>複製</button><button class="text-button" data-action="rename-list"${disabled(s)}>名前を変更</button><button class="text-button danger-text" data-action="delete-list"${disabled(s)}>削除</button></div></header><nav class="tabs" aria-label="表示切り替え">${tabs.map(({ view, label }) => `<button data-view="${view}" class="${s.view === view ? "active" : ""}" ${s.view === view ? 'aria-current="page"' : ""}${disabled(s)} ${view === "compare" && list.items.length < 2 ? "disabled" : ""}>${label}</button>`).join("")}</nav>`;
+  return `<header class="page-header"><div><p class="eyebrow">MY RANKING</p><h1>${e(list.name)}</h1><p class="muted">${list.items.length} 項目 · ${list.comparisonCount} 回の比較</p></div><div class="header-actions"><button class="text-button" data-action="export-list"${disabled(s)}>エクスポート</button><button class="text-button" data-action="duplicate-list"${disabled(s)}>複製</button><button class="text-button" data-action="rename-list"${disabled(s)}>名前を変更</button><button class="text-button danger-text" data-action="delete-list"${disabled(s)}>削除</button></div></header><nav class="tabs" aria-label="表示切り替え">${tabs.map(({ view, label }) => `<button data-view="${view}" class="${s.view === view ? "active" : ""}" ${s.view === view ? 'aria-current="page"' : ""}${disabled(s)} ${view === "compare" && list.items.length < 2 ? "disabled" : ""}>${label}</button>`).join("")}</nav>`;
 }
 function itemsView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
@@ -155,7 +155,13 @@ function modalView(s: AppState): string {
     "itemId" in modal ? s.active?.items.find((entry) => entry.id === modal.itemId) : null;
   let title: string;
   let body: string;
-  if (modal.kind === "bulk-image") {
+  if (modal.kind === "export-list") {
+    title = "リストをエクスポート";
+    body = `<p>「${e(s.active?.name ?? "")}」のリスト名・項目名・タグを ZIP ファイルに保存します。</p><p class="muted">比較履歴・評価は含みません。</p><label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>${s.busy ? '<p role="status">エクスポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
+  } else if (modal.kind === "import-list") {
+    title = "リストをインポート";
+    body = `<p>pairrank でエクスポートした ZIP ファイルから、リスト名・項目名・タグを取り込みます。画像が含まれる場合は画像も取り込みます。</p><p class="muted">新しいリストとして追加します。既存のリストは変更せず、比較は最初から始められます。</p>${s.busy ? '<p role="status">インポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-import"${disabled(s)}>ファイルを選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
+  } else if (modal.kind === "bulk-image") {
     title = "未登録画像を一括登録";
     const run = s.bulkRun;
     const providers = (["brave", "ollama"] as const).filter(
