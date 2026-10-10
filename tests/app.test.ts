@@ -70,6 +70,7 @@ function setup(
     deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(state),
     setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(state),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(state),
+    resetComparisons: vi.fn<AppApi["resetComparisons"]>().mockResolvedValue(state),
     nextPair,
     answer: vi.fn<AppApi["answer"]>().mockImplementation(async () => {
       comparisonCount += 1;
@@ -141,6 +142,74 @@ describe("desktop app interaction", () => {
     expect(root.querySelector("dialog")?.textContent).toContain("macOS");
     expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
     expect(button(root, '[data-action="local-image"]').disabled).toBe(false);
+  });
+
+  it.each(["cancel button", "Escape"] as const)(
+    "warns before resetting and cancels with %s",
+    async (dismissal) => {
+      const { root, controller, api, state } = setup();
+      await controller.initialize();
+      button(root, '[data-action="reset-comparisons"]').focus();
+      await click(root, controller, '[data-action="reset-comparisons"]');
+      const warning = root.querySelector("dialog")?.textContent;
+      expect(warning).toContain(state.name);
+      expect(warning).toContain("比較履歴・評価・比較回数");
+      expect(warning).toContain("元に戻せません");
+      expect(warning).toContain("項目・タグ・画像は残ります");
+      root.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+      expect(api.answer).not.toHaveBeenCalled();
+      if (dismissal === "Escape")
+        root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+      else await click(root, controller, 'dialog .form-actions [data-action="close-modal"]');
+      expect(api.resetComparisons).not.toHaveBeenCalled();
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button(root, '[data-action="reset-comparisons"]'));
+    },
+  );
+
+  it("shows the fresh ranking and Tier, keeps images and tags, and allows a new answer", async () => {
+    const { root, controller, api, state, pair } = setup();
+    const initial = withLocalImage({
+      ...state,
+      tags: [{ id: 1, listId: state.id, name: "果物" }],
+      items: state.items.map((item) => ({ ...item, tagIds: [1] })),
+    });
+    const saved = {
+      ...initial,
+      comparisonCount: 20,
+      convergence: { ...initial.convergence, converged: true },
+      items: initial.items.map((item) => ({
+        ...item,
+        rating: { mu: 30, sigma: 2 },
+        comparisonCount: 20,
+      })),
+    };
+    api.getList.mockResolvedValue(saved);
+    api.resetComparisons.mockResolvedValue(initial);
+    await controller.initialize();
+    expect(root.querySelector(".converged-banner")).not.toBeNull();
+    await click(root, controller, '[data-action="reset-comparisons"]');
+    await click(root, controller, '[data-action="confirm-reset-comparisons"]');
+    expect(api.resetComparisons).toHaveBeenCalledExactlyOnceWith(state.id);
+    expect(root.querySelector("dialog, .converged-banner")).toBeNull();
+    expect(root.querySelector(".page-header")?.textContent).toContain("0 回の比較");
+    expect(root.querySelector(".list-link")?.textContent).toContain("0 回比較");
+    expect(root.querySelectorAll(".rank-row")).toHaveLength(2);
+    expect(root.querySelector(".rank-row")?.textContent).toContain("りんご");
+    expect(root.querySelector(".rank-row img")?.getAttribute("src")).toBe(
+      "asset:///images/picked.png",
+    );
+    expect(root.querySelector("#ranking-tag")?.textContent).toContain("果物");
+    await click(root, controller, '[data-view="tier"]');
+    expect(root.querySelectorAll("#tier-C + .tier-items .tier-card")).toHaveLength(2);
+    api.resumeList.mockResolvedValue(initial);
+    api.nextPair.mockResolvedValue({ ...pair, revision: initial.revision });
+    await click(root, controller, '[data-view="compare"]');
+    await click(root, controller, '[data-answer="a_weak"]');
+    expect(api.answer).toHaveBeenCalledWith(
+      expect.objectContaining({ revision: initial.revision }),
+      "a_weak",
+    );
   });
 
   it("exports without images by default, explains redistribution, and resets opt-in when reopened", async () => {
