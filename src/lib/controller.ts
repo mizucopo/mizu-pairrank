@@ -1,6 +1,7 @@
 import type {
   AppApi,
   ImageCandidate,
+  ItemPair,
   ListState,
   ListSummary,
   PairProposal,
@@ -37,6 +38,7 @@ export type AppState = {
   lists: ListSummary[];
   active: ListState | null;
   pair: PairProposal | null;
+  comparisonPaused: boolean;
   view: View;
   selectedTagId: number | null;
   busy: boolean;
@@ -92,6 +94,7 @@ export class AppController {
     lists: [],
     active: null,
     pair: null,
+    comparisonPaused: false,
     view: "items",
     selectedTagId: null,
     busy: false,
@@ -117,6 +120,7 @@ export class AppController {
 
   private readRequest: symbol | null = null;
   private settingsRead: Promise<SearchSettings> | null = null;
+  private skippedPairs: { ids: ItemPair; remainingAnswers: number }[] = [];
 
   constructor(
     private readonly api: AppApi,
@@ -402,6 +406,11 @@ export class AppController {
 
   private acceptCommittedList(list: ListState): void {
     // Keep committed state usable even if a later sidebar refresh fails.
+    if (this.state.active?.id !== list.id) this.skippedPairs = [];
+    else
+      this.skippedPairs = this.skippedPairs.filter(({ ids }) =>
+        ids.every((id) => list.items.some((item) => item.id === id)),
+      );
     if (
       this.state.active?.id !== list.id ||
       (this.state.selectedTagId !== null &&
@@ -410,6 +419,7 @@ export class AppController {
       this.state.selectedTagId = null;
     this.state.active = list;
     this.state.pair = null;
+    this.state.comparisonPaused = false;
     const modal = this.state.modal;
     if (
       modal?.kind === "tags" &&
@@ -692,6 +702,7 @@ export class AppController {
       const reset = await this.api
         .resetComparisons(list.id)
         .catch((error: unknown) => this.handleListError(list.id, error));
+      this.skippedPairs = [];
       this.acceptCommittedList(reset);
       this.state.modal = null;
       this.state.view = "ranking";
@@ -699,28 +710,75 @@ export class AppController {
     });
   }
 
-  async startComparison(): Promise<void> {
+  async startComparison(retrySkipped = false): Promise<void> {
     const list = this.state.active;
-    if (!list) return;
+    if (!list || this.state.busy) return;
     await this.perform(async () => {
       this.state.pair = null;
+      this.state.comparisonPaused = false;
       this.state.view = "compare";
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const current = await this.api
           .resumeList(list.id)
           .catch((error: unknown) => this.handleListError(list.id, error));
         this.acceptCommittedList(current);
+        const skipped = retrySkipped ? [] : this.skippedPairs;
         const pair = await this.api
-          .nextPair(list.id)
+          .nextPair(
+            list.id,
+            skipped.map(({ ids }) => ids),
+            current.revision,
+          )
           .catch((error: unknown) => this.handleListError(list.id, error));
         if (pair && pair.revision !== current.revision) continue;
-        if (!pair && current.items.length >= 2) continue;
+        if (!pair && current.items.length >= 2 && !skipped.length) continue;
         await this.refreshListSummaries(list.id);
+        this.skippedPairs = skipped;
         this.state.pair = pair;
-        this.state.view = pair ? "compare" : "items";
+        this.state.comparisonPaused = !pair && current.items.length >= 2 && skipped.length > 0;
+        this.state.view = pair || this.state.comparisonPaused ? "compare" : "items";
         return;
       }
       throw new Error(comparisonRetryMessage);
+    });
+  }
+
+  async resumeSkippedComparisons(): Promise<void> {
+    if (this.state.comparisonPaused && !this.state.modal) await this.startComparison(true);
+  }
+
+  async skipComparison(): Promise<void> {
+    const pair = this.state.pair;
+    const list = this.state.active;
+    if (!pair || !list || this.state.view !== "compare" || this.state.modal) return;
+    await this.perform(async () => {
+      const ids: ItemPair = [Math.min(pair.a.id, pair.b.id), Math.max(pair.a.id, pair.b.id)];
+      const skipped = [
+        ...this.skippedPairs,
+        { ids, remainingAnswers: Math.max(1, list.items.length - 1) },
+      ];
+      const next = await this.api
+        .nextPair(
+          pair.listId,
+          skipped.map((entry) => entry.ids),
+          pair.revision,
+        )
+        .catch((error: unknown) => {
+          if (
+            errorMessage(error) === "リストが更新されています。最新の比較を読み直してください。"
+          ) {
+            this.state.pair = null;
+            throw new Error(comparisonRetryMessage, { cause: error });
+          }
+          return this.handleListError(pair.listId, error);
+        });
+      if (next && next.revision !== pair.revision) {
+        this.state.pair = null;
+        throw new Error(comparisonRetryMessage);
+      }
+      this.skippedPairs = skipped;
+      this.state.pair = next;
+      this.state.comparisonPaused = !next;
     });
   }
 
@@ -732,6 +790,8 @@ export class AppController {
         if (this.state.lists.some((entry) => entry.id === this.state.active?.id)) throw error;
       }
       this.state.pair = null;
+      this.state.comparisonPaused = false;
+      this.skippedPairs = [];
       this.state.active = null;
       this.state.modal = null;
       this.state.candidates = [];
@@ -799,6 +859,9 @@ export class AppController {
         return this.handleListError(pair.listId, error);
       }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
+      this.skippedPairs = this.skippedPairs
+        .map((entry) => ({ ...entry, remainingAnswers: entry.remainingAnswers - 1 }))
+        .filter((entry) => entry.remainingAnswers > 0);
       this.acceptCommittedList(result);
       if (result.convergence.converged) {
         this.state.view = "ranking";
@@ -807,10 +870,16 @@ export class AppController {
       await this.refreshListSummaries(result.id);
       if (!result.convergence.converged) {
         const next = await this.api
-          .nextPair(result.id)
+          .nextPair(
+            result.id,
+            this.skippedPairs.map(({ ids }) => ids),
+            result.revision,
+          )
           .catch((error: unknown) => this.handleListError(result.id, error));
-        if (!next || next.revision !== result.revision) throw new Error(comparisonRetryMessage);
+        if (next && next.revision !== result.revision) throw new Error(comparisonRetryMessage);
+        if (!next && !this.skippedPairs.length) throw new Error(comparisonRetryMessage);
         this.state.pair = next;
+        this.state.comparisonPaused = !next;
       }
     });
   }

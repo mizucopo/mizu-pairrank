@@ -125,6 +125,50 @@ afterEach(() => {
 });
 
 describe("desktop app interaction", () => {
+  it("skips without answering, pauses when all pairs are held, then resumes without restart", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    api.nextPair.mockResolvedValueOnce(null);
+    await click(root, controller, '[data-action="skip-comparison"]');
+    expect(api.answer).not.toHaveBeenCalled();
+    expect(controller.state.active).toEqual(state);
+    expect(root.textContent).toContain("比較できるペアをすべて保留しました");
+    expect(root.querySelector(".converged-banner")).toBeNull();
+    root.dispatchEvent(new KeyboardEvent("keydown", { key: "3", bubbles: true }));
+    await settle(controller);
+    expect(api.answer).not.toHaveBeenCalled();
+    await click(root, controller, '[data-action="resume-skipped-comparisons"]');
+    expect(root.querySelectorAll("[data-answer]")).toHaveLength(5);
+    expect(root.textContent).toContain("情報が足りないのでスキップ");
+    await click(root, controller, '[data-answer="a_weak"]');
+    expect(api.answer).toHaveBeenCalledTimes(1);
+    expect(controller.state.active?.comparisonCount).toBe(1);
+  });
+
+  it("disables skipping and preference answers while the next candidate is pending", async () => {
+    const { root, controller, api, pair } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    let finish!: () => void;
+    api.nextPair.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve(pair);
+        }),
+    );
+    button(root, '[data-action="skip-comparison"]').click();
+    expect(button(root, '[data-action="skip-comparison"]').disabled).toBe(true);
+    expect(button(root, '[data-answer="equal"]').disabled).toBe(true);
+    button(root, '[data-action="skip-comparison"]').click();
+    root.dispatchEvent(new KeyboardEvent("keydown", { key: "3", bubbles: true }));
+    expect(api.answer).not.toHaveBeenCalled();
+    expect(api.nextPair).toHaveBeenCalledTimes(2);
+    finish();
+    await settle(controller);
+    expect(button(root, '[data-action="skip-comparison"]').disabled).toBe(false);
+  });
+
   it("explains Keychain access before any credential read on settings and image opening", async () => {
     const { root, controller, api } = setup();
     await controller.initialize();

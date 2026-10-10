@@ -111,6 +111,181 @@ async function comparison() {
   return { initial, saved, api, controller };
 }
 
+async function skippingComparison(itemCount = 3) {
+  const fixture = list();
+  const initial: ListState = {
+    ...fixture,
+    items: Array.from({ length: itemCount }, (_, index) => ({
+      ...fixture.items[0]!,
+      id: 11 + index,
+      name: `項目${index + 1}`,
+    })),
+  };
+  let current = initial;
+  const api = backend(initial);
+  api.resumeList.mockImplementation(async () => current);
+  api.getList.mockImplementation(async () => current);
+  api.nextPair.mockImplementation(async (_id, excluded = []) => {
+    for (const a of current.items) {
+      for (const b of current.items) {
+        if (a.id >= b.id || excluded.some(([x, y]) => x === a.id && y === b.id)) continue;
+        return { listId: current.id, revision: current.revision, a: b, b: a };
+      }
+    }
+    return null;
+  });
+  api.answer.mockImplementation(async () => {
+    current = {
+      ...current,
+      revision: current.revision + 1,
+      comparisonCount: current.comparisonCount + 1,
+    };
+    return current;
+  });
+  const controller = new AppController(api, vi.fn());
+  await controller.initialize();
+  await controller.startComparison();
+  return { initial, api, controller };
+}
+
+describe("skipping comparisons", () => {
+  it("excludes the displayed pair without changing ratings, counts, history or revision", async () => {
+    const { controller, api, initial } = await skippingComparison();
+    const before = structuredClone(controller.state.active);
+    const skipped = controller.state.pair;
+    await controller.skipComparison();
+    expect(api.nextPair).toHaveBeenLastCalledWith(initial.id, [[11, 12]], initial.revision);
+    expect(controller.state.pair).not.toEqual(skipped);
+    expect(controller.state.active).toEqual(before);
+    expect(api.answer).not.toHaveBeenCalled();
+    expect(api.resumeList).toHaveBeenCalledTimes(1);
+    expect(controller.state.comparisonPaused).toBe(false);
+  });
+
+  it.each([3, 5])(
+    "returns a skipped pair after %i items minus one saved answers",
+    async (count) => {
+      const { controller, api } = await skippingComparison(count);
+      const skipped = controller.state.pair;
+      await controller.skipComparison();
+      for (let answer = 1; answer < count - 1; answer += 1) {
+        await controller.answer("equal");
+        expect(api.nextPair.mock.lastCall?.[1]).toEqual([[11, 12]]);
+        expect(controller.state.pair?.a.id).not.toBe(skipped?.a.id);
+      }
+      await controller.answer("equal");
+      expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+      expect(controller.state.pair?.a.id).toBe(skipped?.a.id);
+      expect(controller.state.pair?.b.id).toBe(skipped?.b.id);
+      expect(api.answer).toHaveBeenCalledTimes(count - 1);
+    },
+  );
+
+  it.each([2, 3])(
+    "pauses after all pairs are skipped with %i items and explicitly resumes",
+    async (count) => {
+      const { controller, api, initial } = await skippingComparison(count);
+      const pairs = (count * (count - 1)) / 2;
+      for (let index = 0; index < pairs; index += 1) await controller.skipComparison();
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.view).toBe("compare");
+      expect(controller.state.comparisonPaused).toBe(true);
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.active?.convergence.converged).toBe(false);
+      expect(api.nextPair).toHaveBeenCalledTimes(pairs + 1);
+      await controller.skipComparison();
+      await controller.answer("equal");
+      expect(api.nextPair).toHaveBeenCalledTimes(pairs + 1);
+      expect(api.answer).not.toHaveBeenCalled();
+      // Merely reopening the Compare tab must not lose the cooldown.
+      await controller.navigate("ranking");
+      await controller.navigate("compare");
+      expect(controller.state.comparisonPaused).toBe(true);
+      await controller.resumeSkippedComparisons();
+      expect(controller.state.pair).not.toBeNull();
+      expect(controller.state.comparisonPaused).toBe(false);
+      expect(api.nextPair).toHaveBeenLastCalledWith(initial.id, [], initial.revision);
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it("keeps the proposal and cooldown unchanged on selection failure so skip can be retried", async () => {
+    const { controller, api } = await skippingComparison();
+    const pair = controller.state.pair;
+    api.nextPair.mockRejectedValueOnce(new Error("選択に失敗"));
+    await controller.skipComparison();
+    expect(controller.state.pair).toEqual(pair);
+    expect(controller.state.error).toBe("選択に失敗");
+    await controller.skipComparison();
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([[11, 12]]);
+    expect(controller.state.error).toBe("");
+  });
+
+  it("does not advance a cooldown when an answer fails", async () => {
+    const { controller, api } = await skippingComparison();
+    await controller.skipComparison();
+    api.answer.mockRejectedValueOnce("保存に失敗");
+    await controller.answer("a_weak");
+    await controller.answer("a_weak");
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([[11, 12]]);
+    await controller.answer("a_weak");
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+  });
+
+  it("rejects a stale skip proposal without treating it as exhaustion", async () => {
+    const { controller, api } = await skippingComparison();
+    api.nextPair.mockRejectedValueOnce(
+      "リストが更新されています。最新の比較を読み直してください。",
+    );
+    await controller.skipComparison();
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.comparisonPaused).toBe(false);
+    expect(controller.state.error).toContain("もう一度比較を開始");
+    await controller.startComparison();
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+    expect(controller.state.pair).not.toBeNull();
+  });
+
+  it("gates duplicate skips, answers and modal operations while selecting a pair", async () => {
+    const { controller, api } = await skippingComparison();
+    const next = controller.state.pair!;
+    let finish!: () => void;
+    api.nextPair.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve(next);
+        }),
+    );
+    const pending = controller.skipComparison();
+    await controller.skipComparison();
+    await controller.answer("equal");
+    await controller.resumeSkippedComparisons();
+    expect(api.nextPair).toHaveBeenCalledTimes(2);
+    expect(api.answer).not.toHaveBeenCalled();
+    finish();
+    await pending;
+    await controller.openModal({ kind: "rename-list" });
+    await controller.skipComparison();
+    expect(api.nextPair).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears held pairs on comparison reset and list switch", async () => {
+    const { controller, api, initial } = await skippingComparison();
+    await controller.skipComparison();
+    await controller.openModal({ kind: "reset-comparisons" });
+    await controller.resetComparisons();
+    await controller.startComparison();
+    expect(api.nextPair).toHaveBeenLastCalledWith(initial.id, [], initial.revision);
+    await controller.skipComparison();
+    api.getList.mockResolvedValueOnce(list(2));
+    await controller.selectList(2);
+    await controller.selectList(initial.id);
+    await controller.startComparison();
+    expect(api.nextPair).toHaveBeenLastCalledWith(initial.id, [], initial.revision);
+  });
+});
+
 async function listSelection(context: "startup" | "after deletion") {
   const api = backend();
   const controller = new AppController(api, vi.fn());

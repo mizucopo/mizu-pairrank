@@ -381,7 +381,7 @@ async fn resume_list(app: AppHandle, list_id: i64) -> Result<ListState, String> 
     database_job(app, move |db| db.resume_list(list_id)).await
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PairProposal {
     list_id: i64,
@@ -391,38 +391,64 @@ struct PairProposal {
 }
 
 #[tauri::command]
-async fn next_pair(app: AppHandle, list_id: i64) -> Result<Option<PairProposal>, String> {
+async fn next_pair(
+    app: AppHandle,
+    list_id: i64,
+    excluded_pairs: Option<Vec<[i64; 2]>>,
+    expected_revision: Option<u64>,
+) -> Result<Option<PairProposal>, String> {
     database_job(app, move |db| {
-        let comparison = db.comparison_state(list_id)?;
-        let list = comparison.list;
-        let ratings = list
-            .items
-            .iter()
-            .map(|item| (item.id, item.rating))
-            .collect::<Vec<_>>();
-        let Some((mut a_id, mut b_id)) = rating::select_pair(&ratings, &comparison.pair_counts)?
-        else {
-            return Ok(None);
-        };
-        if rand::random::<bool>() {
-            std::mem::swap(&mut a_id, &mut b_id);
-        }
-        let find = |id| {
-            list.items
-                .iter()
-                .find(|item| item.id == id)
-                .cloned()
-                .ok_or_else(|| "比較項目が見つかりません。".to_string())
-        };
-        Ok(Some(PairProposal {
-            list_id,
-            revision: list.revision,
-            a: find(a_id)?,
-            b: find(b_id)?,
-        }))
+        propose_pair(
+            db.comparison_state(list_id)?,
+            excluded_pairs.as_deref().unwrap_or_default(),
+            expected_revision,
+        )
     })
     .await
 }
+
+fn propose_pair(
+    comparison: database::ComparisonState,
+    excluded_pairs: &[[i64; 2]],
+    expected_revision: Option<u64>,
+) -> Result<Option<PairProposal>, String> {
+    let list = comparison.list;
+    // A missing candidate must still come from the revision the caller expects.
+    if expected_revision.is_some_and(|revision| revision != list.revision) {
+        return Err("リストが更新されています。最新の比較を読み直してください。".to_owned());
+    }
+    let excluded_pairs = excluded_pairs
+        .iter()
+        .map(|&[a, b]| (a.min(b), a.max(b)))
+        .collect();
+    let ratings = list
+        .items
+        .iter()
+        .map(|item| (item.id, item.rating))
+        .collect::<Vec<_>>();
+    let Some((mut a_id, mut b_id)) =
+        rating::select_pair(&ratings, &comparison.pair_counts, &excluded_pairs)?
+    else {
+        return Ok(None);
+    };
+    if rand::random::<bool>() {
+        std::mem::swap(&mut a_id, &mut b_id);
+    }
+    let find = |id| {
+        list.items
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .ok_or_else(|| "比較項目が見つかりません。".to_string())
+    };
+    Ok(Some(PairProposal {
+        list_id: list.id,
+        revision: list.revision,
+        a: find(a_id)?,
+        b: find(b_id)?,
+    }))
+}
+
 #[tauri::command]
 async fn answer(
     app: AppHandle,
@@ -605,6 +631,154 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn pair_proposals_normalize_exclusions_without_changing_saved_comparisons() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.sqlite3");
+        let mut database = Database::open(&path).unwrap();
+        let list = database.create_list("Deferred comparisons".into()).unwrap();
+        let list = database
+            .add_items(
+                list.id,
+                vec!["First".into(), "Second".into(), "Third".into()],
+            )
+            .unwrap();
+        let before = database
+            .answer(
+                list.id,
+                list.items[0].id,
+                list.items[1].id,
+                Preference::AWeak,
+                list.revision,
+            )
+            .unwrap();
+        let read_history = || {
+            let connection = database::test_connection(&path).unwrap();
+            let comparisons = connection
+                .prepare("SELECT id, a_id, b_id, preference FROM comparisons ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let snapshots = connection
+                .prepare("SELECT id, ranking FROM rank_snapshots ORDER BY id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (comparisons, snapshots)
+        };
+        let history = read_history();
+        let counts = database.comparison_state(before.id).unwrap().pair_counts;
+        let first = propose_pair(database.comparison_state(before.id).unwrap(), &[], None)
+            .unwrap()
+            .unwrap();
+        let ids = (first.a.id.min(first.b.id), first.a.id.max(first.b.id));
+        let exclusions = [[ids.1, ids.0], [ids.0, ids.1]];
+        let next = propose_pair(
+            database.comparison_state(before.id).unwrap(),
+            &exclusions,
+            Some(before.revision),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.list_id, before.id);
+        assert_eq!(next.revision, before.revision);
+        assert_ne!((next.a.id.min(next.b.id), next.a.id.max(next.b.id)), ids);
+
+        let all_pairs = before
+            .items
+            .iter()
+            .enumerate()
+            .flat_map(|(index, a)| before.items[index + 1..].iter().map(move |b| [a.id, b.id]))
+            .collect::<Vec<_>>();
+        assert!(
+            propose_pair(
+                database.comparison_state(before.id).unwrap(),
+                &all_pairs,
+                Some(before.revision),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let retried = propose_pair(
+            database.comparison_state(before.id).unwrap(),
+            &[],
+            Some(before.revision),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                retried.a.id.min(retried.b.id),
+                retried.a.id.max(retried.b.id)
+            ),
+            ids
+        );
+        assert_eq!(
+            serde_json::to_value(database.get_list(before.id).unwrap()).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            database.comparison_state(before.id).unwrap().pair_counts,
+            counts
+        );
+        assert_eq!(read_history(), history);
+    }
+
+    #[test]
+    fn pair_proposals_reject_stale_revisions_even_when_every_pair_is_excluded() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut database = Database::open(&directory.path().join("test.sqlite3")).unwrap();
+        let list = database.create_list("Before update".into()).unwrap();
+        let list = database
+            .add_items(list.id, vec!["First".into(), "Second".into()])
+            .unwrap();
+        let exclusions = [[list.items[1].id, list.items[0].id]];
+        let updated = database
+            .rename_list(list.id, "After update".into())
+            .unwrap();
+        let error = propose_pair(
+            database.comparison_state(list.id).unwrap(),
+            &exclusions,
+            Some(list.revision),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "リストが更新されています。最新の比較を読み直してください。"
+        );
+        assert!(
+            propose_pair(
+                database.comparison_state(list.id).unwrap(),
+                &exclusions,
+                Some(updated.revision),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            propose_pair(
+                database.comparison_state(list.id).unwrap(),
+                &exclusions,
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn portable_lists_round_trip_images_without_private_data() {

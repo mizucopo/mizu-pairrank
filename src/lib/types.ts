@@ -37,6 +37,7 @@ export type ListState = {
   convergence: Convergence;
 };
 export type PairProposal = { listId: number; revision: number; a: Item; b: Item };
+export type ItemPair = [number, number];
 export type ImageCandidate = {
   id: string;
   title: string;
@@ -72,7 +73,11 @@ export type AppApi = {
   ) => Promise<ListState>;
   resumeList: (listId: number) => Promise<ListState>;
   resetComparisons: (listId: number) => Promise<ListState>;
-  nextPair: (listId: number) => Promise<PairProposal | null>;
+  nextPair: (
+    listId: number,
+    excludedPairs?: ItemPair[],
+    expectedRevision?: number,
+  ) => Promise<PairProposal | null>;
   answer: (pair: PairProposal, preference: Preference) => Promise<ListState>;
   searchSettings: () => Promise<SearchSettings>;
   setApiKey: (provider: SearchProvider, key: string) => Promise<void>;

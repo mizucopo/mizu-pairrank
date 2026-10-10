@@ -606,6 +606,12 @@ small,
   margin: 12px 0 20px;
   min-height: 1.6em;
 }
+.comparison-skip {
+  text-align: center;
+}
+.comparison-skip p {
+  margin: 8px 0 0;
+}
 .progress-details {
   border-top: 1px solid var(--line);
   padding-top: 13px;

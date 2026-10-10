@@ -85,6 +85,8 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
 }
 function comparisonView(s: AppState, assetUrl: (path: string) => string): string {
   const pair = s.pair;
+  if (!pair && s.comparisonPaused && !s.busy)
+    return `<div class="empty"><div class="empty-symbol">⇄</div><h2>比較できるペアをすべて保留しました</h2><p>情報を確認できたら、保留を解除してもう一度比較できます。<br />スキップは評価や比較回数に含まれません。</p><button data-action="resume-skipped-comparisons">保留した比較を再開</button></div>${progress(s)}`;
   if (!pair)
     return `<div class="empty"><div class="empty-symbol">⇄</div><h2>${s.busy ? "次の比較を選んでいます" : "比較を再開できます"}</h2><p>順位を知る手がかりになるペアを選びます。</p>${s.busy ? '<span class="spinner" aria-hidden="true"></span>' : '<button data-view="compare">次のペアを表示</button>'}</div>`;
   return `<section class="comparison"><div class="comparison-heading"><p class="eyebrow">FOLLOW YOUR PREFERENCE</p><h2>どちらが好きですか？</h2><p class="muted">「大好き」は、相手よりかなり好き。「好き」は、少し好き。</p></div><div class="pair-cards">${(
@@ -99,7 +101,7 @@ function comparisonView(s: AppState, assetUrl: (path: string) => string): string
     )
     .join(
       "",
-    )}<span class="versus" aria-hidden="true">or</span></div><div class="answers" role="group" aria-label="比較への回答">${answers.map((answer) => `<button class="answer ${answer.value}" data-answer="${answer.value}"${disabled(s)}>${answer.label}<kbd>${answer.key}</kbd></button>`).join("")}</div><p class="comparison-note">${s.busy ? "回答を保存して、次の比較を選んでいます…" : "直感で選んで大丈夫。キーボードの1〜5でも回答できます。"}</p></section>${progress(s)}`;
+    )}<span class="versus" aria-hidden="true">or</span></div><div class="answers" role="group" aria-label="比較への回答">${answers.map((answer) => `<button class="answer ${answer.value}" data-answer="${answer.value}"${disabled(s)}>${answer.label}<kbd>${answer.key}</kbd></button>`).join("")}</div><p class="comparison-note">${s.busy ? "次の比較を選んでいます…" : "直感で選んで大丈夫。キーボードの1〜5でも回答できます。"}</p><div class="comparison-skip"><button class="secondary" data-action="skip-comparison"${disabled(s)}>情報が足りないのでスキップ</button><p class="muted small">評価せずに保留します。他の比較に${Math.max(1, (s.active?.items.length ?? 2) - 1)}回答すると再び候補になります。</p></div></section>${progress(s)}`;
 }
 function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;

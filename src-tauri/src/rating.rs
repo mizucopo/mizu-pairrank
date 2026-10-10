@@ -158,10 +158,12 @@ fn information_gain(a: Rating, b: Rating) -> Result<f64, String> {
     }
 }
 
-/// Scan all unordered pairs without a fixed item cap or candidate sampling.
+/// Scan all eligible unordered pairs without a fixed item cap or candidate sampling.
+/// Exclusions use canonical (min_id, max_id) keys and never alter ratings or counts.
 pub fn select_pair(
     items: &[(i64, Rating)],
     counts: &HashMap<(i64, i64), u64>,
+    excluded_pairs: &HashSet<(i64, i64)>,
 ) -> Result<Option<(i64, i64)>, String> {
     let mut ids = HashSet::with_capacity(items.len());
     for &(id, rating) in items {
@@ -173,6 +175,9 @@ pub fn select_pair(
     for (index, &(id_a, a)) in items.iter().enumerate() {
         for &(id_b, b) in &items[index + 1..] {
             let pair = (id_a.min(id_b), id_a.max(id_b));
+            if excluded_pairs.contains(&pair) {
+                continue;
+            }
             let count = counts.get(&pair).copied().unwrap_or(0);
             let information = information_gain(a, b)?;
             let replace = best.is_none_or(|(best_information, best_count, best_pair)| {
@@ -591,7 +596,7 @@ mod tests {
             },
         ] {
             assert!(update_pair(invalid, Rating::default(), Preference::Equal).is_err());
-            assert!(select_pair(&[(1, invalid)], &HashMap::new()).is_err());
+            assert!(select_pair(&[(1, invalid)], &HashMap::new(), &HashSet::new()).is_err());
         }
     }
 
@@ -630,12 +635,73 @@ mod tests {
             (1, Rating::default()),
             (2, Rating::default()),
         ];
-        assert_eq!(select_pair(&items, &HashMap::new()).unwrap(), Some((1, 2)));
+        assert_eq!(
+            select_pair(&items, &HashMap::new(), &HashSet::new()).unwrap(),
+            Some((1, 2))
+        );
         let counts = HashMap::from([((1, 2), 1), ((1, 3), 1)]);
-        assert_eq!(select_pair(&items, &counts).unwrap(), Some((2, 3)));
-        assert_eq!(select_pair(&[], &counts).unwrap(), None);
-        assert_eq!(select_pair(&items[..1], &counts).unwrap(), None);
-        assert!(select_pair(&[(1, Rating::default()), (1, Rating::default())], &counts).is_err());
+        assert_eq!(
+            select_pair(&items, &counts, &HashSet::new()).unwrap(),
+            Some((2, 3))
+        );
+        assert_eq!(select_pair(&[], &counts, &HashSet::new()).unwrap(), None);
+        assert_eq!(
+            select_pair(&items[..1], &counts, &HashSet::new()).unwrap(),
+            None
+        );
+        assert!(
+            select_pair(
+                &[(1, Rating::default()), (1, Rating::default())],
+                &counts,
+                &HashSet::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pair_selection_defers_only_excluded_pairs_and_preserves_remaining_ties() {
+        let items = [
+            (3, Rating::default()),
+            (1, Rating::default()),
+            (2, Rating::default()),
+        ];
+        let excluded = HashSet::from([(1, 2)]);
+        assert_eq!(
+            select_pair(&items, &HashMap::new(), &excluded).unwrap(),
+            Some((1, 3))
+        );
+        let counts = HashMap::from([((1, 3), 1)]);
+        assert_eq!(
+            select_pair(&items, &counts, &excluded).unwrap(),
+            Some((2, 3))
+        );
+        assert_eq!(
+            select_pair(&items, &counts, &HashSet::new()).unwrap(),
+            Some((1, 2))
+        );
+    }
+
+    #[test]
+    fn pair_selection_returns_none_after_all_pairs_are_excluded() {
+        let items = [
+            (1, Rating::default()),
+            (2, Rating::default()),
+            (3, Rating::default()),
+        ];
+        let excluded = HashSet::from([(1, 2), (1, 3), (2, 3)]);
+        assert_eq!(
+            select_pair(&items, &HashMap::new(), &excluded).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_pair(&items[..2], &HashMap::new(), &excluded).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_pair(&items, &HashMap::new(), &HashSet::new()).unwrap(),
+            Some((1, 2))
+        );
     }
 
     #[test]
@@ -645,7 +711,10 @@ mod tests {
             sigma: 1.0,
         };
         let items = [(1, settled), (2, settled), (3, Rating::default())];
-        assert_eq!(select_pair(&items, &HashMap::new()).unwrap(), Some((1, 3)));
+        assert_eq!(
+            select_pair(&items, &HashMap::new(), &HashSet::new()).unwrap(),
+            Some((1, 3))
+        );
         assert!(
             information_gain(settled, Rating::default()).unwrap()
                 > information_gain(settled, settled).unwrap()
@@ -706,7 +775,7 @@ mod tests {
             })
             .collect();
         let started = std::time::Instant::now();
-        let pair = select_pair(&items, &HashMap::new()).unwrap();
+        let pair = select_pair(&items, &HashMap::new(), &HashSet::new()).unwrap();
         eprintln!(
             "500 items / 124750 pairs: {:?}, selected {pair:?}",
             started.elapsed()
