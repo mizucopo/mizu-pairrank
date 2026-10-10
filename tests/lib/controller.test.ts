@@ -78,6 +78,7 @@ function backend(first = list(), second = list(2)) {
     deleteTag: vi.fn<AppApi["deleteTag"]>().mockResolvedValue(first),
     setItemTag: vi.fn<AppApi["setItemTag"]>().mockResolvedValue(first),
     resumeList: vi.fn<AppApi["resumeList"]>().mockResolvedValue(first),
+    resetComparisons: vi.fn<AppApi["resetComparisons"]>().mockResolvedValue(first),
     nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(proposal(first)),
     answer: vi.fn<AppApi["answer"]>().mockResolvedValue(first),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
@@ -121,6 +122,103 @@ async function listSelection(context: "startup" | "after deletion") {
   const load = () => (context === "startup" ? controller.initialize() : controller.confirmDelete());
   return { api, controller, load };
 }
+
+describe("comparison reset", () => {
+  it("requires confirmation and preserves the current comparison on cancellation", async () => {
+    const { controller, api } = await comparison();
+    const before = controller.state.active;
+    const pair = controller.state.pair;
+    await controller.resetComparisons();
+    expect(api.resetComparisons).not.toHaveBeenCalled();
+    await controller.openModal({ kind: "reset-comparisons" });
+    controller.closeModal();
+    expect(api.resetComparisons).not.toHaveBeenCalled();
+    expect(controller.state.active).toBe(before);
+    expect(controller.state.pair).toBe(pair);
+    expect(controller.state.view).toBe("compare");
+  });
+
+  it("accepts the reset state, clears the old pair and summary, and compares again", async () => {
+    const { controller, api, saved, initial } = await comparison();
+    const tag = { id: 1, listId: initial.id, name: "お気に入り" };
+    const reset = { ...initial, revision: saved.revision + 1, tags: [tag] };
+    controller.state.active = { ...saved, tags: [tag] };
+    controller.selectTag(tag.id);
+    api.resetComparisons.mockResolvedValue(reset);
+    // A reset response is sufficient even if a subsequent sidebar read would fail.
+    api.listSummaries.mockRejectedValueOnce("一覧を取得できません。");
+    await controller.openModal({ kind: "reset-comparisons" });
+    await controller.resetComparisons();
+    expect(api.resetComparisons).toHaveBeenCalledExactlyOnceWith(initial.id);
+    expect(controller.state.active).toEqual(reset);
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.view).toBe("ranking");
+    expect(controller.state.selectedTagId).toBe(tag.id);
+    expect(controller.state.lists.find((entry) => entry.id === initial.id)).toEqual(summary(reset));
+    expect(controller.state.notice).toContain("比較をリセットしました");
+    expect(controller.state.error).toBe("");
+    api.listSummaries.mockReset().mockResolvedValue([summary(reset)]);
+    api.resumeList.mockResolvedValue(reset);
+    api.nextPair.mockResolvedValue(proposal(reset));
+    await controller.startComparison();
+    expect(controller.state.pair?.revision).toBe(reset.revision);
+    expect(controller.state.view).toBe("compare");
+  });
+
+  it("retains the warning and saved state after an error so the user can retry", async () => {
+    const { controller, api } = await comparison();
+    const before = controller.state.active;
+    const pair = controller.state.pair;
+    api.resetComparisons.mockRejectedValueOnce("保存に失敗しました。");
+    await controller.openModal({ kind: "reset-comparisons" });
+    await controller.resetComparisons();
+    expect(controller.state.error).toBe("保存に失敗しました。");
+    expect(controller.state.modal?.kind).toBe("reset-comparisons");
+    expect(controller.state.active).toBe(before);
+    expect(controller.state.pair).toBe(pair);
+    expect(controller.state.notice).toBe("");
+    await controller.resetComparisons();
+    expect(api.resetComparisons).toHaveBeenCalledTimes(2);
+    expect(controller.state.modal).toBeNull();
+  });
+
+  it("blocks repeat writes, dismissal and navigation while a reset is pending", async () => {
+    const { controller, api } = await comparison();
+    let finish: ((value: ListState) => void) | undefined;
+    api.resetComparisons.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await controller.openModal({ kind: "reset-comparisons" });
+    const pending = controller.resetComparisons();
+    await controller.resetComparisons();
+    controller.closeModal();
+    await controller.navigate("items");
+    expect(controller.state.modal?.kind).toBe("reset-comparisons");
+    expect(controller.state.view).toBe("compare");
+    expect(api.resetComparisons).toHaveBeenCalledTimes(1);
+    if (!finish || !controller.state.active) throw new Error("Missing pending reset");
+    finish(controller.state.active);
+    await pending;
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it("recovers when another instance deleted the selected list", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    api.resetComparisons.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    await controller.openModal({ kind: "reset-comparisons" });
+    await controller.resetComparisons();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.error).toBe("リストが見つかりません。");
+  });
+});
 
 describe("portable list transfer", () => {
   it("requires an export modal and defaults images off whenever it opens", async () => {

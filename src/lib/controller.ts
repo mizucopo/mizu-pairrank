@@ -15,6 +15,7 @@ export type Modal =
   | { kind: "create-list" }
   | { kind: "rename-list" }
   | { kind: "delete-list" }
+  | { kind: "reset-comparisons" }
   | { kind: "export-list" }
   | { kind: "import-list" }
   | { kind: "rename-item"; itemId: number }
@@ -706,6 +707,20 @@ export class AppController {
       this.state.drafts.items = "";
       await this.acceptList(result);
       this.state.notice = `${names.length}件の項目を追加しました。`;
+    });
+  }
+
+  async resetComparisons(): Promise<void> {
+    const list = this.state.active;
+    if (!list || this.state.modal?.kind !== "reset-comparisons") return;
+    await this.perform(async () => {
+      const reset = await this.api
+        .resetComparisons(list.id)
+        .catch((error: unknown) => this.handleListError(list.id, error));
+      this.acceptCommittedList(reset);
+      this.state.modal = null;
+      this.state.view = "ranking";
+      this.state.notice = "比較をリセットしました。「比較する」からやり直せます。";
     });
   }
 

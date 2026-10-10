@@ -373,6 +373,10 @@ async fn set_item_tag(
     .await
 }
 #[tauri::command]
+async fn reset_comparisons(app: AppHandle, list_id: i64) -> Result<ListState, String> {
+    database_job(app, move |db| db.reset_comparisons(list_id)).await
+}
+#[tauri::command]
 async fn resume_list(app: AppHandle, list_id: i64) -> Result<ListState, String> {
     database_job(app, move |db| db.resume_list(list_id)).await
 }
@@ -581,6 +585,7 @@ pub fn run() {
             rename_tag,
             delete_tag,
             set_item_tag,
+            reset_comparisons,
             resume_list,
             next_pair,
             answer,
@@ -1113,6 +1118,52 @@ mod tests {
             .image_response(&image_request(&image.path, "GET"));
         assert_eq!(response.status(), tauri::http::StatusCode::OK);
         assert_eq!(response.body(), &image_contents);
+    }
+
+    #[tokio::test]
+    async fn reset_comparisons_keeps_managed_images_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let documents = root.path().join("Documents");
+        std::fs::create_dir(&documents).unwrap();
+        let first = Backend::open_in_documents(Ok(documents.clone()));
+        let (list_id, item_id, image) = list_with_image(&first).await;
+        let contents =
+            std::fs::read(documents.join("mizu-pairrank/images").join(&image.path)).unwrap();
+        let reset = first
+            .database_job(move |db| {
+                let list = db.get_list(list_id)?;
+                db.answer(
+                    list_id,
+                    list.items[0].id,
+                    list.items[1].id,
+                    Preference::AStrong,
+                    list.revision,
+                )?;
+                db.reset_comparisons(list_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reset.comparison_count, 0);
+        assert_eq!(reset.items[0].id, item_id);
+        assert_eq!(reset.items[0].image.as_ref().unwrap().path, image.path);
+        drop(first);
+
+        let reopened = Backend::open_in_documents(Ok(documents));
+        let loaded = reopened
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded).unwrap(),
+            serde_json::to_value(reset).unwrap()
+        );
+        let response = reopened
+            .images
+            .as_ref()
+            .unwrap()
+            .image_response(&image_request(&image.path, "GET"));
+        assert_eq!(response.status(), tauri::http::StatusCode::OK);
+        assert_eq!(response.body(), &contents);
     }
 
     #[tokio::test]
