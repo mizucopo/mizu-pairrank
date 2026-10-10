@@ -718,10 +718,6 @@ progress {
   width: 48px;
   height: 48px;
 }
-.tier-rank {
-  color: var(--ink);
-  font-size: 0.65rem;
-}
 .tier-name {
   font-size: 0.76rem;
   line-height: 1.4;
