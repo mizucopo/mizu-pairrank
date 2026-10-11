@@ -688,13 +688,27 @@ progress {
   display: grid;
   place-items: center;
   margin: 0;
-  background: #eaf0e4;
-  color: var(--accent);
   font-size: 1.25rem;
 }
-.tier-row:first-child .tier-label {
+#tier-S {
   background: #f5ebd8;
   color: #8d682e;
+}
+#tier-A {
+  background: #f7e1d6;
+  color: #9b4b2c;
+}
+#tier-B {
+  background: #e4efdb;
+  color: #496c32;
+}
+#tier-C {
+  background: #dcecf4;
+  color: #2b617a;
+}
+#tier-D {
+  background: #e9e2f4;
+  color: #68508a;
 }
 .tier-items {
   display: flex;
