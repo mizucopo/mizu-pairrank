@@ -295,8 +295,10 @@ async fn report_images(
 }
 
 #[tauri::command]
-async fn save_report(app: AppHandle, format: ReportFormat, bytes: Vec<u8>) -> Result<bool, String> {
-    report::validate_payload(format, &bytes)?;
+async fn save_report(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<bool, String> {
+    let (format, bytes) = report::read_request(request.body(), request.headers())?;
+    // Request borrows the IPC body; copy only validated bytes for the native worker.
+    let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
         let extension = format.extension();
         let label = match format {

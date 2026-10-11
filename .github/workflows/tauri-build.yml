@@ -405,8 +405,7 @@ jobs:
             $applications[0].FullName,
             "src/assets/NotoSansJP-OFL.txt",
             "src/assets/NotoEmoji-OFL.txt",
-            "src/assets/pdfmake-LICENSE.txt",
-            "src/assets/unicode-segmenter-LICENSE.txt"
+            "src/assets/THIRD_PARTY_NOTICES.txt"
           )
           foreach ($path in $distributionFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing Windows distribution file: $path" }
@@ -435,6 +434,13 @@ jobs:
             echo "::error::Expected exactly one macOS application in $bundle_dir."
             exit 1
           fi
+          for license in NotoSansJP-OFL.txt NotoEmoji-OFL.txt THIRD_PARTY_NOTICES.txt; do
+            resource="${applications[0]}/Contents/Resources/licenses/$license"
+            if [ ! -f "$resource" ] || ! cmp -s "src/assets/$license" "$resource"; then
+              echo "::error::Missing or different macOS license resource: $resource"
+              exit 1
+            fi
+          done
           artifact_dir="$RUNNER_TEMP/tauri-artifacts"
           mkdir -p "$artifact_dir"
           ditto -c -k --keepParent "${applications[0]}" \

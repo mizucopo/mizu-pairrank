@@ -107,7 +107,8 @@ function savedReportDocument(api: ReturnType<typeof setup>["api"], index = 0): D
   const call = api.saveReport.mock.calls[index];
   if (!call) throw new Error("No report was saved");
   expect(call[0]).toBe("html");
-  const html = new TextDecoder().decode(Uint8Array.from(call[1]));
+  expect(call[1]).toBeInstanceOf(Uint8Array);
+  const html = new TextDecoder().decode(call[1]);
   return new DOMParser().parseFromString(html, "text/html");
 }
 

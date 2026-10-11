@@ -10,7 +10,8 @@ export const api: AppApi = {
   exportList: (listId, includeImages) => invoke("export_list", { listId, includeImages }),
   reportImages: (listId, expectedRevision, itemIds) =>
     invoke("report_images", { listId, expectedRevision, itemIds }),
-  saveReport: (format, bytes) => invoke("save_report", { format, bytes }),
+  saveReport: (format, bytes) =>
+    invoke("save_report", bytes, { headers: { "x-pairrank-report-format": format } }),
   importList: () => invoke("import_list"),
   renameList: (listId, name) => invoke("rename_list", { listId, name }),
   deleteList: (listId) => invoke("delete_list", { listId }),

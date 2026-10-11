@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { AppController } from "../../src/lib/controller.js";
+import * as report from "../../src/lib/report.js";
 import type {
   AppApi,
   ImageCandidate,
@@ -102,7 +103,8 @@ function savedReportHtml(api: ReturnType<typeof backend>, index = 0): string {
   const call = api.saveReport.mock.calls[index];
   if (!call) throw new Error("No report was saved");
   expect(call[0]).toBe("html");
-  return new TextDecoder().decode(Uint8Array.from(call[1]));
+  expect(call[1]).toBeInstanceOf(Uint8Array);
+  return new TextDecoder().decode(call[1]);
 }
 
 async function comparison() {
@@ -521,6 +523,54 @@ describe("comparison reset", () => {
 });
 
 describe("ranking and tier reports", () => {
+  it("keeps rendered PDF bytes unchanged when handing them to the API", async () => {
+    const bytes = new Uint8Array([37, 80, 68, 70, 45]);
+    const render = vi.spyOn(report, "reportPdf").mockResolvedValueOnce(bytes);
+    try {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate("ranking");
+      await controller.openModal({ kind: "export-report", view: "ranking" });
+
+      await controller.exportReport();
+
+      expect(api.saveReport).toHaveBeenCalledOnce();
+      expect(api.saveReport.mock.calls[0]?.[1]).toBe(bytes);
+    } finally {
+      render.mockRestore();
+    }
+  });
+
+  it.each([50 * 1024 * 1024, 50 * 1024 * 1024 + 1])(
+    "checks the %i-byte report size before handing typed bytes to the API",
+    async (size) => {
+      const bytes = new Uint8Array(size);
+      const render = vi.spyOn(report, "reportPdf").mockResolvedValueOnce(bytes);
+      try {
+        const api = backend();
+        const controller = new AppController(api, vi.fn());
+        await controller.initialize();
+        await controller.navigate("ranking");
+        await controller.openModal({ kind: "export-report", view: "ranking" });
+
+        await controller.exportReport();
+
+        if (size === 50 * 1024 * 1024) {
+          expect(api.saveReport).toHaveBeenCalledOnce();
+          expect(api.saveReport.mock.calls[0]?.[1] === bytes).toBe(true);
+          expect(controller.state.modal).toBeNull();
+        } else {
+          expect(api.saveReport).not.toHaveBeenCalled();
+          expect(controller.state.error).toContain("50 MiB");
+          expect(controller.state.modal?.kind).toBe("export-report");
+        }
+      } finally {
+        render.mockRestore();
+      }
+    },
+  );
+
   it("requires an active report view and modal, and resets format and image opt-in on reopen", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());

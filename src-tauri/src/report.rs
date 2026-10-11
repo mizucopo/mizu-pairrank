@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use tauri::http::HeaderMap;
+use tauri::ipc::InvokeBody;
 
 use crate::database::Database;
 use crate::images::ImageService;
@@ -12,12 +13,34 @@ use crate::models::ImageAsset;
 const MAX_IMAGES: usize = 500;
 const MAX_TOTAL_IMAGE_PIXELS: u64 = 100_000_000;
 const DATA_URL_PREFIX: &str = "data:image/png;base64,";
+const FORMAT_HEADER: &str = "x-pairrank-report-format";
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportFormat {
     Html,
     Pdf,
+}
+
+pub fn read_request<'a>(
+    body: &'a InvokeBody,
+    headers: &HeaderMap,
+) -> Result<(ReportFormat, &'a [u8]), String> {
+    let InvokeBody::Raw(bytes) = body else {
+        return Err("レポートはバイナリデータで送信してください。再試行してください。".to_owned());
+    };
+    let format = match headers
+        .get(FORMAT_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("html") => ReportFormat::Html,
+        Some("pdf") => ReportFormat::Pdf,
+        _ => return Err("レポート形式の指定が正しくありません。再試行してください。".to_owned()),
+    };
+    if headers.get_all(FORMAT_HEADER).iter().count() != 1 {
+        return Err("レポート形式の指定が正しくありません。再試行してください。".to_owned());
+    }
+    validate_payload(format, bytes)?;
+    Ok((format, bytes))
 }
 
 impl ReportFormat {
@@ -177,6 +200,84 @@ mod tests {
     use crate::models::ListState;
     use crate::rating::Preference;
     use std::io::Cursor;
+
+    fn request_headers(format: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(FORMAT_HEADER, format.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn report_requests_accept_only_raw_bytes_with_explicit_format_metadata() {
+        for (format, document) in [
+            (
+                ReportFormat::Html,
+                "<!doctype html><html>日本語</html>".as_bytes(),
+            ),
+            (
+                ReportFormat::Pdf,
+                b"%PDF-1.7\n\xff\0binary\n%%EOF\n".as_slice(),
+            ),
+        ] {
+            let body = InvokeBody::Raw(document.to_vec());
+            let InvokeBody::Raw(original) = &body else {
+                unreachable!()
+            };
+            let (received_format, bytes) =
+                read_request(&body, &request_headers(format.extension())).unwrap();
+            assert_eq!(received_format, format);
+            assert_eq!(bytes, document);
+            assert_eq!(bytes.as_ptr(), original.as_ptr());
+        }
+
+        let mut headers = request_headers("pdf");
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        for body in [
+            InvokeBody::Json(serde_json::json!({"format":"pdf","bytes":[37,80,68,70,45]})),
+            InvokeBody::Json(serde_json::json!([37, 80, 68, 70, 45])),
+        ] {
+            assert!(
+                read_request(&body, &headers)
+                    .unwrap_err()
+                    .contains("バイナリ")
+            );
+        }
+    }
+
+    #[test]
+    fn report_requests_reject_missing_unsupported_and_ambiguous_format_headers() {
+        let body = InvokeBody::Raw(b"%PDF-1.7\n%%EOF".to_vec());
+        assert!(read_request(&body, &HeaderMap::new()).is_err());
+        let mut content_type_only = HeaderMap::new();
+        content_type_only.insert("content-type", "application/pdf".parse().unwrap());
+        assert!(read_request(&body, &content_type_only).is_err());
+        for format in ["", "zip", "PDF", "application/pdf", "pdf,html", " pdf"] {
+            assert!(read_request(&body, &request_headers(format)).is_err());
+        }
+        let mut headers = request_headers("pdf");
+        headers.append(FORMAT_HEADER, "html".parse().unwrap());
+        assert!(read_request(&body, &headers).is_err());
+        headers.insert(
+            FORMAT_HEADER,
+            tauri::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(read_request(&body, &headers).is_err());
+    }
+
+    #[test]
+    fn report_requests_validate_utf8_and_document_magic_before_save() {
+        for document in [
+            b"<!doctype html>\xff".as_slice(),
+            b"%PDF-1.7",
+            b"PK ZIP archive",
+            b"",
+        ] {
+            let body = InvokeBody::Raw(document.to_vec());
+            assert!(read_request(&body, &request_headers("html")).is_err());
+        }
+        let html = InvokeBody::Raw(b"<!doctype html><html></html>".to_vec());
+        assert!(read_request(&html, &request_headers("pdf")).is_err());
+    }
 
     fn fixture() -> (tempfile::TempDir, Database, ImageService, ListState) {
         let directory = tempfile::tempdir().unwrap();
@@ -377,9 +478,6 @@ mod tests {
 
     #[test]
     fn report_payloads_validate_format_encoding_and_size_before_save() {
-        assert!(serde_json::from_str::<ReportFormat>("\"html\"").is_ok());
-        assert!(serde_json::from_str::<ReportFormat>("\"pdf\"").is_ok());
-        assert!(serde_json::from_str::<ReportFormat>("\"zip\"").is_err());
         assert!(validate_payload(ReportFormat::Html, b" \n<!DOCTYPE HTML><html></html>").is_ok());
         assert!(validate_payload(ReportFormat::Html, b"<html lang=\"ja\"></html>").is_ok());
         for bytes in [
@@ -395,17 +493,24 @@ mod tests {
         assert!(validate_payload(ReportFormat::Pdf, b"<!doctype html>").is_err());
         let mut maximum = vec![b' '; crate::transfer::MAX_FILE_BYTES];
         maximum[..5].copy_from_slice(b"%PDF-");
-        assert!(validate_payload(ReportFormat::Pdf, &maximum).is_ok());
+        let mut body = InvokeBody::Raw(maximum);
+        assert!(read_request(&body, &request_headers("pdf")).is_ok());
+        let InvokeBody::Raw(maximum) = &mut body else {
+            unreachable!()
+        };
         maximum.push(b' ');
         assert!(
-            validate_payload(ReportFormat::Pdf, &maximum)
+            read_request(&body, &request_headers("pdf"))
                 .unwrap_err()
                 .contains("50MiB")
         );
+        let InvokeBody::Raw(maximum) = &body else {
+            unreachable!()
+        };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ranking.pdf");
         std::fs::write(&path, b"existing document").unwrap();
-        assert!(write(&path, ReportFormat::Pdf, &maximum).is_err());
+        assert!(write(&path, ReportFormat::Pdf, maximum).is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"existing document");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }

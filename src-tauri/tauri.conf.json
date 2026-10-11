@@ -31,8 +31,7 @@
     "resources": {
       "../src/assets/NotoSansJP-OFL.txt": "licenses/NotoSansJP-OFL.txt",
       "../src/assets/NotoEmoji-OFL.txt": "licenses/NotoEmoji-OFL.txt",
-      "../src/assets/pdfmake-LICENSE.txt": "licenses/pdfmake-LICENSE.txt",
-      "../src/assets/unicode-segmenter-LICENSE.txt": "licenses/unicode-segmenter-LICENSE.txt"
+      "../src/assets/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt"
     },
     "icon": [
       "icons/32x32.png",
