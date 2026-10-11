@@ -454,6 +454,9 @@ small,
   border: 1px solid var(--line);
   max-width: 100%;
 }
+.tag-filter .tag-chip:hover {
+  background: #dce6d5;
+}
 .tag-filter .tag-chip[aria-pressed="true"] {
   background: var(--ink);
   color: #fff;
