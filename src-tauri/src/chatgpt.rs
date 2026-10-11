@@ -31,6 +31,7 @@ const SCOPES: &str =
 const CALLBACK_PATH: &str = "/auth/callback";
 const MAX_HTTP_BODY: usize = 128 * 1024;
 const MAX_CALLBACK_HEADER: usize = 16 * 1024;
+const MAX_CLIENT_ID_BYTES: usize = 512;
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(180);
 // Commands create clients using their current credential store. The gate is shared across them.
 static SESSION_GATE: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
@@ -96,6 +97,16 @@ struct Registry {
     version: u8,
     active_profile: Option<String>,
     profiles: Vec<Session>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_registration: Option<PendingRegistration>,
+}
+
+// An issued ID is not an account identity until a new ID token is validated.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRegistration {
+    issuer: String,
+    client_id: String,
 }
 
 impl Default for Registry {
@@ -104,6 +115,7 @@ impl Default for Registry {
             version: 1,
             active_profile: None,
             profiles: Vec::new(),
+            pending_registration: None,
         }
     }
 }
@@ -140,6 +152,13 @@ impl Registry {
             {
                 return Err(invalid());
             }
+        }
+        if self.pending_registration.as_ref().is_some_and(|pending| {
+            pending.issuer != AUTH_ORIGIN
+                || !issued_client_id(&pending.client_id)
+                || clients.contains(&pending.client_id)
+        }) {
+            return Err(invalid());
         }
         if self
             .active_profile
@@ -301,6 +320,22 @@ impl ChatGptClient {
         let (guard, mut registry) = self.load_registry_async(guard).await?;
         let previous = registry.active().cloned();
         let returning = previous.as_ref().filter(|_| !new_account);
+        let pending = registry
+            .pending_registration
+            .clone()
+            .filter(|_| returning.is_none());
+        let issued_client = returning
+            .map(|session| session.client_id.as_str())
+            .or_else(|| pending.as_ref().map(|pending| pending.client_id.as_str()));
+        if issued_client.is_none() {
+            let mut reservation = registry.clone();
+            reservation.pending_registration = Some(PendingRegistration {
+                issuer: AUTH_ORIGIN.to_owned(),
+                // JSON escaping can double an otherwise valid client's byte length.
+                client_id: "\\".repeat(MAX_CLIENT_ID_BYTES),
+            });
+            registry_record(&reservation)?;
+        }
         let (guard, host_id) = self.host_id_async(guard).await?;
         let discovery = self.discovery().await?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -321,10 +356,7 @@ impl ChatGptClient {
         {
             let mut query = authorization.query_pairs_mut();
             query.extend_pairs([
-                (
-                    "client_id",
-                    returning.map_or("dynamic_agent_client", |s| s.client_id.as_str()),
-                ),
+                ("client_id", issued_client.unwrap_or("dynamic_agent_client")),
                 ("ext_agent_host_id", host_id.as_str()),
                 ("response_type", "code"),
                 ("redirect_uri", redirect_uri.as_str()),
@@ -346,7 +378,7 @@ impl ChatGptClient {
                     // An explicit reconnect can enable a previously declined plan permission.
                     query.append_pair("prompt", "consent");
                 }
-            } else {
+            } else if issued_client.is_none() {
                 query.append_pair("agent_name_hint", "mizu-pairrank");
             }
         }
@@ -360,17 +392,23 @@ impl ChatGptClient {
         .await?;
         let callback = timeout(
             SIGN_IN_TIMEOUT,
-            await_callback(
-                &listener,
-                &state,
-                returning.map(|session| session.client_id.as_str()),
-            ),
+            await_callback(&listener, &state, issued_client),
         )
         .await
         .map_err(|_| {
             "ChatGPTサインインが時間切れになりました。再試行してください。".to_owned()
         })??;
-        let tokens = self
+        let guard = if issued_client.is_none() {
+            registry.pending_registration = Some(PendingRegistration {
+                issuer: discovery.issuer.clone(),
+                client_id: callback.client_id.clone(),
+            });
+            // Publish the issued ID before consuming a one-time authorization code.
+            self.save_registry_async(guard, &registry).await?
+        } else {
+            guard
+        };
+        let tokens = match self
             .token_request(
                 &discovery.token_endpoint,
                 &[
@@ -383,7 +421,18 @@ impl ChatGptClient {
                 ],
             )
             .await
-            .map_err(|failure| failure.message)?;
+        {
+            Ok(tokens) => tokens,
+            Err(failure) => {
+                // An invalid unverified registration cannot be resumed. Let the
+                // user's next explicit attempt create a fresh registration.
+                if returning.is_none() && failure.code.as_deref() == Some("invalid_client") {
+                    registry.pending_registration = None;
+                    let _guard = self.save_registry_async(guard, &registry).await?;
+                }
+                return Err(failure.message);
+            }
+        };
         let id_token = nonempty(tokens.id_token.as_deref()).ok_or_else(|| {
             "ChatGPTの本人確認トークンがありません。再試行してください。".to_owned()
         })?;
@@ -419,6 +468,7 @@ impl ChatGptClient {
         if returning.is_some() {
             *registry.active_mut().expect("validated active profile") = session;
         } else {
+            registry.pending_registration = None;
             registry.active_profile = Some(session.id.clone());
             registry.profiles.push(session);
         }
@@ -795,6 +845,10 @@ fn save_registry_record(
     registry: &Registry,
 ) -> Result<(), String> {
     registry.validate()?;
+    credentials.set(CredentialKind::ChatGptSession, &registry_record(registry)?)
+}
+
+fn registry_record(registry: &Registry) -> Result<String, String> {
     let record = serde_json::to_string(registry)
         .map_err(|_| "ChatGPT接続を保存できませんでした。".to_owned())?;
     if record.len() > MAX_HTTP_BODY {
@@ -803,7 +857,7 @@ fn save_registry_record(
                 .to_owned(),
         );
     }
-    credentials.set(CredentialKind::ChatGptSession, &record)
+    Ok(record)
 }
 
 fn host_id_record(credentials: &dyn CredentialStore) -> Result<String, String> {
@@ -900,7 +954,7 @@ fn random_value(bytes: usize) -> Result<String, String> {
 fn issued_client_id(value: &str) -> bool {
     !value.is_empty()
         && value != "dynamic_agent_client"
-        && value.len() <= 512
+        && value.len() <= MAX_CLIENT_ID_BYTES
         && !value.chars().any(char::is_control)
 }
 
@@ -1712,6 +1766,530 @@ mod tests {
         }
     }
 
+    fn registration_callback(
+        server: &FixtureServer,
+        expected_client: &'static str,
+        issued_client: &'static str,
+        outcome: &'static str,
+        attempts: Arc<StdMutex<Vec<HashMap<String, String>>>>,
+    ) -> impl FnOnce(String) -> Result<(), String> + Send + 'static {
+        let token_reply = server.token_reply.clone();
+        let runtime = tokio::runtime::Handle::current();
+        move |authorization| {
+            let query: HashMap<String, String> = Url::parse(&authorization)
+                .unwrap()
+                .query_pairs()
+                .into_owned()
+                .collect();
+            assert_eq!(query["client_id"], expected_client);
+            assert_eq!(
+                query.contains_key("agent_name_hint"),
+                expected_client == "dynamic_agent_client"
+            );
+            let mut observed = attempts.lock().unwrap();
+            observed.push(query.clone());
+            let code = format!("fixture-code-{}", observed.len());
+            drop(observed);
+            *token_reply.lock().unwrap() = match outcome {
+                "invalid_grant" | "invalid_client" => (400, json!({"error":outcome})),
+                _ => (
+                    200,
+                    json!({"id_token":signed_token(issued_client, &query["nonce"], json!({})), "scope":SCOPES, "access_token":"connected-access", "refresh_token":"connected-refresh", "token_type":"Bearer", "expires_in":3600}),
+                ),
+            };
+            let mut callback = Url::parse(&query["redirect_uri"]).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("state", &query["state"]);
+            if outcome == "cancel" {
+                callback
+                    .query_pairs_mut()
+                    .append_pair("error", "access_denied");
+            } else {
+                callback
+                    .query_pairs_mut()
+                    .append_pair("code", &code)
+                    .append_pair("client_id", issued_client);
+            }
+            runtime.spawn(async move {
+                reqwest::get(callback).await.unwrap();
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_code_exchange_retains_issued_registration_for_fresh_authorization() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = server.client(credentials.clone());
+        let attempts = Arc::new(StdMutex::new(Vec::new()));
+        assert!(
+            client
+                .connect(
+                    false,
+                    registration_callback(
+                        &server,
+                        "dynamic_agent_client",
+                        "oaiapp_pending",
+                        "invalid_grant",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let status = read_status(credentials.as_ref()).unwrap();
+        assert!(
+            !status.connected
+                && !status.sharing
+                && status.profiles.is_empty()
+                && status.active_profile.is_none()
+        );
+        let stored: Value = serde_json::from_str(
+            &credentials
+                .get(CredentialKind::ChatGptSession)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored["pending_registration"],
+            json!({"issuer":AUTH_ORIGIN, "client_id":"oaiapp_pending"})
+        );
+        assert!(client.access_token().await.is_err());
+        // A fresh client factory must recover using the issued ID, never a new dynamic registration.
+        let restarted = server.client(credentials.clone());
+        restarted
+            .connect(
+                false,
+                registration_callback(
+                    &server,
+                    "oaiapp_pending",
+                    "oaiapp_pending",
+                    "success",
+                    attempts.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let queries = attempts.lock().unwrap();
+        assert_eq!(queries.len(), 2);
+        for field in ["state", "nonce", "code_challenge"] {
+            assert_ne!(queries[0][field], queries[1][field]);
+        }
+        assert_eq!(
+            queries[0]["ext_agent_host_id"],
+            queries[1]["ext_agent_host_id"]
+        );
+        assert!(
+            !queries[1].contains_key("id_token_hint") && !queries[1].contains_key("login_hint")
+        );
+        let forms = server.forms.lock().unwrap();
+        assert_eq!(forms.len(), 2);
+        for (index, form) in forms.iter().enumerate() {
+            let form: HashMap<_, _> = url::form_urlencoded::parse(form.as_bytes()).collect();
+            assert_eq!(form["client_id"], "oaiapp_pending");
+            assert_eq!(form["grant_type"], "authorization_code");
+            assert_eq!(form["code"], format!("fixture-code-{}", index + 1));
+            assert_eq!(
+                URL_SAFE_NO_PAD.encode(digest::digest(
+                    &digest::SHA256,
+                    form["code_verifier"].as_bytes()
+                )),
+                queries[index]["code_challenge"]
+            );
+        }
+        let status = read_status(credentials.as_ref()).unwrap();
+        assert!(status.connected && status.sharing);
+        assert_eq!(status.profiles.len(), 1);
+        assert_eq!(
+            restarted.load_session().unwrap().unwrap().client_id,
+            "oaiapp_pending"
+        );
+        assert!(
+            load_registry_record(credentials.as_ref())
+                .unwrap()
+                .pending_registration
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_registration_preserves_saved_profiles_and_reconnect_choice() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = server.client(credentials.clone());
+        let original = saved_session();
+        client.save_session(&original).unwrap();
+        credentials
+            .set(
+                CredentialKind::ApiKey(crate::images::SearchProvider::Openai),
+                "fixture-api-key",
+            )
+            .unwrap();
+        credentials
+            .set(
+                CredentialKind::OpenAiSettings,
+                "fixture-model-and-provider-settings",
+            )
+            .unwrap();
+        let before = serde_json::to_value(read_status(credentials.as_ref()).unwrap()).unwrap();
+        let attempts = Arc::new(StdMutex::new(Vec::new()));
+        assert!(
+            client
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "dynamic_agent_client",
+                        "oaiapp_pending",
+                        "invalid_grant",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(read_status(credentials.as_ref()).unwrap()).unwrap(),
+            before
+        );
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&registry.profiles).unwrap(),
+            json!([original])
+        );
+        assert_eq!(
+            registry.pending_registration.unwrap().client_id,
+            "oaiapp_pending"
+        );
+        assert!(
+            client
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "oaiapp_pending",
+                        "oaiapp_pending",
+                        "cancel",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let before_substitution = credentials.get(CredentialKind::ChatGptSession).unwrap();
+        assert!(
+            client
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "oaiapp_pending",
+                        "oaiapp_substitution",
+                        "success",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            credentials.get(CredentialKind::ChatGptSession).unwrap(),
+            before_substitution
+        );
+        // Reconnecting the selected verified profile does not consume the unfinished new account.
+        client
+            .connect(
+                false,
+                registration_callback(
+                    &server,
+                    "oaiapp_test",
+                    "oaiapp_test",
+                    "success",
+                    attempts.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(attempts.lock().unwrap()[3].contains_key("id_token_hint"));
+        let before_resume =
+            serde_json::to_value(load_registry_record(credentials.as_ref()).unwrap().profiles)
+                .unwrap();
+        let restarted = server.client(credentials.clone());
+        restarted
+            .connect(
+                true,
+                registration_callback(
+                    &server,
+                    "oaiapp_pending",
+                    "oaiapp_pending",
+                    "success",
+                    attempts.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert_eq!(registry.profiles.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&registry.profiles[..1]).unwrap(),
+            before_resume
+        );
+        assert_eq!(registry.active().unwrap().client_id, "oaiapp_pending");
+        assert!(registry.pending_registration.is_none());
+        assert_eq!(
+            credentials
+                .get(CredentialKind::ApiKey(
+                    crate::images::SearchProvider::Openai
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("fixture-api-key")
+        );
+        assert_eq!(
+            credentials
+                .get(CredentialKind::OpenAiSettings)
+                .unwrap()
+                .as_deref(),
+            Some("fixture-model-and-provider-settings")
+        );
+        // Once promoted, another explicit add-account request can start a new registration.
+        assert!(
+            restarted
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "dynamic_agent_client",
+                        "oaiapp_next",
+                        "invalid_grant",
+                        attempts
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            load_registry_record(credentials.as_ref())
+                .unwrap()
+                .profiles
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_pending_client_allows_a_new_explicit_registration_without_erasing_profiles() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = server.client(credentials.clone());
+        client.save_session(&saved_session()).unwrap();
+        let attempts = Arc::new(StdMutex::new(Vec::new()));
+        assert!(
+            client
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "dynamic_agent_client",
+                        "oaiapp_pending",
+                        "invalid_grant",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let before =
+            serde_json::to_value(load_registry_record(credentials.as_ref()).unwrap().profiles)
+                .unwrap();
+        assert!(
+            client
+                .connect(
+                    false,
+                    registration_callback(
+                        &server,
+                        "oaiapp_test",
+                        "oaiapp_test",
+                        "invalid_client",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            load_registry_record(credentials.as_ref())
+                .unwrap()
+                .pending_registration
+                .is_some()
+        );
+        assert!(
+            client
+                .connect(
+                    true,
+                    registration_callback(
+                        &server,
+                        "oaiapp_pending",
+                        "oaiapp_pending",
+                        "invalid_client",
+                        attempts.clone()
+                    )
+                )
+                .await
+                .is_err()
+        );
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert!(registry.pending_registration.is_none());
+        assert_eq!(serde_json::to_value(registry.profiles).unwrap(), before);
+        client
+            .connect(
+                true,
+                registration_callback(
+                    &server,
+                    "dynamic_agent_client",
+                    "oaiapp_replacement",
+                    "success",
+                    attempts,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            load_registry_record(credentials.as_ref())
+                .unwrap()
+                .profiles
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_registration_validation_and_registry_capacity_preserve_prior_record() {
+        let _test = TEST_GATE.lock().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = ChatGptClient::new(credentials.clone());
+        client.save_session(&saved_session()).unwrap();
+        let valid = credentials
+            .get(CredentialKind::ChatGptSession)
+            .unwrap()
+            .unwrap();
+        for pending in [
+            json!({"issuer":"https://evil.invalid", "client_id":"oaiapp_pending"}),
+            json!({"issuer":AUTH_ORIGIN, "client_id":"dynamic_agent_client"}),
+            json!({"issuer":AUTH_ORIGIN, "client_id":"oaiapp_test"}),
+            json!({"issuer":AUTH_ORIGIN, "client_id":"x".repeat(513)}),
+            json!({"issuer":AUTH_ORIGIN, "client_id":"oaiapp_pending", "subject":"unverified-subject"}),
+        ] {
+            let mut record: Value = serde_json::from_str(&valid).unwrap();
+            record["pending_registration"] = pending;
+            credentials
+                .set(CredentialKind::ChatGptSession, &record.to_string())
+                .unwrap();
+            assert!(read_status(credentials.as_ref()).is_err());
+            assert_eq!(
+                credentials
+                    .get(CredentialKind::ChatGptSession)
+                    .unwrap()
+                    .as_deref(),
+                Some(record.to_string().as_str())
+            );
+        }
+        credentials
+            .set(CredentialKind::ChatGptSession, &valid)
+            .unwrap();
+        let mut registry = load_registry_record(credentials.as_ref()).unwrap();
+        registry.profiles[0].access_token =
+            Some("x".repeat(MAX_HTTP_BODY - valid.len() + "old-access".len() - 32));
+        save_registry_record(credentials.as_ref(), &registry).unwrap();
+        let before = credentials.get(CredentialKind::ChatGptSession).unwrap();
+        assert_eq!(before.as_ref().unwrap().len(), MAX_HTTP_BODY - 32);
+        assert!(
+            client
+                .connect(true, |_| panic!(
+                    "insufficient capacity must fail before registration"
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            credentials.get(CredentialKind::ChatGptSession).unwrap(),
+            before
+        );
+        registry.pending_registration = Some(PendingRegistration {
+            issuer: AUTH_ORIGIN.to_owned(),
+            client_id: "oaiapp_pending".to_owned(),
+        });
+        assert!(save_registry_record(credentials.as_ref(), &registry).is_err());
+        assert_eq!(
+            credentials.get(CredentialKind::ChatGptSession).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_registration_is_durable_before_exchange_and_survives_cancellation() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        server.pause_token.store(true, Ordering::SeqCst);
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = server.client(credentials.clone());
+        let attempts = Arc::new(StdMutex::new(Vec::new()));
+        let browser = registration_callback(
+            &server,
+            "dynamic_agent_client",
+            "oaiapp_pending",
+            "invalid_grant",
+            attempts.clone(),
+        );
+        let connecting = client.clone();
+        let command = tokio::spawn(async move { connecting.connect(false, browser).await });
+        server.token_started.notified().await;
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert!(registry.profiles.is_empty() && registry.active_profile.is_none());
+        assert_eq!(
+            registry.pending_registration.unwrap().client_id,
+            "oaiapp_pending"
+        );
+        assert!(
+            client
+                .connect(true, |_| panic!(
+                    "overlapping authorization must be rejected"
+                ))
+                .await
+                .is_err()
+        );
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        server.pause_token.store(false, Ordering::SeqCst);
+        server.token_release.add_permits(1);
+        client
+            .connect(
+                false,
+                registration_callback(
+                    &server,
+                    "oaiapp_pending",
+                    "oaiapp_pending",
+                    "success",
+                    attempts,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            load_registry_record(credentials.as_ref())
+                .unwrap()
+                .profiles
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_or_unverified_new_sign_in_preserves_the_prior_account() {
         let _test = TEST_GATE.lock().await;
@@ -1736,10 +2314,16 @@ mod tests {
                 .await
                 .is_err()
         );
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
         assert_eq!(
-            credentials.get(CredentialKind::ChatGptSession).unwrap(),
-            before
+            serde_json::to_value(registry.profiles).unwrap(),
+            json!([saved_session()])
         );
+        assert_eq!(
+            registry.pending_registration.unwrap().client_id,
+            "oaiapp_new"
+        );
+        let before_returning = credentials.get(CredentialKind::ChatGptSession).unwrap();
         assert!(
             client
                 .connect(false, browser_callback(&server, "wrong-account", false))
@@ -1748,7 +2332,7 @@ mod tests {
         );
         assert_eq!(
             credentials.get(CredentialKind::ChatGptSession).unwrap(),
-            before
+            before_returning
         );
     }
 

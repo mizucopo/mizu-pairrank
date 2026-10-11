@@ -173,7 +173,7 @@ export class AppController {
   };
 
   private readRequest: symbol | null = null;
-  private settingsRead: Promise<SearchSettings> | null = null;
+  private settingsRead: Promise<unknown> | null = null;
   private skippedPairs: { ids: ItemPair; remainingAnswers: number }[] = [];
   private lastAnswer: {
     pair: PairProposal;
@@ -261,7 +261,12 @@ export class AppController {
   }
 
   async navigate(view: View): Promise<void> {
-    if (view === "settings" && this.state.readPending === "settings") return;
+    if (
+      view === "settings" &&
+      (this.state.readPending === "settings" ||
+        (this.state.view === "settings" && !this.state.modal))
+    )
+      return;
     this.cancelRead("settings");
     if (this.state.busy) return;
     this.state.imageSearchReturn = null;
@@ -374,18 +379,27 @@ export class AppController {
     }
   }
 
+  private async readSettings<T>(load: () => Promise<T>): Promise<T | null> {
+    const request = this.readRequest;
+    // UI cancellation leaves the native worker holding the single settings-read slot.
+    if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+    if (this.readRequest !== request) return null;
+    const reading = load();
+    this.settingsRead = reading;
+    try {
+      return await reading;
+    } finally {
+      if (this.settingsRead === reading) this.settingsRead = null;
+    }
+  }
+
   private async loadSettings(kind: ReadKind): Promise<void> {
     await this.performRead(
       kind,
       async () => {
         const request = this.readRequest;
-        // UI cancellation leaves the native worker holding the single settings-read slot.
-        if (this.settingsRead) await this.settingsRead.catch(() => undefined);
-        if (this.readRequest !== request) return null;
-        const reading = this.api.searchSettings();
-        this.settingsRead = reading;
         try {
-          return await reading;
+          return await this.readSettings(() => this.api.searchSettings());
         } catch (error) {
           if (this.readRequest === request) {
             const message = errorMessage(error);
@@ -396,18 +410,19 @@ export class AppController {
             });
           }
           throw error;
-        } finally {
-          if (this.settingsRead === reading) this.settingsRead = null;
         }
       },
       (settings) => {
         if (settings) {
-          const previous = this.state.settings;
+          const firstLoad = this.state.settings === null;
+          const previous = this.state.settings ?? initialSearchSettings();
           this.acceptSettings(settings);
           const accepted = this.state.settings;
-          if (accepted && (!previous || settings.errors?.openai === undefined)) {
-            this.state.drafts.openaiModel = accepted.openaiModel;
-            this.state.openaiAuthMode = accepted.openaiAuthMode;
+          if (accepted && (firstLoad || settings.errors?.openai === undefined)) {
+            if (this.state.drafts.openaiModel === previous.openaiModel)
+              this.state.drafts.openaiModel = accepted.openaiModel;
+            if (this.state.openaiAuthMode === previous.openaiAuthMode)
+              this.state.openaiAuthMode = accepted.openaiAuthMode;
           }
         }
       },
@@ -441,6 +456,8 @@ export class AppController {
         settings.defaultProvider = "brave";
       else if (settings.ollamaConfigured && settings.errors?.ollama === undefined)
         settings.defaultProvider = "ollama";
+      else if (settings.openaiConfigured && settings.errors?.openai === undefined)
+        settings.defaultProvider = "openai";
       else
         settings.defaultProvider =
           settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
@@ -1246,7 +1263,7 @@ export class AppController {
       "settings",
       async () => {
         try {
-          return await this.api.openAiModels();
+          return await this.readSettings(() => this.api.openAiModels());
         } catch (error) {
           throw new Error(
             `モデル一覧を取得できませんでした: ${errorMessage(error)} モデルIDは直接入力して保存できます。`,
@@ -1255,7 +1272,7 @@ export class AppController {
         }
       },
       (models) => {
-        this.state.openaiModels = models;
+        if (models) this.state.openaiModels = models;
       },
     );
   }

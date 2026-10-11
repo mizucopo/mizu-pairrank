@@ -299,7 +299,7 @@ fn search_request(model: &str, secret: &str, query: &str) -> Result<Request, Str
         .header("Accept", "text/event-stream")
         .json(&json!({
             "model": model,
-            "reasoning": { "effort": "low" },
+            "tool_choice": "required",
             "tools": [{
                 "type": "web_search",
                 "search_content_types": ["image", "text"],
@@ -378,14 +378,22 @@ impl ErrorContext<'_> {
                 "ChatGPTプランの利用上限に達しました。「利用状況を管理」で確認してください。".to_owned(),
             Some("subscription_sharing_usage_unavailable") if self.settings.auth_mode == OpenAiAuthMode::Chatgpt =>
                 "ChatGPTプランの使用を現在利用できません。「利用状況を管理」で確認して再試行してください。".to_owned(),
+            Some("subscription_sharing_user_not_eligible") if self.settings.auth_mode == OpenAiAuthMode::Chatgpt =>
+                "ChatGPTプランの使用が選択したアカウント・ワークスペースまたはポリシーで制限されています。利用条件をアカウント・ワークスペースの管理者に確認してください。".to_owned(),
+            Some("subscription_sharing_route_not_supported") if self.settings.auth_mode == OpenAiAuthMode::Chatgpt =>
+                "ChatGPTプランの接続経路が利用を許可されていません。アプリの更新・対応状況を確認してください。".to_owned(),
+            Some("chatpass_v2_scope_not_authorized" | "chatpass_v2_invalid_authorization_context") if self.settings.auth_mode == OpenAiAuthMode::Chatgpt =>
+                "ChatGPTプランの使用権限を確認できませんでした。選択したアカウントとアプリの接続・許可設定を確認してください。".to_owned(),
             _ if self.status == StatusCode::UNAUTHORIZED => match self.settings.auth_mode {
                 OpenAiAuthMode::Api => "OpenAIのAPIキーを認証できませんでした。APIキーを確認して保存し直してください。".to_owned(),
                 OpenAiAuthMode::Chatgpt => "ChatGPTの接続を認証できませんでした。接続し直してください。".to_owned(),
             },
             _ if self.status == StatusCode::TOO_MANY_REQUESTS || code == Some("rate_limit_exceeded") =>
                 "OpenAIのリクエスト上限に達しました。時間をおいて再試行してください。".to_owned(),
-            _ if self.status == StatusCode::FORBIDDEN || self.status == StatusCode::NOT_FOUND || model_failure(error, code, param) =>
+            _ if (self.settings.auth_mode == OpenAiAuthMode::Api && self.status == StatusCode::FORBIDDEN) || self.status == StatusCode::NOT_FOUND || model_failure(error, code, param) =>
                 format!("OpenAIのモデル「{}」で画像検索を利用できません。モデルへのアクセス権を確認するか、別のモデルを指定してください。", self.settings.model),
+            _ if self.settings.auth_mode == OpenAiAuthMode::Chatgpt && self.status == StatusCode::FORBIDDEN =>
+                "ChatGPTプランの利用が権限・ポリシーまたは提供地域の制限で許可されませんでした。選択したアカウント・ワークスペースとアプリの利用許可を確認してください。".to_owned(),
             _ => "OpenAIの画像検索を完了できませんでした。再試行してください。".to_owned(),
         };
         self.with_metadata(message, error)
@@ -955,6 +963,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_requests_require_the_web_search_tool_in_both_auth_modes() {
+        for mode in [OpenAiAuthMode::Api, OpenAiAuthMode::Chatgpt] {
+            let (client, transport) = client(credentials(mode), vec![success()]);
+            assert_eq!(client.search("cats").await.unwrap().len(), 1);
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests[0].body["tool_choice"], "required");
+            assert_eq!(requests[0].body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[0].body["tools"][0]["type"], "web_search");
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_models_use_server_reasoning_defaults_without_capability_assumptions() {
+        for mode in [OpenAiAuthMode::Api, OpenAiAuthMode::Chatgpt] {
+            for model in ["gpt-4.1", "gpt-6-luna", "future-unlisted-model"] {
+                let credentials = credentials(mode);
+                write_settings(credentials.as_ref(), model.to_owned(), mode).unwrap();
+                let (client, transport) = client(credentials, vec![success()]);
+                assert_eq!(client.search("cats").await.unwrap().len(), 1);
+                let requests = transport.requests.lock().unwrap();
+                let body = &requests[0].body;
+                assert_eq!(body["model"], model);
+                assert!(body.get("reasoning").is_none(), "{mode:?}: {model}");
+                assert_eq!(body["store"], false);
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["input"], json!([{"role": "user", "content": "cats"}]));
+                assert_eq!(requests.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn known_chatgpt_admission_errors_outrank_model_parameters() {
+        for (code, expected) in [
+            (
+                "subscription_sharing_user_not_eligible",
+                "アカウント・ワークスペース",
+            ),
+            ("subscription_sharing_route_not_supported", "接続経路"),
+            ("chatpass_v2_scope_not_authorized", "使用権限"),
+            ("chatpass_v2_invalid_authorization_context", "使用権限"),
+        ] {
+            for param in ["model", "tools[0].image_settings"] {
+                let error = json!({"code": code, "param": param, "message": CHATGPT_SECRET});
+                for response in [
+                    response(403, json!({"error": error}).to_string().into_bytes()),
+                    response(200, event("response.failed", json!({"error": error}))),
+                ] {
+                    let credentials = credentials(OpenAiAuthMode::Chatgpt);
+                    let (client, transport) = client(credentials.clone(), vec![response]);
+                    let failure = client.search("cats").await.err().unwrap();
+                    assert!(failure.contains(expected), "{failure}");
+                    assert!(failure.contains("ChatGPTプラン"));
+                    assert!(failure.contains(code));
+                    assert!(failure.contains(&format!("param={param}")));
+                    assert!(failure.contains("request_id=req_mock_123"));
+                    assert!(!failure.contains("別のモデル"));
+                    assert!(!failure.contains("モデル「"));
+                    assert!(!failure.contains("接続し直して"));
+                    assert!(!failure.contains(CHATGPT_SECRET));
+                    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+                    assert!(credentials.writes.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unstructured_chatgpt_403_reports_plan_restrictions_without_model_changes() {
+        for body in [
+            json!({"detail": CHATGPT_SECRET}).to_string().into_bytes(),
+            b"<html>Forbidden by serving-region admission policy</html>".to_vec(),
+            b"not-json".to_vec(),
+            br#"{"error":{"code":"permission_denied"}}"#.to_vec(),
+        ] {
+            let (client, transport) = client(
+                credentials(OpenAiAuthMode::Chatgpt),
+                vec![response(403, body)],
+            );
+            let failure = client.search("cats").await.err().unwrap();
+            assert!(failure.contains("ChatGPTプラン"), "{failure}");
+            assert!(failure.contains("制限"));
+            assert!(failure.contains("アカウント・ワークスペース"));
+            assert!(failure.contains("HTTP 403"));
+            assert!(failure.contains("request_id=req_mock_123"));
+            assert!(!failure.contains("別のモデル"));
+            assert!(!failure.contains("モデル「"));
+            assert!(!failure.contains(CHATGPT_SECRET));
+            assert!(!failure.contains("<html>"));
+            assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_model_errors_and_api_403_keep_selected_model_guidance() {
+        for mode in [OpenAiAuthMode::Api, OpenAiAuthMode::Chatgpt] {
+            for error in [
+                json!({"code": "model_not_found", "param": "model"}),
+                json!({"code": "invalid_model"}),
+                json!({"code": "invalid_request_error", "param": "tools[0].image_settings"}),
+            ] {
+                let (client, _) = client(
+                    credentials(mode),
+                    vec![response(
+                        403,
+                        json!({"error": error}).to_string().into_bytes(),
+                    )],
+                );
+                let failure = client.search("cats").await.err().unwrap();
+                assert!(failure.contains("future-unlisted-model"), "{failure}");
+                assert!(failure.contains("別のモデル"));
+            }
+        }
+        let (client, _) = client(
+            credentials(OpenAiAuthMode::Api),
+            vec![response(403, b"not-json".to_vec())],
+        );
+        let failure = client.search("cats").await.err().unwrap();
+        assert!(failure.contains("future-unlisted-model"));
+        assert!(failure.contains("別のモデル"));
+    }
+
+    #[tokio::test]
     async fn both_auth_modes_send_the_saved_unlisted_model_and_required_image_search_body() {
         for (mode, secret, unused_kind) in [
             (
@@ -984,7 +1115,7 @@ mod tests {
             assert_eq!(
                 request.body,
                 json!({
-                    "model": "future-unlisted-model", "reasoning": {"effort": "low"},
+                    "model": "future-unlisted-model", "tool_choice": "required",
                     "tools": [{"type": "web_search", "search_content_types": ["image", "text"], "image_settings": {"max_results": 30, "caption": true}}],
                     "include": ["web_search_call.results"], "input": [{"role": "user", "content": "cats at sunset"}],
                     "instructions": "Search web images matching query. Use web_search for image results.", "store": false, "stream": true

@@ -4650,3 +4650,115 @@ describe("saved ChatGPT profiles", () => {
     expect(controller.availableBulkProviders()).toContain("openai");
   });
 });
+
+describe("OpenAI settings read recovery", () => {
+  const settings = {
+    ...openAiSettings,
+    braveConfigured: false,
+    ollamaConfigured: false,
+    openaiConfigured: true,
+    openaiModel: "persisted-model",
+    defaultProvider: "openai" as const,
+  };
+
+  it("selects healthy OpenAI on the first settings read when both peers fail", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue({
+      ...settings,
+      errors: { brave: "Brave keyring denied", ollama: "Ollama keyring denied" },
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    expect(controller.availableBulkProviders()).toEqual(["openai"]);
+    expect(controller.state.settings?.defaultProvider).toBe("openai");
+    expect(controller.state.provider).toBe("openai");
+    await controller.searchImages();
+    expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("openai", "項目1");
+  });
+
+  it.each(["before initial read", "after initial read"] as const)(
+    "keeps unsaved model and authentication-mode edits made %s when checking credentials",
+    async (timing) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValue(settings);
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      if (timing === "after initial read") await controller.checkSearchSettings();
+      controller.state.drafts.openaiModel = "unsaved-manual-model";
+      controller.state.openaiAuthMode = "chatgpt";
+      await controller.checkSearchSettings();
+      expect(controller.state.drafts.openaiModel).toBe("unsaved-manual-model");
+      expect(controller.state.openaiAuthMode).toBe("chatgpt");
+      expect(controller.state.settings?.openaiModel).toBe("persisted-model");
+      expect(controller.state.settings?.openaiAuthMode).toBe("api");
+      expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "waits for a cancelled model-list worker's %s before a new settings read uses the native slot",
+    async (outcome) => {
+      const api = backend();
+      let nativeBusy = false;
+      let finishModels = () => {};
+      api.openAiModels.mockImplementationOnce(() => {
+        nativeBusy = true;
+        return new Promise((resolve, reject) => {
+          finishModels = () => {
+            nativeBusy = false;
+            if (outcome === "success") resolve(["abandoned-model"]);
+            else reject(new Error("abandoned model request failed"));
+          };
+        });
+      });
+      api.searchSettings.mockImplementation(async () => {
+        if (nativeBusy) throw new Error("native settings slot already in use");
+        return settings;
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      const modelsRead = controller.refreshOpenAiModels();
+      await controller.navigate("items");
+      await controller.navigate("settings");
+      const settingsRead = controller.checkSearchSettings();
+      await Promise.resolve();
+      const callsWhileNativeBusy = api.searchSettings.mock.calls.length;
+      finishModels();
+      await Promise.all([modelsRead, settingsRead]);
+      expect(callsWhileNativeBusy).toBe(0);
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(controller.state.settings).toEqual(settings);
+      expect(controller.state.openaiModels).toEqual([]);
+      expect(controller.state.error).toBe("");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it("keeps the image-search return target when navigating to settings again on the same page", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue(settings);
+    const candidate: ImageCandidate = {
+      id: "kept",
+      title: "Previous result",
+      previewUrl: "data:image/png;base64,AA==",
+      sourceUrl: "https://example.org/image",
+    };
+    api.searchImages.mockResolvedValue([candidate]);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    await controller.searchImages();
+    controller.editImageSearchSettings();
+    const target = controller.state.imageSearchReturn;
+    await controller.navigate("settings");
+    expect(controller.state.imageSearchReturn).toEqual(target);
+    controller.resumeImageSearch();
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+    expect(controller.state.candidates).toEqual([candidate]);
+    expect(controller.state.searched).toBe(true);
+    expect(controller.state.drafts.query).toBe("項目1");
+  });
+});
