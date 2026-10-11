@@ -40,7 +40,7 @@ export type AppState = {
   pair: PairProposal | null;
   comparisonPaused: boolean;
   view: View;
-  selectedTagId: number | null;
+  selectedTagIds: number[];
   busy: boolean;
   initialized: boolean;
   fatal: boolean;
@@ -97,7 +97,7 @@ export class AppController {
     pair: null,
     comparisonPaused: false,
     view: "items",
-    selectedTagId: null,
+    selectedTagIds: [],
     busy: false,
     initialized: false,
     fatal: false,
@@ -158,7 +158,7 @@ export class AppController {
   }
 
   private async loadFirstAvailableList(): Promise<ListState | null> {
-    this.state.selectedTagId = null;
+    this.state.selectedTagIds = [];
     this.state.lists = await this.api.listSummaries();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const first = this.state.lists[0];
@@ -192,9 +192,12 @@ export class AppController {
     });
   }
 
-  selectTag(tagId: number | null): void {
-    if (tagId !== null && !this.state.active?.tags.some((tag) => tag.id === tagId)) return;
-    this.state.selectedTagId = tagId;
+  toggleTag(tagId: number): void {
+    if (this.state.busy || !this.state.active?.tags.some((tag) => tag.id === tagId)) return;
+    const selected = this.state.selectedTagIds;
+    this.state.selectedTagIds = selected.includes(tagId)
+      ? selected.filter((id) => id !== tagId)
+      : [...selected, tagId];
     this.changed();
   }
 
@@ -425,12 +428,10 @@ export class AppController {
             remainingAnswers > 0 && ids.every((id) => list.items.some((item) => item.id === id)),
         );
     }
-    if (
-      this.state.active?.id !== list.id ||
-      (this.state.selectedTagId !== null &&
-        !list.tags.some((tag) => tag.id === this.state.selectedTagId))
-    )
-      this.state.selectedTagId = null;
+    this.state.selectedTagIds =
+      previous?.id !== list.id
+        ? []
+        : this.state.selectedTagIds.filter((id) => list.tags.some((tag) => tag.id === id));
     this.state.active = list;
     this.state.pair = null;
     this.state.comparisonPaused = false;

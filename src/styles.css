@@ -446,15 +446,18 @@ small,
 .tag-chip small {
   color: var(--muted);
 }
-.ranking-filter {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.tag-filter {
   margin-bottom: 10px;
   font-size: 0.8rem;
 }
-.ranking-filter select {
-  width: min(100%, 260px);
+.tag-filter .tag-chip {
+  border: 1px solid var(--line);
+  max-width: 100%;
+}
+.tag-filter .tag-chip[aria-pressed="true"] {
+  background: var(--ink);
+  color: #fff;
+  border-color: var(--ink);
 }
 .item-actions {
   display: flex;
