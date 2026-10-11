@@ -244,7 +244,7 @@ describe("desktop app interaction", () => {
     expect(root.querySelector(".rank-row img")?.getAttribute("src")).toBe(
       "asset:///images/picked.png",
     );
-    expect(root.querySelector("#ranking-tag")?.textContent).toContain("果物");
+    expect(root.querySelector(".tag-filter")?.textContent).toContain("果物");
     await click(root, controller, '[data-view="tier"]');
     expect(root.querySelectorAll("#tier-C + .tier-items .tier-card")).toHaveLength(2);
     api.resumeList.mockResolvedValue(initial);
@@ -2194,47 +2194,183 @@ describe("desktop app interaction", () => {
     expect(root.querySelector("script, img, [onerror]")).toBeNull();
   });
 
-  it("filters the ranking in saved order, renumbers it, and escapes tag names", async () => {
-    const { root, controller, state } = setup();
-    const hostile = `<img src=x onerror="alert(1)">&`;
-    state.tags = [
-      { id: 3, listId: 1, name: hostile },
-      { id: 4, listId: 1, name: "全件" },
-      { id: 5, listId: 1, name: "空" },
-    ];
-    state.items[0]!.tagIds = [3, 4];
-    state.items[1]!.tagIds = [4];
-    await controller.initialize();
-    await controller.navigate("ranking");
-    const select = root.querySelector<HTMLSelectElement>("#ranking-tag");
-    if (!select) throw new Error("Missing ranking tag selector");
-    expect(select.options[1]?.textContent).toBe(hostile);
-    expect(root.querySelector(".ranking-filter img, [onerror]")).toBeNull();
-    select.value = "3";
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-    expect([...root.querySelectorAll(".rank-row h3")].map((node) => node.textContent)).toEqual([
-      "りんご",
-    ]);
-    expect(root.querySelector(".rank-number")?.textContent).toBe("1");
-    const emptySelect = root.querySelector<HTMLSelectElement>("#ranking-tag");
-    if (!emptySelect) throw new Error("Missing ranking tag selector");
-    emptySelect.value = "5";
-    emptySelect.dispatchEvent(new Event("change", { bubbles: true }));
-    expect(root.textContent).toContain("このタグが付いた項目はありません。");
-    expect(root.textContent).toContain("リスト全体で行います");
-    const allSelect = root.querySelector<HTMLSelectElement>("#ranking-tag");
-    if (!allSelect) throw new Error("Missing ranking tag selector");
-    allSelect.value = "";
-    allSelect.dispatchEvent(new Event("change", { bubbles: true }));
-    expect([...root.querySelectorAll(".rank-row h3")].map((node) => node.textContent)).toEqual([
-      "りんご",
-      "みかん",
-    ]);
-    expect([...root.querySelectorAll(".rank-number")].map((node) => node.textContent)).toEqual([
-      "1",
-      "2",
-    ]);
-  });
+  it.each(["ranking", "tier"] as const)(
+    "shows every tag and toggles AND filtering, deselection, and empty results in %s",
+    async (view) => {
+      const { root, controller, state } = setup();
+      const hostile = `<img src=x onerror="alert(1)">&`;
+      state.tags = [
+        { id: 3, listId: 1, name: hostile },
+        { id: 4, listId: 1, name: "共通" },
+        { id: 5, listId: 1, name: "未割当" },
+      ];
+      state.items = [
+        { ...state.items[0]!, rating: { mu: 50, sigma: 8 }, tagIds: [4] },
+        { ...state.items[1]!, rating: { mu: 30, sigma: 8 }, tagIds: [3, 4] },
+        { ...state.items[0]!, id: 12, name: "レモン", rating: { mu: 20, sigma: 8 }, tagIds: [3] },
+        { ...state.items[0]!, id: 13, name: "ぶどう", rating: { mu: 10, sigma: 8 }, tagIds: [] },
+      ];
+      await controller.initialize();
+      await controller.navigate(view);
+      const names = () =>
+        [...root.querySelectorAll(view === "ranking" ? ".rank-row h3" : ".tier-name")].map(
+          (node) => node.textContent,
+        );
+      const filter = (id: number) => `.tag-filter [data-action="toggle-tag"][data-id="${id}"]`;
+      const pressed = () =>
+        [...root.querySelectorAll('.tag-filter button[aria-pressed="true"]')].map(
+          (node) => (node as HTMLButtonElement).dataset.id,
+        );
+      expect(names()).toEqual(["りんご", "みかん", "レモン", "ぶどう"]);
+      expect(
+        [...root.querySelectorAll(".tag-filter button")].map((node) => node.textContent),
+      ).toEqual(state.tags.map((tag) => tag.name));
+      expect(
+        [...root.querySelectorAll(".tag-filter button")].map((node) =>
+          node.getAttribute("aria-pressed"),
+        ),
+      ).toEqual(["false", "false", "false"]);
+      expect(root.querySelector(".tag-filter img, .tag-filter [onerror]")).toBeNull();
+      button(root, filter(3)).focus();
+      await click(root, controller, filter(3));
+      expect(document.activeElement).toBe(button(root, filter(3)));
+      expect(names()).toEqual(["みかん", "レモン"]);
+      await click(root, controller, filter(4));
+      expect(pressed()).toEqual(["3", "4"]);
+      expect(names()).toEqual(["みかん"]);
+      const otherView = view === "ranking" ? "tier" : "ranking";
+      await click(root, controller, `.tabs [data-view="${otherView}"]`);
+      expect(pressed()).toEqual(["3", "4"]);
+      expect(
+        [...root.querySelectorAll(otherView === "ranking" ? ".rank-row h3" : ".tier-name")].map(
+          (node) => node.textContent,
+        ),
+      ).toEqual(["みかん"]);
+      await click(root, controller, `.tabs [data-view="${view}"]`);
+      if (view === "ranking") expect(root.querySelector(".rank-number")?.textContent).toBe("1");
+      else
+        expect(
+          root.querySelector(".tier-card")?.closest(".tier-row")?.querySelector(".tier-label")
+            ?.textContent,
+        ).toBe("B");
+      await click(root, controller, filter(3));
+      expect(pressed()).toEqual(["4"]);
+      expect(names()).toEqual(["りんご", "みかん"]);
+      await click(root, controller, filter(4));
+      expect(pressed()).toEqual([]);
+      expect(names()).toEqual(["りんご", "みかん", "レモン", "ぶどう"]);
+      if (view === "ranking")
+        expect([...root.querySelectorAll(".rank-number")].map((node) => node.textContent)).toEqual([
+          "1",
+          "2",
+          "3",
+          "4",
+        ]);
+      await click(root, controller, filter(5));
+      expect(names()).toEqual([]);
+      expect(root.textContent).toContain("選択したタグをすべて持つ項目はありません。");
+      expect(root.querySelectorAll(".tag-filter button")).toHaveLength(3);
+      await click(root, controller, filter(5));
+      expect(names()).toEqual(["りんご", "みかん", "レモン", "ぶどう"]);
+    },
+  );
+
+  it.each(["ranking", "tier"] as const)(
+    "disables tag filtering while a list operation is pending in %s",
+    async (view) => {
+      const { root, controller, api, state } = setup();
+      state.tags = [
+        { id: 3, listId: 1, name: "甘い" },
+        { id: 4, listId: 1, name: "赤い" },
+      ];
+      await controller.initialize();
+      await controller.navigate(view);
+      await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
+      let finish!: (value: ListState) => void;
+      api.getList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const loading = controller.selectList(state.id);
+      const filters = [...root.querySelectorAll<HTMLButtonElement>(".tag-filter button")];
+      expect(filters).toHaveLength(2);
+      expect(filters.every((entry) => entry.disabled)).toBe(true);
+      for (const entry of filters) entry.click();
+      expect(controller.state.selectedTagIds).toEqual([3]);
+      finish(state);
+      await loading;
+    },
+  );
+
+  it.each(["ranking", "tier"] as const)(
+    "keeps filters current after tag rename, item assignment, and tag deletion in %s",
+    async (view) => {
+      const { root, controller, api, state } = setup();
+      const initial: ListState = {
+        ...state,
+        tags: [
+          { id: 3, listId: 1, name: "甘い" },
+          { id: 4, listId: 1, name: "赤い" },
+        ],
+        items: state.items.map((item, index) => ({ ...item, tagIds: index ? [3, 4] : [3] })),
+      };
+      api.getList.mockResolvedValue(initial);
+      await controller.initialize();
+      await controller.navigate(view);
+      const filter = (id: number) => `.tag-filter [data-action="toggle-tag"][data-id="${id}"]`;
+      const names = () =>
+        [...root.querySelectorAll(view === "ranking" ? ".rank-row h3" : ".tier-name")].map(
+          (node) => node.textContent,
+        );
+      await click(root, controller, filter(3));
+      await click(root, controller, filter(4));
+      expect(names()).toEqual(["みかん"]);
+      await controller.navigate("items");
+      await controller.openModal({ kind: "tags" });
+      controller.editTag(3);
+      controller.state.tagDraft = "甘い果物";
+      const renamed = {
+        ...initial,
+        tags: initial.tags.map((tag) => (tag.id === 3 ? { ...tag, name: "甘い果物" } : tag)),
+      };
+      api.renameTag.mockResolvedValueOnce(renamed);
+      await controller.saveTag();
+      controller.closeModal();
+      await controller.navigate(view);
+      expect(button(root, filter(3)).textContent).toBe("甘い果物");
+      expect(button(root, filter(3)).getAttribute("aria-pressed")).toBe("true");
+      expect(button(root, filter(4)).getAttribute("aria-pressed")).toBe("true");
+      expect(names()).toEqual(["みかん"]);
+      await controller.navigate("items");
+      await controller.openModal({ kind: "tags", itemId: 10 });
+      const assigned = {
+        ...renamed,
+        items: renamed.items.map((item) => ({ ...item, tagIds: [3, 4] })),
+      };
+      api.setItemTag.mockResolvedValueOnce(assigned);
+      await controller.toggleItemTag(4, true);
+      controller.closeModal();
+      await controller.navigate(view);
+      expect(names()).toEqual(["りんご", "みかん"]);
+      await controller.navigate("items");
+      await controller.openModal({ kind: "tags" });
+      controller.deleteTagPrompt(3);
+      api.deleteTag.mockResolvedValueOnce({
+        ...assigned,
+        tags: assigned.tags.filter((tag) => tag.id !== 3),
+        items: assigned.items.map((item) => ({ ...item, tagIds: [4] })),
+      });
+      await controller.confirmTagDelete();
+      controller.closeModal();
+      await controller.navigate(view);
+      expect(root.querySelector(filter(3))).toBeNull();
+      expect(button(root, filter(4)).getAttribute("aria-pressed")).toBe("true");
+      expect(controller.state.selectedTagIds).toEqual([4]);
+      expect(names()).toEqual(["りんご", "みかん"]);
+    },
+  );
 
   it.each(["tag name", "checkbox"] as const)(
     "toggles only the matching item tag through its %s",

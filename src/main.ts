@@ -216,8 +216,6 @@ export function mountApp(
       controller.state.bulkProvider =
         target.value === "brave" || target.value === "ollama" ? target.value : null;
       render();
-    } else if (target instanceof HTMLSelectElement && target.id === "ranking-tag") {
-      controller.selectTag(target.value === "" ? null : Number(target.value));
     } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
       void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     } else if (target instanceof HTMLInputElement && target.id === "export-include-images") {
@@ -280,6 +278,9 @@ export function mountApp(
     const id = Number(button.dataset.id);
     const provider: SearchProvider = button.dataset.provider === "ollama" ? "ollama" : "brave";
     switch (button.dataset.action) {
+      case "toggle-tag":
+        controller.toggleTag(id);
+        break;
       case "skip-comparison":
         void controller.skipComparison();
         break;

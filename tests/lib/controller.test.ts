@@ -424,7 +424,7 @@ describe("comparison reset", () => {
     const tag = { id: 1, listId: initial.id, name: "お気に入り" };
     const reset = { ...initial, revision: saved.revision + 1, tags: [tag] };
     controller.state.active = { ...saved, tags: [tag] };
-    controller.selectTag(tag.id);
+    controller.toggleTag(tag.id);
     api.resetComparisons.mockResolvedValue(reset);
     // A reset response is sufficient even if a subsequent sidebar read would fail.
     api.listSummaries.mockRejectedValueOnce("一覧を取得できません。");
@@ -435,7 +435,7 @@ describe("comparison reset", () => {
     expect(controller.state.pair).toBeNull();
     expect(controller.state.modal).toBeNull();
     expect(controller.state.view).toBe("ranking");
-    expect(controller.state.selectedTagId).toBe(tag.id);
+    expect(controller.state.selectedTagIds).toEqual([tag.id]);
     expect(controller.state.lists.find((entry) => entry.id === initial.id)).toEqual(summary(reset));
     expect(controller.state.notice).toContain("比較をリセットしました");
     expect(controller.state.error).toBe("");
@@ -629,7 +629,7 @@ describe("portable list transfer", () => {
     api.importList.mockResolvedValueOnce(imported);
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
-    controller.selectTag(1);
+    controller.toggleTag(1);
     controller.state.drafts.items = "古い項目の下書き";
     controller.state.drafts.query = "古い検索";
     await controller.startComparison();
@@ -641,7 +641,7 @@ describe("portable list transfer", () => {
     expect(controller.state.lists).toEqual([summary(initial), summary(imported)]);
     expect(controller.state.modal).toBeNull();
     expect(controller.state.pair).toBeNull();
-    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.selectedTagIds).toEqual([]);
     expect(controller.state.view).toBe("items");
     expect(controller.state.drafts.items).toBe("");
     expect(controller.state.drafts.query).toBe("");
@@ -789,7 +789,7 @@ describe("tag management", () => {
     const api = backend(initial);
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
-    controller.selectTag(3);
+    controller.toggleTag(3);
     await controller.openModal({ kind: "tags" });
     controller.editTag(3);
     controller.state.tagDraft = "新しい";
@@ -800,7 +800,7 @@ describe("tag management", () => {
 
     expect(api.getList).toHaveBeenCalledTimes(2);
     expect(controller.state.active).toEqual(refreshed);
-    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.selectedTagIds).toEqual([]);
     expect(controller.state.tagEditingId).toBeNull();
     expect(controller.state.tagDraft).toBe("");
     expect(controller.state.error).toBe("タグが見つかりません。");
@@ -856,47 +856,98 @@ describe("tag management", () => {
     expect(controller.state.error).toBe("");
   });
 
-  it("renames and deletes tags while resetting a deleted ranking filter", async () => {
+  it("keeps selected tags after renaming and removes only the deleted selection", async () => {
     const initial: ListState = {
       ...list(),
-      tags: [{ id: 3, listId: 1, name: "以前" }],
-      items: list().items.map((item) => ({ ...item, tagIds: [3] })),
+      tags: [
+        { id: 3, listId: 1, name: "以前" },
+        { id: 4, listId: 1, name: "残す" },
+      ],
+      items: list().items.map((item) => ({ ...item, tagIds: [3, 4] })),
     };
     const api = backend(initial);
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
-    controller.selectTag(3);
+    controller.toggleTag(3);
+    controller.toggleTag(4);
     await controller.openModal({ kind: "tags" });
     controller.editTag(3);
     controller.state.tagDraft = "新しい";
-    const renamed = { ...initial, tags: [{ ...initial.tags[0]!, name: "新しい" }] };
+    const renamed = {
+      ...initial,
+      tags: initial.tags.map((tag) => (tag.id === 3 ? { ...tag, name: "新しい" } : tag)),
+    };
     api.renameTag.mockResolvedValueOnce(renamed);
     await controller.saveTag();
     expect(api.renameTag).toHaveBeenCalledExactlyOnceWith(1, 3, "新しい");
-    expect(controller.state.selectedTagId).toBe(3);
+    expect(controller.state.selectedTagIds).toEqual([3, 4]);
     controller.deleteTagPrompt(3);
     const deleted = {
       ...renamed,
-      tags: [],
-      items: renamed.items.map((item) => ({ ...item, tagIds: [] })),
+      tags: renamed.tags.filter((tag) => tag.id !== 3),
+      items: renamed.items.map((item) => ({ ...item, tagIds: [4] })),
     };
     api.deleteTag.mockResolvedValueOnce(deleted);
     await controller.confirmTagDelete();
     expect(api.deleteTag).toHaveBeenCalledExactlyOnceWith(1, 3);
-    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.selectedTagIds).toEqual([4]);
   });
 
-  it("resets the selected tag when switching lists", async () => {
-    const first = { ...list(), tags: [{ id: 3, listId: 1, name: "好き" }] };
-    const second = { ...list(2), tags: [{ id: 4, listId: 2, name: "好き" }] };
+  it("toggles valid tags, keeps selections across pages, and ignores changes while busy", async () => {
+    const initial = {
+      ...list(),
+      tags: [
+        { id: 3, listId: 1, name: "好き" },
+        { id: 4, listId: 1, name: "未割当" },
+      ],
+    };
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    expect(controller.state.selectedTagIds).toEqual([]);
+    controller.toggleTag(3);
+    controller.toggleTag(4);
+    controller.toggleTag(999);
+    expect(controller.state.selectedTagIds).toEqual([3, 4]);
+    for (const view of ["ranking", "tier", "items", "ranking"] as const) {
+      await controller.navigate(view);
+      expect(controller.state.selectedTagIds).toEqual([3, 4]);
+    }
+    await controller.selectList(initial.id);
+    expect(controller.state.selectedTagIds).toEqual([3, 4]);
+    controller.toggleTag(3);
+    expect(controller.state.selectedTagIds).toEqual([4]);
+    let finish!: (value: ListState) => void;
+    api.getList.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const loading = controller.selectList(initial.id);
+    expect(controller.state.busy).toBe(true);
+    controller.toggleTag(3);
+    controller.toggleTag(4);
+    expect(controller.state.selectedTagIds).toEqual([4]);
+    finish(initial);
+    await loading;
+    controller.toggleTag(4);
+    expect(controller.state.selectedTagIds).toEqual([]);
+  });
+
+  it("resets all selected tags when switching lists, even when tag IDs overlap", async () => {
+    const first = {
+      ...list(),
+      tags: [
+        { id: 3, listId: 1, name: "好き" },
+        { id: 4, listId: 1, name: "甘い" },
+      ],
+    };
+    const second = { ...list(2), tags: [{ id: 3, listId: 2, name: "別のタグ" }] };
     const api = backend(first, second);
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
-    controller.selectTag(3);
+    controller.toggleTag(3);
+    controller.toggleTag(4);
     await controller.selectList(2);
-    expect(controller.state.selectedTagId).toBeNull();
-    controller.selectTag(3);
-    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.selectedTagIds).toEqual([]);
+    controller.toggleTag(4);
+    expect(controller.state.selectedTagIds).toEqual([]);
   });
 
   it("clears the selected tag when deleting the current list and loading another", async () => {
@@ -905,12 +956,12 @@ describe("tag management", () => {
     const api = backend(first, second);
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
-    controller.selectTag(3);
+    controller.toggleTag(3);
     await controller.openModal({ kind: "delete-list" });
     api.listSummaries.mockResolvedValueOnce([summary(second)]);
     await controller.confirmDelete();
     expect(controller.state.active?.id).toBe(2);
-    expect(controller.state.selectedTagId).toBeNull();
+    expect(controller.state.selectedTagIds).toEqual([]);
   });
 });
 
