@@ -64,7 +64,7 @@ export type AppApi = {
     expectedRevision: number,
     itemIds: number[],
   ) => Promise<Record<string, string>>;
-  saveReport: (format: ReportFormat, bytes: Uint8Array) => Promise<boolean>;
+  saveReport: (format: ReportFormat, bytes: Uint8Array, view: ReportView) => Promise<boolean>;
   importList: () => Promise<ListState | null>;
   renameList: (listId: number, name: string) => Promise<ListState>;
   deleteList: (listId: number) => Promise<void>;

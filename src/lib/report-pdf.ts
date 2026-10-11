@@ -168,7 +168,7 @@ function tiers(report: Report): Content[] {
               fillColor: tierPalette[tier.label].background,
               color: tierPalette[tier.label].color,
             },
-            { text: "項目（左ほど上位）", colSpan: 4, fillColor: "#eef1e9" },
+            { text: "", colSpan: 4, fillColor: "#eef1e9" },
             {},
             {},
             {},

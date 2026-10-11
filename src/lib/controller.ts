@@ -653,7 +653,7 @@ export class AppController {
         format === "html" ? new TextEncoder().encode(reportHtml(report)) : await reportPdf(report);
       if (bytes.length > 50 * 1024 * 1024)
         throw new Error("出力する表は 50 MiB 以内にしてください。画像を含めずに再試行できます。");
-      if (!(await this.api.saveReport(format, bytes))) return;
+      if (!(await this.api.saveReport(format, bytes, modal.view))) return;
       this.state.modal = null;
       this.state.notice = `${modal.view === "ranking" ? "ランキング" : "Tier 表"}を ${format.toUpperCase()} で出力しました。`;
     });

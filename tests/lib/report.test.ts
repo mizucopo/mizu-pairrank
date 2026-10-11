@@ -302,7 +302,7 @@ describe("saved PDF output", () => {
             .map((page) =>
               page
                 .replace(/\d+ \/ \d+$/, "")
-                .replace(/^Tier C項目（左ほど上位）/, "")
+                .replace(/^Tier C/, "")
                 .replace(/^順位画像項目評価σ比較/, ""),
             )
             .join("");
@@ -360,9 +360,8 @@ describe("saved PDF output", () => {
     const pdf = await PDFDocument.load(await reportPdf(createReport(state, "tier", [])));
     const texts = pageTexts(pdf);
     expect(texts.length).toBeGreaterThan(2);
-    expect(texts.slice(1, -1).every((text) => text.includes("Tier C項目（左ほど上位）"))).toBe(
-      true,
-    );
+    expect(texts.slice(1, -1).every((text) => text.includes("Tier C"))).toBe(true);
+    expect(texts.join("")).not.toContain("項目（左ほど上位）");
     for (const entry of state.items.slice(1)) expect(texts.join("")).toContain(entry.name);
     expect(texts.join("")).toContain("折り返し");
     expect(texts.join("")).not.toContain("\ufffd");

@@ -14,6 +14,7 @@ const MAX_IMAGES: usize = 500;
 const MAX_TOTAL_IMAGE_PIXELS: u64 = 100_000_000;
 const DATA_URL_PREFIX: &str = "data:image/png;base64,";
 const FORMAT_HEADER: &str = "x-pairrank-report-format";
+const VIEW_HEADER: &str = "x-pairrank-report-view";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportFormat {
@@ -21,10 +22,26 @@ pub enum ReportFormat {
     Pdf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportView {
+    Ranking,
+    Tier,
+}
+
+impl ReportView {
+    pub fn default_filename(self, format: ReportFormat) -> String {
+        let stem = match self {
+            Self::Ranking => "ranking",
+            Self::Tier => "tier",
+        };
+        format!("{stem}.{}", format.extension())
+    }
+}
+
 pub fn read_request<'a>(
     body: &'a InvokeBody,
     headers: &HeaderMap,
-) -> Result<(ReportFormat, &'a [u8]), String> {
+) -> Result<(ReportFormat, ReportView, &'a [u8]), String> {
     let InvokeBody::Raw(bytes) = body else {
         return Err("レポートはバイナリデータで送信してください。再試行してください。".to_owned());
     };
@@ -39,8 +56,19 @@ pub fn read_request<'a>(
     if headers.get_all(FORMAT_HEADER).iter().count() != 1 {
         return Err("レポート形式の指定が正しくありません。再試行してください。".to_owned());
     }
+    let view = match headers
+        .get(VIEW_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("ranking") => ReportView::Ranking,
+        Some("tier") => ReportView::Tier,
+        _ => return Err("レポートの表示種類が正しくありません。再試行してください。".to_owned()),
+    };
+    if headers.get_all(VIEW_HEADER).iter().count() != 1 {
+        return Err("レポートの表示種類が正しくありません。再試行してください。".to_owned());
+    }
     validate_payload(format, bytes)?;
-    Ok((format, bytes))
+    Ok((format, view, bytes))
 }
 
 impl ReportFormat {
@@ -204,6 +232,7 @@ mod tests {
     fn request_headers(format: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(FORMAT_HEADER, format.parse().unwrap());
+        headers.insert(VIEW_HEADER, "ranking".parse().unwrap());
         headers
     }
 
@@ -223,9 +252,10 @@ mod tests {
             let InvokeBody::Raw(original) = &body else {
                 unreachable!()
             };
-            let (received_format, bytes) =
+            let (received_format, received_view, bytes) =
                 read_request(&body, &request_headers(format.extension())).unwrap();
             assert_eq!(received_format, format);
+            assert_eq!(received_view, ReportView::Ranking);
             assert_eq!(bytes, document);
             assert_eq!(bytes.as_ptr(), original.as_ptr());
         }
@@ -277,6 +307,46 @@ mod tests {
         }
         let html = InvokeBody::Raw(b"<!doctype html><html></html>".to_vec());
         assert!(read_request(&html, &request_headers("pdf")).is_err());
+    }
+
+    #[test]
+    fn report_requests_choose_distinct_default_names_for_each_view_and_format() {
+        for (format, document) in [
+            ("pdf", b"%PDF-1.7\n%%EOF".as_slice()),
+            ("html", b"<!doctype html><html></html>".as_slice()),
+        ] {
+            for view in ["ranking", "tier"] {
+                let body = InvokeBody::Raw(document.to_vec());
+                let mut headers = request_headers(format);
+                headers.insert(VIEW_HEADER, view.parse().unwrap());
+                let (format, received_view, bytes) = read_request(&body, &headers).unwrap();
+                assert_eq!(
+                    received_view.default_filename(format),
+                    format!("{view}.{}", format.extension())
+                );
+                assert_eq!(bytes, document);
+            }
+        }
+    }
+
+    #[test]
+    fn report_requests_reject_missing_unsupported_and_ambiguous_view_headers() {
+        let body = InvokeBody::Raw(b"%PDF-1.7\n%%EOF".to_vec());
+        let mut headers = request_headers("pdf");
+        headers.remove(VIEW_HEADER);
+        assert!(read_request(&body, &headers).is_err());
+        for view in ["", "list", "Tier", "tier,ranking", " tier"] {
+            headers.insert(VIEW_HEADER, view.parse().unwrap());
+            assert!(read_request(&body, &headers).is_err());
+        }
+        headers.insert(VIEW_HEADER, "tier".parse().unwrap());
+        headers.append(VIEW_HEADER, "ranking".parse().unwrap());
+        assert!(read_request(&body, &headers).is_err());
+        headers.insert(
+            VIEW_HEADER,
+            tauri::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(read_request(&body, &headers).is_err());
     }
 
     fn fixture() -> (tempfile::TempDir, Database, ImageService, ListState) {

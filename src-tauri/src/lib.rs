@@ -296,7 +296,7 @@ async fn report_images(
 
 #[tauri::command]
 async fn save_report(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<bool, String> {
-    let (format, bytes) = report::read_request(request.body(), request.headers())?;
+    let (format, view, bytes) = report::read_request(request.body(), request.headers())?;
     // Request borrows the IPC body; copy only validated bytes for the native worker.
     let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -309,7 +309,7 @@ async fn save_report(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result
             .dialog()
             .file()
             .add_filter(label, &[extension])
-            .set_file_name(format!("ranking.{extension}"))
+            .set_file_name(view.default_filename(format))
             .blocking_save_file()
         else {
             return Ok(false);
