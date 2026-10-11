@@ -47,8 +47,15 @@ function covered(code: number, ranges: readonly [number, number][]): boolean {
   return false;
 }
 
-function textRuns(text: string): { text: string; font: string }[] {
-  const runs: { text: string; font: string }[] = [];
+type TextRun = {
+  text: string;
+  font: string;
+  wordBreak: "normal" | "break-all";
+  noWrap: boolean;
+};
+
+function textRuns(text: string): TextRun[] {
+  const runs: TextRun[] = [];
   for (const { segment } of segmenter.segment(text)) {
     const points = Array.from(segment, (character) => character.codePointAt(0)!);
     const layoutControl = (code: number): boolean => [9, 10, 13].includes(code);
@@ -63,9 +70,22 @@ function textRuns(text: string): { text: string; font: string }[] {
         `PDFで表示できない文字があります: ${segment}。HTML形式でエクスポートしてください。`,
       );
     }
+    // pdfmake's break-all and emergency wrapping split UTF-16 code units.
+    // Only single-unit graphemes can use break-all; keep larger graphemes
+    // indivisible so surrogate pairs, combining marks, and ZWJ emoji survive.
+    const noWrap = segment.length > 1 && segment !== "\r\n";
+    const wordBreak = noWrap || segment === "\r\n" ? "normal" : "break-all";
     const last = runs.at(-1);
-    if (last?.font === font) last.text += segment;
-    else runs.push({ text: segment, font });
+    if (!noWrap && last?.font === font && !last.noWrap && last.wordBreak === wordBreak) {
+      last.text += segment;
+    } else {
+      runs.push({ text: segment, font, wordBreak, noWrap });
+      if (noWrap) {
+        // An empty inline stops pdfmake rejoining adjacent graphemes into an
+        // unbreakable word. It adds no character to the saved PDF text.
+        runs.push({ text: "", font, wordBreak: "normal", noWrap: false });
+      }
+    }
   }
   return runs;
 }

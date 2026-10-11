@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
+import pdfMake from "pdfmake/build/pdfmake";
 import { decodePDFRawStream, PDFArray, PDFDict, PDFDocument, PDFName, PDFRawStream } from "pdf-lib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createReport, matchingItems, reportHtml, reportPdf } from "../../src/lib/report.js";
 import type { Item, ListState } from "../../src/lib/types.js";
@@ -236,6 +237,86 @@ describe("report projection and HTML", () => {
 });
 
 describe("saved PDF output", () => {
+  it.each([
+    {
+      description: "unbroken Latin with Japanese and joined emoji",
+      title: "VeryLongUnbrokenAsciiListTitle".repeat(12),
+      tag: "VeryLongUnbrokenAsciiTagName".repeat(12),
+      name: `${"VeryLongUnbrokenAsciiItemName".repeat(12)}𠮷🍎👩‍👩‍👧‍👦`,
+    },
+    {
+      description: "consecutive non-BMP Japanese graphemes",
+      title: `題名${"𠮷".repeat(120)}題名終`,
+      tag: `タグ${"𠮷".repeat(120)}タグ終`,
+      name: `項目${"𠮷".repeat(120)}項目終`,
+    },
+    {
+      description: "consecutive emoji graphemes",
+      title: `題名${"🍎".repeat(120)}題名終`,
+      tag: `タグ${"🍎".repeat(120)}タグ終`,
+      name: `項目${"🍎".repeat(120)}項目終`,
+    },
+    {
+      description: "consecutive decomposed Latin graphemes",
+      title: `題名${"e\u0301".repeat(180)}題名終`,
+      tag: `タグ${"e\u0301".repeat(180)}タグ終`,
+      name: `項目${"e\u0301".repeat(180)}項目終`,
+    },
+  ])(
+    "wraps $description in titles, tags, and names in both views",
+    async ({ title, tag, name }) => {
+      type LayoutStream = {
+        _pdfMakePages: {
+          pageSize: { width: number };
+          items: {
+            type: string;
+            item: { x: number; getWidth: () => number };
+          }[];
+        }[];
+      };
+      const state = list([item(1, 25, [10])]);
+      state.name = title;
+      state.tags[0]!.name = tag;
+      state.items[0]!.name = name;
+      const createPdf = vi.spyOn(pdfMake, "createPdf");
+      try {
+        for (const view of ["ranking", "tier"] as const) {
+          const pdf = await PDFDocument.load(await reportPdf(createReport(state, view, [10])));
+          const output = createPdf.mock.results.at(-1)!.value;
+          const stream = (await output.getStream()) as unknown as LayoutStream;
+          const lines = stream["_pdfMakePages"].flatMap((page) =>
+            page.items
+              .filter(({ type }) => type === "line")
+              .map(({ item: line }) => ({
+                left: line.x,
+                right: line.x + line.getWidth(),
+                pageWidth: page.pageSize.width,
+              })),
+          );
+          expect(lines.length).toBeGreaterThan(20);
+          for (const line of lines) {
+            expect(line.left).toBeGreaterThanOrEqual(31.99);
+            expect(line.right).toBeLessThanOrEqual(line.pageWidth - 32 + 0.01);
+          }
+          const text = pageTexts(pdf)
+            .map((page) =>
+              page
+                .replace(/\d+ \/ \d+$/, "")
+                .replace(/^Tier C項目（左ほど上位）/, "")
+                .replace(/^順位画像項目評価σ比較/, ""),
+            )
+            .join("");
+          expect(text).toContain(state.name);
+          expect(text).toContain(state.tags[0]!.name);
+          expect(text).toContain(state.items[0]!.name);
+          expect(text).not.toContain("\ufffd");
+        }
+      } finally {
+        createPdf.mockRestore();
+      }
+    },
+  );
+
   it("creates a readable PDF with embedded Japanese text and opted-in managed PNG data", async () => {
     const state = list([item(1)]);
     state.items[0]!.name = "かな漢字髙𠮷";
