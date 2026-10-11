@@ -1,24 +1,9 @@
 import { answers, configuredSearchProviders, tagNameMaxLength } from "./controller.js";
 import type { AppState, View } from "./controller.js";
+import { escapeHtml } from "./html.js";
 import { tierRows } from "./tier.js";
 import type { Item, SearchProvider } from "./types.js";
 
-export function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (c) => {
-    switch (c) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      default:
-        return "&#39;";
-    }
-  });
-}
 const e = escapeHtml;
 const disabled = (state: AppState): string => (state.busy ? " disabled" : "");
 const number = (value: number): string => value.toFixed(2);
@@ -119,7 +104,7 @@ function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
   const visible = list.items.filter((item) => matchesSelectedTags(item, s));
-  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div></div>${s.canUndoAnswer ? undoAnswerButton(s) : ""}${tagFilter(s)}${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
+  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div><button class="secondary" data-action="export-report"${disabled(s)}>表を出力</button></div>${s.canUndoAnswer ? undoAnswerButton(s) : ""}${tagFilter(s)}${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
 }
 function tierView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
@@ -130,7 +115,7 @@ function tierView(s: AppState, assetUrl: (path: string) => string): string {
     entries: row.entries.filter(({ item }) => matchesSelectedTags(item, s)),
   }));
   const hasVisibleItems = rows.some((row) => row.entries.length > 0);
-  return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && allRows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div></div>${tagFilter(s)}${hasVisibleItems ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item }) => `<li class="tier-card">${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
+  return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && allRows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div><button class="secondary" data-action="export-report"${disabled(s)}>表を出力</button></div>${tagFilter(s)}${hasVisibleItems ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item }) => `<li class="tier-card">${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
   return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header>${credentialAccess(s)}<section class="settings-grid">${(
@@ -167,6 +152,9 @@ function modalView(s: AppState): string {
   if (modal.kind === "export-list") {
     title = "リストをエクスポート";
     body = `<p>「${e(s.active?.name ?? "")}」のリスト名・項目名・タグを ZIP ファイルに保存します。</p><p class="muted">比較履歴・評価は含みません。</p><label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>${s.busy ? '<p role="status">エクスポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
+  } else if (modal.kind === "export-report") {
+    title = `${modal.view === "ranking" ? "ランキング" : "Tier 表"}を出力`;
+    body = `<p>「${e(s.active?.name ?? "")}」の、現在のタグ絞り込みに一致する全項目を保存します。</p><label for="report-format">ファイル形式</label><select id="report-format" data-focus="report-format"${disabled(s)}><option value="pdf"${s.reportFormat === "pdf" ? " selected" : ""}>PDF</option><option value="html"${s.reportFormat === "html" ? " selected" : ""}>HTML</option></select><label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>${s.busy ? '<p role="status">表を作成・保存しています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-report-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
   } else if (modal.kind === "import-list") {
     title = "リストをインポート";
     body = `<p>pairrank でエクスポートした ZIP ファイルから、リスト名・項目名・タグを取り込みます。画像が含まれる場合は画像も取り込みます。</p><p class="muted">新しいリストとして追加します。既存のリストは変更せず、比較は最初から始められます。</p>${s.busy ? '<p role="status">インポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-import"${disabled(s)}>ファイルを選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;

@@ -6,9 +6,12 @@ import type {
   ListSummary,
   PairProposal,
   Preference,
+  ReportFormat,
+  ReportView,
   SearchProvider,
   SearchSettings,
 } from "./types.js";
+import { createReport, matchingItems, reportHtml, reportPdf } from "./report.js";
 
 export type View = "items" | "compare" | "ranking" | "tier" | "settings";
 type ReadKind = "image" | "settings";
@@ -18,6 +21,7 @@ export type Modal =
   | { kind: "delete-list" }
   | { kind: "reset-comparisons" }
   | { kind: "export-list" }
+  | { kind: "export-report"; view: ReportView }
   | { kind: "import-list" }
   | { kind: "rename-item"; itemId: number }
   | { kind: "delete-item"; itemId: number }
@@ -49,6 +53,7 @@ export type AppState = {
   notice: string;
   modal: Modal;
   exportIncludeImages: boolean;
+  reportFormat: ReportFormat;
   tagDraft: string;
   tagEditingId: number | null;
   tagDeletingId: number | null;
@@ -107,6 +112,7 @@ export class AppController {
     notice: "",
     modal: null,
     exportIncludeImages: false,
+    reportFormat: "pdf",
     tagDraft: "",
     tagEditingId: null,
     tagDeletingId: null,
@@ -394,10 +400,13 @@ export class AppController {
   async openModal(modal: Exclude<Modal, null>): Promise<void> {
     this.cancelRead("settings");
     if (this.state.busy) return;
-    if (modal.kind === "export-list" && !this.state.active) return;
+    if ((modal.kind === "export-list" || modal.kind === "export-report") && !this.state.active)
+      return;
+    if (modal.kind === "export-report" && this.state.view !== modal.view) return;
     this.state.modal = modal;
     this.state.error = "";
     this.state.exportIncludeImages = false;
+    this.state.reportFormat = "pdf";
     this.state.tagDraft = "";
     this.state.tagEditingId = null;
     this.state.tagDeletingId = null;
@@ -609,9 +618,47 @@ export class AppController {
   }
 
   setExportIncludeImages(includeImages: boolean): void {
-    if (this.state.busy || this.state.modal?.kind !== "export-list") return;
+    if (
+      this.state.busy ||
+      (this.state.modal?.kind !== "export-list" && this.state.modal?.kind !== "export-report")
+    )
+      return;
     this.state.exportIncludeImages = includeImages;
     this.changed();
+  }
+
+  setReportFormat(format: ReportFormat): void {
+    if (this.state.busy || this.state.modal?.kind !== "export-report") return;
+    this.state.reportFormat = format;
+    this.changed();
+  }
+
+  async exportReport(): Promise<void> {
+    const list = this.state.active;
+    const modal = this.state.modal;
+    if (!list || modal?.kind !== "export-report" || this.state.view !== modal.view) return;
+    const tags = [...this.state.selectedTagIds];
+    const format = this.state.reportFormat;
+    const imageIds = this.state.exportIncludeImages
+      ? matchingItems(list.items, tags)
+          .filter((item) => item.image)
+          .map((item) => item.id)
+      : [];
+    await this.perform(async () => {
+      const images = imageIds.length
+        ? await this.api
+            .reportImages(list.id, list.revision, imageIds)
+            .catch((error: unknown) => this.handleListError(list.id, error))
+        : {};
+      const report = createReport(list, modal.view, tags, images);
+      const bytes =
+        format === "html" ? new TextEncoder().encode(reportHtml(report)) : await reportPdf(report);
+      if (bytes.length > 50 * 1024 * 1024)
+        throw new Error("出力する表は 50 MiB 以内にしてください。画像を含めずに再試行できます。");
+      if (!(await this.api.saveReport(format, Array.from(bytes)))) return;
+      this.state.modal = null;
+      this.state.notice = `${modal.view === "ranking" ? "ランキング" : "Tier 表"}を ${format.toUpperCase()} で出力しました。`;
+    });
   }
 
   async exportList(): Promise<void> {

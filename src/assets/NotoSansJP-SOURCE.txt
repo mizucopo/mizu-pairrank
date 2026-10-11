@@ -1,0 +1,9 @@
+NotoSansJP-Regular.otf is the unmodified static Japanese subset of Noto Sans CJK.
+Upstream: https://github.com/notofonts/noto-cjk
+Source: https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/JP/NotoSansJP-Regular.otf
+Retrieved: 2026-10-11
+SHA-256: dff723ba59d57d136764a04b9b2d03205544f7cd785a711442d6d2d085ac5073
+License: SIL Open Font License 1.1 (NotoSansJP-OFL.txt)
+Copyright: © 2014-2021 Adobe (http://www.adobe.com/).
+Copyright information is retained in the unmodified font's name metadata and
+included with the bundled OFL license notice.

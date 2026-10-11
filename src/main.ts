@@ -220,6 +220,9 @@ export function mountApp(
       void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     } else if (target instanceof HTMLInputElement && target.id === "export-include-images") {
       controller.setExportIncludeImages(target.checked);
+    } else if (target instanceof HTMLSelectElement && target.id === "report-format") {
+      if (target.value === "html" || target.value === "pdf")
+        controller.setReportFormat(target.value);
     }
   });
   root.addEventListener("submit", (event) => {
@@ -304,6 +307,13 @@ export function mountApp(
         break;
       case "export-list":
         void openModal({ kind: "export-list" }, button);
+        break;
+      case "export-report":
+        if (controller.state.view === "ranking" || controller.state.view === "tier")
+          void openModal({ kind: "export-report", view: controller.state.view }, button);
+        break;
+      case "confirm-report-export":
+        void controller.exportReport();
         break;
       case "import-list":
         void openModal({ kind: "import-list" }, button);

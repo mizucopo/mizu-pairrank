@@ -3,6 +3,7 @@ mod database;
 mod images;
 mod models;
 mod rating;
+mod report;
 mod sqlite_vfs;
 mod storage;
 mod transfer;
@@ -11,6 +12,8 @@ use database::{Database, ImageChange};
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
 use models::{ImageAsset, ListState, ListSummary};
 use rating::Preference;
+use report::ReportFormat;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -33,6 +36,27 @@ struct Backend {
 }
 
 impl Backend {
+    async fn report_images(
+        &self,
+        list_id: i64,
+        expected_revision: i64,
+        item_ids: Vec<i64>,
+    ) -> Result<HashMap<i64, String>, String> {
+        let selected = self
+            .database_job(move |db| {
+                report::selected_images(db, list_id, expected_revision, &item_ids)
+            })
+            .await?;
+        if selected.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let images = self.images.clone()?;
+        // The database snapshot and its permit are released before decoding images.
+        tokio::task::spawn_blocking(move || report::image_urls(selected, &images))
+            .await
+            .map_err(|_| "画像を書き出せませんでした。画像なしで再試行できます。".to_owned())?
+    }
+
     async fn auto_register_image(
         &self,
         list_id: i64,
@@ -256,6 +280,44 @@ async fn export_list(app: AppHandle, list_id: i64, include_images: bool) -> Resu
         Ok(true)
     })
     .await
+}
+
+#[tauri::command]
+async fn report_images(
+    app: AppHandle,
+    list_id: i64,
+    expected_revision: i64,
+    item_ids: Vec<i64>,
+) -> Result<HashMap<i64, String>, String> {
+    app.state::<Backend>()
+        .report_images(list_id, expected_revision, item_ids)
+        .await
+}
+
+#[tauri::command]
+async fn save_report(app: AppHandle, format: ReportFormat, bytes: Vec<u8>) -> Result<bool, String> {
+    report::validate_payload(format, &bytes)?;
+    tokio::task::spawn_blocking(move || {
+        let extension = format.extension();
+        let label = match format {
+            ReportFormat::Html => "HTML レポート",
+            ReportFormat::Pdf => "PDF レポート",
+        };
+        let Some(file) = app
+            .dialog()
+            .file()
+            .add_filter(label, &[extension])
+            .set_file_name(format!("ranking.{extension}"))
+            .blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let path = file.into_path().map_err(|error| error.to_string())?;
+        report::write(&path, format, &bytes)?;
+        Ok(true)
+    })
+    .await
+    .map_err(|_| "レポートを保存できませんでした。再試行してください。".to_owned())?
 }
 
 #[tauri::command]
@@ -611,6 +673,8 @@ pub fn run() {
             create_list,
             duplicate_list,
             export_list,
+            report_images,
+            save_report,
             import_list,
             rename_list,
             delete_list,
@@ -642,6 +706,49 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn reports_without_images_work_when_image_storage_is_unavailable() {
+        let (_directory, mut backend) = backend();
+        let (list_id, item_id, _) = list_with_image(&backend).await;
+        let list = backend
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        let revision = i64::try_from(list.revision).unwrap();
+        let before = serde_json::to_value(&list).unwrap();
+        let output = backend
+            .report_images(list_id, revision, vec![item_id])
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert!(output[&item_id].starts_with("data:image/png;base64,"));
+        backend.images = Err("Image storage unavailable".into());
+        assert!(
+            backend
+                .report_images(list_id, revision, vec![])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .report_images(list_id, revision - 1, vec![])
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .report_images(list_id, revision, vec![item_id])
+                .await
+                .is_err()
+        );
+        let after = backend
+            .database_job(move |db| db.get_list(list_id))
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+    }
 
     #[test]
     fn pair_proposals_normalize_exclusions_without_changing_saved_comparisons() {
