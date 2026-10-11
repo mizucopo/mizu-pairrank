@@ -28,3 +28,30 @@ describe("report IPC transport", () => {
     });
   });
 });
+
+describe("OpenAI IPC transport", () => {
+  it("sends model, mode and authentication actions without credential reads", async () => {
+    const transport = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: { invoke: transport } });
+    await api.saveOpenAiSettings("unlisted-model", "chatgpt");
+    await api.openAiModels();
+    await api.connectChatGpt(false);
+    await api.connectChatGpt(true);
+    await api.disconnectChatGpt();
+    await api.openChatGptUsage();
+    await api.setApiKey("openai", "test-key");
+    await api.searchImages("openai", "りんご");
+    await api.autoRegisterImage(1, 10, "openai");
+    expect(transport.mock.calls.map(([command, payload]) => [command, payload])).toEqual([
+      ["save_openai_settings", { model: "unlisted-model", authMode: "chatgpt" }],
+      ["openai_models", {}],
+      ["connect_chatgpt", { newAccount: false }],
+      ["connect_chatgpt", { newAccount: true }],
+      ["disconnect_chatgpt", {}],
+      ["open_chatgpt_usage", {}],
+      ["set_api_key", { provider: "openai", key: "test-key" }],
+      ["search_images", { provider: "openai", query: "りんご" }],
+      ["auto_register_image", { listId: 1, itemId: 10, provider: "openai" }],
+    ]);
+  });
+});

@@ -12,6 +12,15 @@ import type {
   Preference,
 } from "../src/lib/types.js";
 
+const openAiSettings = {
+  openaiConfigured: false,
+  openaiModel: "gpt-6-luna",
+  openaiAuthMode: "api" as const,
+  chatgptConnected: false,
+  chatgptSharing: false,
+  chatgptAccount: null,
+};
+
 function setup(
   assetUrl: (path: string, protocol?: string) => string = (path) => `asset://${path}`,
 ) {
@@ -44,6 +53,7 @@ function setup(
   // The selected presentation deliberately reverses registration order.
   const pair: PairProposal = { listId: 1, revision: 5, a: second, b: first };
   const settings = {
+    ...openAiSettings,
     braveConfigured: false,
     ollamaConfigured: false,
     defaultProvider: "brave" as const,
@@ -84,6 +94,11 @@ function setup(
     undoAnswer: vi.fn<AppApi["undoAnswer"]>().mockResolvedValue(state),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
+    saveOpenAiSettings: vi.fn<AppApi["saveOpenAiSettings"]>().mockResolvedValue(undefined),
+    openAiModels: vi.fn<AppApi["openAiModels"]>().mockResolvedValue([]),
+    connectChatGpt: vi.fn<AppApi["connectChatGpt"]>().mockResolvedValue(undefined),
+    disconnectChatGpt: vi.fn<AppApi["disconnectChatGpt"]>().mockResolvedValue(undefined),
+    openChatGptUsage: vi.fn<AppApi["openChatGptUsage"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
     autoRegisterImage: vi.fn<AppApi["autoRegisterImage"]>().mockResolvedValue("skipped"),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(state),
@@ -322,13 +337,13 @@ describe("desktop app interaction", () => {
     await click(root, controller, '[data-view="settings"]');
     expect(
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
-    ).toEqual(["未確認", "未確認"]);
+    ).toEqual(["未確認", "未確認", "未確認"]);
     expect(root.textContent).toContain("比較");
     api.searchSettings.mockRejectedValueOnce(new Error("ユーザーが確認をキャンセルしました"));
     await click(root, controller, '[data-action="check-search-settings"]');
     expect(
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
-    ).toEqual(["確認できません", "確認できません"]);
+    ).toEqual(["確認できません", "確認できません", "確認できません"]);
     expect(button(root, '[data-action="check-search-settings"]').disabled).toBe(false);
     await click(root, controller, '[data-action="select-list"][data-id="1"]');
     await click(root, controller, '[data-view="compare"]');
@@ -338,11 +353,11 @@ describe("desktop app interaction", () => {
     await click(root, controller, '[data-view="settings"]');
     expect(
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
-    ).toEqual(["確認できません", "確認できません"]);
+    ).toEqual(["確認できません", "確認できません", "確認できません"]);
     await click(root, controller, '[data-action="check-search-settings"]');
     expect(
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
-    ).toEqual(["未設定", "未設定"]);
+    ).toEqual(["未設定", "未設定", "未設定"]);
     expect(api.searchSettings).toHaveBeenCalledTimes(2);
   });
 
@@ -359,6 +374,7 @@ describe("desktop app interaction", () => {
             finishOld = () =>
               outcome === "result"
                 ? resolve({
+                    ...openAiSettings,
                     braveConfigured: false,
                     ollamaConfigured: true,
                     defaultProvider: "ollama",
@@ -377,7 +393,12 @@ describe("desktop app interaction", () => {
         () =>
           new Promise((resolve) => {
             finishCurrent = () =>
-              resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
+              resolve({
+                ...openAiSettings,
+                braveConfigured: true,
+                ollamaConfigured: false,
+                defaultProvider: "brave",
+              });
           }),
       );
       const currentRead = controller.checkSearchSettings();
@@ -412,7 +433,7 @@ describe("desktop app interaction", () => {
     expect(root.textContent).toContain("APIキーを削除しました。");
     expect(
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
-    ).toEqual(["未設定", "未確認"]);
+    ).toEqual(["未設定", "未確認", "未確認"]);
     expect(api.searchSettings).not.toHaveBeenCalled();
   });
 
@@ -932,7 +953,12 @@ describe("desktop app interaction", () => {
     if (!row) throw new Error("Missing Tier row");
     row.focus();
     row.scrollLeft = 80;
-    finishRead({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
+    finishRead({
+      ...openAiSettings,
+      braveConfigured: false,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
     await reading;
     expect(root.querySelector(".tier-items")).toBe(row);
     expect(document.activeElement).toBe(row);
@@ -952,6 +978,7 @@ describe("desktop app interaction", () => {
       const { root, controller, api } = setup();
       await controller.initialize();
       api.searchSettings.mockResolvedValueOnce({
+        ...openAiSettings,
         braveConfigured,
         ollamaConfigured,
         defaultProvider: "brave",
@@ -986,6 +1013,7 @@ describe("desktop app interaction", () => {
     await controller.initialize();
     expect(button(root, '[data-action="bulk-images"]').disabled).toBe(false);
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: false,
       ollamaConfigured: true,
       defaultProvider: "ollama",
@@ -1010,6 +1038,7 @@ describe("desktop app interaction", () => {
     expect(button(root, '[data-action="start-bulk-images"]').disabled).toBe(true);
     expect(button(root, '[data-action="check-search-settings"]').disabled).toBe(false);
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1023,6 +1052,7 @@ describe("desktop app interaction", () => {
   it("disables bulk start during an explicit credential recheck while keeping cancellation available", async () => {
     const { root, controller, api } = setup();
     const configured = {
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave" as const,
@@ -1062,6 +1092,7 @@ describe("desktop app interaction", () => {
     api.getList.mockResolvedValueOnce(withLocalImage(state));
     await controller.initialize();
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1093,6 +1124,7 @@ describe("desktop app interaction", () => {
     const { root, controller, api, state } = setup();
     await controller.initialize();
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1130,6 +1162,7 @@ describe("desktop app interaction", () => {
     const { root, controller, api, state } = setup();
     await controller.initialize();
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1155,6 +1188,7 @@ describe("desktop app interaction", () => {
     const { root, controller, api } = setup();
     await controller.initialize();
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1267,6 +1301,7 @@ describe("desktop app interaction", () => {
           new Promise((resolve) => {
             finish = () =>
               resolve({
+                ...openAiSettings,
                 braveConfigured: false,
                 ollamaConfigured: true,
                 defaultProvider: "ollama",
@@ -1312,6 +1347,7 @@ describe("desktop app interaction", () => {
             new Promise((resolve) => {
               finishOld = () =>
                 resolve({
+                  ...openAiSettings,
                   braveConfigured: false,
                   ollamaConfigured: false,
                   defaultProvider: "brave",
@@ -1330,6 +1366,7 @@ describe("desktop app interaction", () => {
           new Promise((resolve) => {
             finishCurrent = () =>
               resolve({
+                ...openAiSettings,
                 braveConfigured: true,
                 ollamaConfigured: false,
                 defaultProvider: "brave",
@@ -1621,7 +1658,12 @@ describe("desktop app interaction", () => {
         selector = '[data-action="check-search-settings"]';
         api.searchSettings.mockImplementationOnce(async () => {
           await pending;
-          return { braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" };
+          return {
+            ...openAiSettings,
+            braveConfigured: false,
+            ollamaConfigured: false,
+            defaultProvider: "brave",
+          };
         });
       } else if (operation === "form") {
         selector = '[data-form="add-items"] button[type="submit"]';
@@ -1689,6 +1731,7 @@ describe("desktop app interaction", () => {
     const { root, controller, api, state } = setup();
     if (method === "removeImage") api.getList.mockResolvedValueOnce(withLocalImage(state));
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1957,6 +2000,7 @@ describe("desktop app interaction", () => {
       const { root, controller, api } = setup();
       const healthy = unreadable === "brave" ? "ollama" : "brave";
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: healthy === "brave",
         ollamaConfigured: healthy === "ollama",
         defaultProvider: healthy,
@@ -2077,7 +2121,12 @@ describe("desktop app interaction", () => {
       () =>
         new Promise((resolve) => {
           finish = () =>
-            resolve({ braveConfigured: false, ollamaConfigured: false, defaultProvider: "brave" });
+            resolve({
+              ...openAiSettings,
+              braveConfigured: false,
+              ollamaConfigured: false,
+              defaultProvider: "brave",
+            });
         }),
     );
     await controller.openModal({ kind: "image", itemId: 10 });
@@ -2141,6 +2190,7 @@ describe("desktop app interaction", () => {
       sourceUrl: "https://example.org/fruit",
     };
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -2184,6 +2234,7 @@ describe("desktop app interaction", () => {
     async (origin) => {
       const { root, controller, api } = setup();
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: true,
         ollamaConfigured: false,
         defaultProvider: "brave",
@@ -2226,9 +2277,10 @@ describe("desktop app interaction", () => {
     },
   );
 
-  it("clears old candidates when switching provider and preserves the item after search failure", async () => {
+  it("preserves old candidates and the item after switching provider and a search failure", async () => {
     const { root, controller, api, state } = setup();
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: true,
       defaultProvider: "brave",
@@ -2258,7 +2310,7 @@ describe("desktop app interaction", () => {
     if (!(provider instanceof HTMLSelectElement)) throw new Error("Missing provider");
     provider.value = "ollama";
     provider.dispatchEvent(new Event("change", { bubbles: true }));
-    expect(root.querySelectorAll(".image-result")).toHaveLength(0);
+    expect(root.querySelectorAll(".image-result")).toHaveLength(1);
     search();
     await settle(controller);
     expect(api.searchImages).toHaveBeenNthCalledWith(2, "ollama", "りんご");
@@ -2271,7 +2323,7 @@ describe("desktop app interaction", () => {
     retryProvider.dispatchEvent(new Event("change", { bubbles: true }));
     expect(controller.state.error).toBe("");
     expect(root.querySelector('[role="alert"]')).toBeNull();
-    expect(controller.state.searched).toBe(false);
+    expect(controller.state.searched).toBe(true);
     expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(false);
   });
 
@@ -2285,6 +2337,7 @@ describe("desktop app interaction", () => {
     async (request, dismissal) => {
       const { root, controller, api, state } = setup();
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: true,
         ollamaConfigured: false,
         defaultProvider: "brave",
@@ -2330,6 +2383,7 @@ describe("desktop app interaction", () => {
     async (outcome) => {
       const { root, controller, api, state } = setup();
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: true,
         ollamaConfigured: false,
         defaultProvider: "brave",
@@ -3101,5 +3155,232 @@ describe("undo answer controls", () => {
     expect(root.querySelector('[role="alert"]')).toBeNull();
     expect(controller.state.pair).toEqual({ ...pair, revision: restored.revision });
     expect(api.undoAnswer).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("OpenAI search interactions", () => {
+  function input(root: HTMLElement, selector: string, value: string): HTMLInputElement {
+    const field = root.querySelector<HTMLInputElement>(selector);
+    if (!field) throw new Error(`Missing input: ${selector}`);
+    field.value = value;
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    return field;
+  }
+  function select(root: HTMLElement, selector: string, value: string): void {
+    const field = root.querySelector<HTMLSelectElement>(selector);
+    if (!field) throw new Error(`Missing select: ${selector}`);
+    field.value = value;
+    field.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  async function submit(
+    root: HTMLElement,
+    controller: AppController,
+    selector: string,
+  ): Promise<void> {
+    const form = root.querySelector(selector);
+    if (!(form instanceof HTMLFormElement)) throw new Error(`Missing form: ${selector}`);
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle(controller);
+  }
+
+  it.each(["api", "chatgpt"] as const)(
+    "edits and saves a manual model and %s mode with separate authentication controls",
+    async (mode) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-view="settings"]');
+      expect(root.querySelector<HTMLInputElement>("#openaiModel")?.value).toBe("gpt-6-luna");
+      select(root, "#openai-auth-mode", mode);
+      input(root, "#openaiModel", "unlisted-model");
+      expect(root.querySelector<HTMLInputElement>("#openaiKey") !== null).toBe(mode === "api");
+      if (mode === "api") expect(root.textContent).toContain("APIの都度課金");
+      else
+        expect(button(root, '[data-action="connect-chatgpt"]').textContent).toBe(
+          "Continue with ChatGPT",
+        );
+      await submit(root, controller, '[data-form="save-openai-settings"]');
+      expect(api.saveOpenAiSettings).toHaveBeenCalledExactlyOnceWith("unlisted-model", mode);
+      expect(api.setApiKey).not.toHaveBeenCalled();
+      expect(api.connectChatGpt).not.toHaveBeenCalled();
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      expect(api.openAiModels).not.toHaveBeenCalled();
+      expect(root.querySelector<HTMLInputElement>("#openaiModel")?.value).toBe("unlisted-model");
+      expect(root.querySelector<HTMLSelectElement>("#openai-auth-mode")?.value).toBe(mode);
+    },
+  );
+
+  it.each(["listed-model", "unlisted-model"])(
+    "allows %s after model-list failure and explains that listing does not guarantee image search",
+    async (model) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-view="settings"]');
+      api.openAiModels.mockResolvedValueOnce(["listed-model"]);
+      await click(root, controller, '[data-action="refresh-openai-models"]');
+      expect(root.querySelector<HTMLOptionElement>("#openai-models option")?.value).toBe(
+        "listed-model",
+      );
+      const field = input(root, "#openaiModel", model);
+      field.focus();
+      api.openAiModels.mockRejectedValueOnce(new Error("一覧への接続に失敗しました"));
+      await click(root, controller, '[data-action="refresh-openai-models"]');
+      expect(root.querySelector<HTMLInputElement>("#openaiModel")?.value).toBe(model);
+      expect(root.querySelector<HTMLOptionElement>("#openai-models option")?.value).toBe(
+        "listed-model",
+      );
+      expect(root.textContent).toContain("直接入力して保存できます");
+      expect(root.textContent).toContain("画像検索への対応を保証しません");
+      expect(
+        button(root, '[data-form="save-openai-settings"] button[type="submit"]').disabled,
+      ).toBe(false);
+      await submit(root, controller, '[data-form="save-openai-settings"]');
+      expect(api.saveOpenAiSettings).toHaveBeenCalledExactlyOnceWith(model, "api");
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it("saves and removes the OpenAI API key using the existing credential command, without model mutation", async () => {
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="settings"]');
+    input(root, "#openaiKey", " test-key ");
+    await submit(root, controller, '[data-form="save-key"][data-provider="openai"]');
+    expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith("openai", "test-key");
+    expect(root.querySelector<HTMLInputElement>("#openaiKey")?.value).toBe("");
+    await click(root, controller, '[data-action="remove-key"][data-provider="openai"]');
+    expect(api.setApiKey).toHaveBeenLastCalledWith("openai", "");
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+  });
+
+  it("connects, selects another account, manages usage and disconnects through native ChatGPT actions", async () => {
+    const { root, controller, api } = setup();
+    const settings = {
+      ...openAiSettings,
+      braveConfigured: false,
+      ollamaConfigured: false,
+      openaiAuthMode: "chatgpt" as const,
+      defaultProvider: "brave" as const,
+    };
+    api.searchSettings.mockResolvedValueOnce(settings);
+    await controller.initialize();
+    await click(root, controller, '[data-view="settings"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    const connected = {
+      ...settings,
+      openaiConfigured: true,
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "person@example.org",
+      defaultProvider: "openai" as const,
+    };
+    api.searchSettings.mockResolvedValue(connected);
+    await click(root, controller, '[data-action="connect-chatgpt"]');
+    expect(api.connectChatGpt).toHaveBeenCalledExactlyOnceWith(false);
+    expect(root.textContent).toContain("Using ChatGPT plan");
+    expect(root.textContent).toContain("person@example.org");
+    expect(root.querySelector("#openaiKey")).toBeNull();
+    await click(root, controller, '[data-action="new-chatgpt-account"]');
+    expect(api.connectChatGpt).toHaveBeenLastCalledWith(true);
+    await click(root, controller, '[data-action="chatgpt-usage"]');
+    expect(api.openChatGptUsage).toHaveBeenCalledOnce();
+    api.searchSettings.mockResolvedValue(settings);
+    await click(root, controller, '[data-action="disconnect-chatgpt"]');
+    expect(api.disconnectChatGpt).toHaveBeenCalledOnce();
+    expect(button(root, '[data-action="connect-chatgpt"]').textContent).toBe(
+      "Continue with ChatGPT",
+    );
+    expect(api.setApiKey).not.toHaveBeenCalled();
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps candidates and images while changing the model after failure, then retries with OpenAI explicitly", async () => {
+    const { root, controller, api, state } = setup();
+    const settings = {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiModel: "saved-model",
+      defaultProvider: "openai" as const,
+    };
+    api.searchSettings.mockResolvedValue(settings);
+    const candidate: ImageCandidate = {
+      id: "previous",
+      title: "Previous result",
+      previewUrl: "data:image/png;base64,AA==",
+      sourceUrl: "https://example.org/previous",
+    };
+    const updatedCandidate = { ...candidate, id: "next", title: "New result" };
+    api.searchImages
+      .mockResolvedValueOnce([candidate])
+      .mockRejectedValueOnce(
+        new Error("モデルID saved-model は利用できません。モデルを変更して再試行してください。"),
+      )
+      .mockResolvedValueOnce([updatedCandidate]);
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await submit(root, controller, '[data-form="search-images"]');
+    await submit(root, controller, '[data-form="search-images"]');
+    expect(root.querySelectorAll(".image-result")).toHaveLength(1);
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain("saved-model");
+    expect(controller.state.active).toEqual(state);
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.state.settings).toEqual(settings);
+    const changeModel = root.querySelector<HTMLButtonElement>('dialog [data-view="settings"]');
+    if (!changeModel) throw new Error("Missing model settings link");
+    changeModel.click();
+    await settle(controller);
+    input(root, "#openaiModel", "replacement-model");
+    await submit(root, controller, '[data-form="save-openai-settings"]');
+    await click(root, controller, '[data-action="resume-image-search"]');
+    expect(root.querySelectorAll(".image-result")).toHaveLength(1);
+    expect(controller.state.candidates).toEqual([candidate]);
+    expect(root.textContent).toContain("replacement-model");
+    await submit(root, controller, '[data-form="search-images"]');
+    expect(controller.state.candidates).toEqual([updatedCandidate]);
+    expect(api.searchImages.mock.calls).toEqual([
+      ["openai", "りんご"],
+      ["openai", "りんご"],
+      ["openai", "りんご"],
+    ]);
+    expect(api.saveOpenAiSettings).toHaveBeenCalledExactlyOnceWith("replacement-model", "api");
+    expect(api.setRemoteImage).not.toHaveBeenCalled();
+  });
+
+  it("offers OpenAI alongside Brave and Ollama for manual and bulk provider selection", async () => {
+    const { root, controller, api } = setup();
+    api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      defaultProvider: "brave",
+    });
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    expect(
+      [...root.querySelectorAll<HTMLOptionElement>("#search-provider option")].map(
+        (option) => option.value,
+      ),
+    ).toEqual(["brave", "ollama", "openai"]);
+    select(root, "#search-provider", "openai");
+    await submit(root, controller, '[data-form="search-images"]');
+    expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("openai", "りんご");
+    await click(root, controller, '[data-action="close-modal"]');
+    await click(root, controller, '[data-action="bulk-images"]');
+    expect(
+      [...root.querySelectorAll<HTMLOptionElement>("#bulk-provider option")].map(
+        (option) => option.value,
+      ),
+    ).toEqual(["", "brave", "ollama", "openai"]);
+    select(root, "#bulk-provider", "openai");
+    await click(root, controller, '[data-action="start-bulk-images"]');
+    expect(api.autoRegisterImage.mock.calls).toEqual([
+      [1, 10, "openai"],
+      [1, 11, "openai"],
+    ]);
   });
 });

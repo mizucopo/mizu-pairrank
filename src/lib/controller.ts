@@ -4,6 +4,7 @@ import type {
   ItemPair,
   ListState,
   ListSummary,
+  OpenAiAuthMode,
   PairProposal,
   Preference,
   ReportFormat,
@@ -65,7 +66,18 @@ export type AppState = {
   searched: boolean;
   readPending: ReadKind | null;
   provider: SearchProvider;
-  drafts: { name: string; items: string; query: string; braveKey: string; ollamaKey: string };
+  openaiAuthMode: OpenAiAuthMode;
+  openaiModels: string[];
+  imageSearchReturn: { itemId: number; listId: number; view: View } | null;
+  drafts: {
+    name: string;
+    items: string;
+    query: string;
+    braveKey: string;
+    ollamaKey: string;
+    openaiKey: string;
+    openaiModel: string;
+  };
 };
 
 export const answers: { value: Preference; label: string; key: string }[] = [
@@ -77,14 +89,34 @@ export const answers: { value: Preference; label: string; key: string }[] = [
 ];
 
 export const tagNameMaxLength = 30;
+const searchProviders = ["brave", "ollama", "openai"] as const;
+const configuredField = {
+  brave: "braveConfigured",
+  ollama: "ollamaConfigured",
+  openai: "openaiConfigured",
+} as const;
+
+function initialSearchSettings(): SearchSettings {
+  return {
+    braveConfigured: false,
+    ollamaConfigured: false,
+    openaiConfigured: false,
+    openaiModel: "gpt-6-luna",
+    openaiAuthMode: "api",
+    chatgptConnected: false,
+    chatgptSharing: false,
+    chatgptAccount: null,
+    defaultProvider: "brave",
+  };
+}
 
 export function configuredSearchProviders(state: AppState): SearchProvider[] {
   const settings = state.settings;
   if (!settings) return [];
-  return (["brave", "ollama"] as const).filter(
+  return searchProviders.filter(
     (provider) =>
       state.checkedProviders.includes(provider) &&
-      (provider === "brave" ? settings.braveConfigured : settings.ollamaConfigured) &&
+      settings[configuredField[provider]] &&
       settings.errors?.[provider] === undefined,
   );
 }
@@ -124,7 +156,18 @@ export class AppController {
     searched: false,
     readPending: null,
     provider: "brave",
-    drafts: { name: "", items: "", query: "", braveKey: "", ollamaKey: "" },
+    openaiAuthMode: "api",
+    openaiModels: [],
+    imageSearchReturn: null,
+    drafts: {
+      name: "",
+      items: "",
+      query: "",
+      braveKey: "",
+      ollamaKey: "",
+      openaiKey: "",
+      openaiModel: "gpt-6-luna",
+    },
   };
 
   private readRequest: symbol | null = null;
@@ -195,6 +238,7 @@ export class AppController {
   async selectList(id: number): Promise<void> {
     this.cancelRead("settings");
     await this.perform(async () => {
+      this.state.imageSearchReturn = null;
       const list = await this.api
         .getList(id)
         .catch((error: unknown) => this.handleListError(id, error));
@@ -218,6 +262,7 @@ export class AppController {
     if (view === "settings" && this.state.readPending === "settings") return;
     this.cancelRead("settings");
     if (this.state.busy) return;
+    this.state.imageSearchReturn = null;
     if (view === "compare") {
       // Resuming a converged list resets its ranking window and invalidates undo.
       if (this.lastAnswer && this.state.active?.convergence.converged) {
@@ -343,10 +388,9 @@ export class AppController {
           if (this.readRequest === request) {
             const message = errorMessage(error);
             this.acceptSettings({
-              braveConfigured: false,
-              ollamaConfigured: false,
-              defaultProvider: "brave",
-              errors: { brave: message, ollama: message },
+              ...initialSearchSettings(),
+              ...this.state.settings,
+              errors: { brave: message, ollama: message, openai: message },
             });
           }
           throw error;
@@ -355,25 +399,40 @@ export class AppController {
         }
       },
       (settings) => {
-        if (settings) this.acceptSettings(settings);
+        if (settings) {
+          const previous = this.state.settings;
+          this.acceptSettings(settings);
+          const accepted = this.state.settings;
+          if (accepted && (!previous || settings.errors?.openai === undefined)) {
+            this.state.drafts.openaiModel = accepted.openaiModel;
+            this.state.openaiAuthMode = accepted.openaiAuthMode;
+          }
+        }
       },
     );
   }
 
   private acceptSettings(
     current: SearchSettings,
-    checked: SearchProvider[] = ["brave", "ollama"],
+    checked: SearchProvider[] = [...searchProviders],
   ): void {
     const settings = { ...current };
     let hasErrors = false;
-    for (const provider of ["brave", "ollama"] as const) {
+    for (const provider of searchProviders) {
       if (current.errors?.[provider] !== undefined) {
         hasErrors = true;
-        const field = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+        const field = configuredField[provider];
         settings[field] = this.state.settings?.[field] ?? false;
+        if (provider === "openai" && this.state.settings) {
+          settings.openaiModel = this.state.settings.openaiModel;
+          settings.openaiAuthMode = this.state.settings.openaiAuthMode;
+          settings.chatgptConnected = this.state.settings.chatgptConnected;
+          settings.chatgptSharing = this.state.settings.chatgptSharing;
+          settings.chatgptAccount = this.state.settings.chatgptAccount;
+        }
       }
     }
-    if (hasErrors) {
+    if (hasErrors && this.state.provider !== "openai") {
       if (settings.braveConfigured && settings.errors?.brave === undefined)
         settings.defaultProvider = "brave";
       else if (settings.ollamaConfigured && settings.errors?.ollama === undefined)
@@ -383,12 +442,12 @@ export class AppController {
           settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
     }
     this.state.settings = settings;
-    this.state.checkedProviders = (["brave", "ollama"] as const).filter(
+    this.state.checkedProviders = searchProviders.filter(
       (provider) =>
         this.state.checkedProviders.includes(provider) ||
         (checked.includes(provider) && current.errors?.[provider] === undefined),
     );
-    this.state.provider = settings.defaultProvider;
+    if (this.state.provider !== "openai") this.state.provider = settings.defaultProvider;
     if (this.state.modal?.kind === "bulk-image") {
       const providers = this.availableBulkProviders();
       if (providers.length === 1) this.state.bulkProvider = providers[0]!;
@@ -403,6 +462,7 @@ export class AppController {
     if ((modal.kind === "export-list" || modal.kind === "export-report") && !this.state.active)
       return;
     if (modal.kind === "export-report" && this.state.view !== modal.view) return;
+    this.state.imageSearchReturn = null;
     this.state.modal = modal;
     this.state.error = "";
     this.state.exportIncludeImages = false;
@@ -1015,12 +1075,13 @@ export class AppController {
       return;
     }
     if (!this.availableBulkProviders().includes(this.state.provider)) {
-      this.state.error = "保存済みキーを確認するか、検索設定でAPIキーを登録してください。";
+      this.state.error =
+        this.state.provider === "openai"
+          ? "保存済みの接続状態を確認するか、検索設定で取得方法と認証を設定してください。"
+          : "保存済みキーを確認するか、検索設定でAPIキーを登録してください。";
       this.changed();
       return;
     }
-    this.state.candidates = [];
-    this.state.searched = false;
     await this.performRead(
       "image",
       () => this.api.searchImages(this.state.provider, query),
@@ -1087,28 +1148,196 @@ export class AppController {
   }
 
   async saveKey(provider: SearchProvider, remove = false): Promise<void> {
-    const field = provider === "brave" ? "braveKey" : "ollamaKey";
+    const field = `${provider}Key` as const;
     const key = remove ? "" : this.state.drafts[field].trim();
     await this.perform(async () => {
       if (!remove && !key) throw new Error("APIキーの形式が正しくありません。");
       await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
       this.state.notice = remove ? "APIキーを削除しました。" : "APIキーを保存しました。";
-      const configured = provider === "brave" ? "braveConfigured" : "ollamaConfigured";
+      const acknowledgesSearch =
+        provider !== "openai" || this.state.settings?.openaiAuthMode !== "chatgpt";
+      const configured = configuredField[provider];
       const settings: SearchSettings = {
-        braveConfigured: false,
-        ollamaConfigured: false,
-        defaultProvider: "brave",
+        ...initialSearchSettings(),
         ...this.state.settings,
-        [configured]: !remove,
+        [configured]:
+          provider === "openai" && this.state.settings?.openaiAuthMode === "chatgpt"
+            ? this.state.settings.openaiConfigured
+            : !remove,
       };
-      if (settings.errors) {
+      if (settings.errors && acknowledgesSearch) {
         settings.errors = { ...settings.errors };
         delete settings.errors[provider];
       }
       settings.defaultProvider =
-        settings.ollamaConfigured && !settings.braveConfigured ? "ollama" : "brave";
-      this.acceptSettings(settings, [provider]);
+        searchProviders.find((candidate) => settings[configuredField[candidate]]) ?? "brave";
+      this.acceptSettings(settings, acknowledgesSearch ? [provider] : []);
     });
+  }
+
+  async saveOpenAiSettings(): Promise<void> {
+    if (this.state.view !== "settings" || this.state.modal) return;
+    const model = this.state.drafts.openaiModel.trim();
+    const authMode = this.state.openaiAuthMode;
+    await this.perform(async () => {
+      if (!model) throw new Error("OpenAIのモデルIDを入力してください。");
+      await this.api.saveOpenAiSettings(model, authMode);
+      const previous = this.state.settings;
+      const settings = {
+        ...initialSearchSettings(),
+        ...previous,
+        openaiModel: model,
+        openaiAuthMode: authMode,
+      };
+      if (!previous || previous.openaiAuthMode !== authMode) {
+        this.state.openaiModels = [];
+        settings.openaiConfigured =
+          authMode === "chatgpt" && settings.chatgptConnected && settings.chatgptSharing;
+        this.state.checkedProviders = this.state.checkedProviders.filter(
+          (provider) => provider !== "openai",
+        );
+      }
+      this.state.settings = settings;
+      this.state.drafts.openaiModel = model;
+      this.state.notice = "OpenAIの取得方法とモデルIDを保存しました。次の検索に適用されます。";
+    });
+  }
+
+  editImageSearchSettings(): void {
+    const modal = this.state.modal;
+    if (this.state.busy || modal?.kind !== "image" || !this.state.active) return;
+    this.state.imageSearchReturn = {
+      itemId: modal.itemId,
+      listId: this.state.active.id,
+      view: this.state.view,
+    };
+    this.state.modal = null;
+    this.state.view = "settings";
+    this.state.error = "";
+    this.changed();
+  }
+
+  resumeImageSearch(): void {
+    const target = this.state.imageSearchReturn;
+    if (
+      this.state.busy ||
+      !target ||
+      this.state.active?.id !== target.listId ||
+      !this.state.active.items.some((item) => item.id === target.itemId)
+    )
+      return;
+    this.state.view = target.view;
+    this.state.modal = { kind: "image", itemId: target.itemId };
+    this.state.imageSearchReturn = null;
+    this.state.error = "";
+    this.changed();
+  }
+
+  async refreshOpenAiModels(): Promise<void> {
+    if (this.state.view !== "settings" || this.state.modal) return;
+    if (this.state.settings && this.state.openaiAuthMode !== this.state.settings.openaiAuthMode)
+      return;
+    await this.performRead(
+      "settings",
+      async () => {
+        try {
+          return await this.api.openAiModels();
+        } catch (error) {
+          throw new Error(
+            `モデル一覧を取得できませんでした: ${errorMessage(error)} モデルIDは直接入力して保存できます。`,
+            { cause: error },
+          );
+        }
+      },
+      (models) => {
+        this.state.openaiModels = models;
+      },
+    );
+  }
+
+  async connectChatGpt(newAccount = false): Promise<void> {
+    if (this.state.view !== "settings" || this.state.modal) return;
+    await this.perform(async () => {
+      this.state.openaiModels = [];
+      let failure: string | null = null;
+      try {
+        await this.api.connectChatGpt(newAccount);
+      } catch (error) {
+        failure = errorMessage(error);
+      }
+      if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+      try {
+        const settings = await this.api.searchSettings();
+        this.acceptSettings(settings);
+        if (settings.errors?.openai !== undefined) {
+          failure = [
+            failure,
+            `接続状態を再確認できませんでした: ${settings.errors.openai || "資格情報を読み取れませんでした。"}`,
+          ]
+            .filter(Boolean)
+            .join(" ");
+        }
+      } catch (error) {
+        const message = errorMessage(error);
+        if (this.state.settings) {
+          this.state.settings = {
+            ...this.state.settings,
+            errors: { ...this.state.settings.errors, openai: message },
+          };
+        }
+        this.state.checkedProviders = this.state.checkedProviders.filter(
+          (provider) => provider !== "openai",
+        );
+        failure = [failure, `接続状態を再確認できませんでした: ${message}`]
+          .filter(Boolean)
+          .join(" ");
+      }
+      if (failure !== null) throw new Error(failure);
+      this.state.notice = "ChatGPTの接続状態を更新しました。";
+    });
+  }
+
+  async disconnectChatGpt(): Promise<void> {
+    if (this.state.view !== "settings" || this.state.modal) return;
+    await this.perform(async () => {
+      this.state.openaiModels = [];
+      let failure: string | null = null;
+      try {
+        await this.api.disconnectChatGpt();
+      } catch (error) {
+        failure = errorMessage(error);
+      }
+      if (this.state.settings) {
+        this.state.settings = {
+          ...this.state.settings,
+          chatgptConnected: false,
+          chatgptSharing: false,
+          chatgptAccount: null,
+          openaiConfigured:
+            this.state.settings.openaiAuthMode === "api" && this.state.settings.openaiConfigured,
+        };
+      }
+      if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+      try {
+        this.acceptSettings(await this.api.searchSettings());
+      } catch (error) {
+        if (this.state.settings) {
+          this.state.checkedProviders = this.state.checkedProviders.filter(
+            (provider) => provider !== "openai",
+          );
+        }
+        failure = [failure, `接続状態を再確認できませんでした: ${errorMessage(error)}`]
+          .filter(Boolean)
+          .join(" ");
+      }
+      if (failure !== null) throw new Error(failure);
+      this.state.notice = "ChatGPTとの接続を解除しました。";
+    });
+  }
+
+  async openChatGptUsage(): Promise<void> {
+    if (this.state.view !== "settings" || this.state.modal) return;
+    await this.perform(() => this.api.openChatGptUsage());
   }
 }
