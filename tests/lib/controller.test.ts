@@ -8,6 +8,8 @@ import type {
   ListState,
   ListSummary,
   PairProposal,
+  ReportFormat,
+  ReportView,
 } from "../../src/lib/types.js";
 
 function list(id = 1): ListState {
@@ -523,6 +525,29 @@ describe("comparison reset", () => {
 });
 
 describe("ranking and tier reports", () => {
+  it.each<[ReportView, ReportFormat]>([
+    ["ranking", "html"],
+    ["ranking", "pdf"],
+    ["tier", "html"],
+    ["tier", "pdf"],
+  ])("sends the active %s view when saving %s", async (view, format) => {
+    const render = vi
+      .spyOn(report, "reportPdf")
+      .mockResolvedValue(new Uint8Array([37, 80, 68, 70, 45]));
+    try {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate(view);
+      await controller.openModal({ kind: "export-report", view });
+      controller.setReportFormat(format);
+      await controller.exportReport();
+      expect(api.saveReport).toHaveBeenCalledExactlyOnceWith(format, expect.any(Uint8Array), view);
+    } finally {
+      render.mockRestore();
+    }
+  });
+
   it("keeps rendered PDF bytes unchanged when handing them to the API", async () => {
     const bytes = new Uint8Array([37, 80, 68, 70, 45]);
     const render = vi.spyOn(report, "reportPdf").mockResolvedValueOnce(bytes);
