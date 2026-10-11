@@ -44,6 +44,7 @@ export const api: AppApi = {
   saveOpenAiSettings: (model, authMode) => invoke("save_openai_settings", { model, authMode }),
   openAiModels: () => invoke("openai_models"),
   connectChatGpt: (newAccount) => invoke("connect_chatgpt", { newAccount }),
+  selectChatGptProfile: (profileId) => invoke("select_chatgpt_profile", { profileId }),
   disconnectChatGpt: () => invoke("disconnect_chatgpt"),
   openChatGptUsage: () => invoke("open_chatgpt_usage"),
   searchImages: (provider, query) => invoke("search_images", { provider, query }),

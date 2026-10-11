@@ -106,6 +106,8 @@ function initialSearchSettings(): SearchSettings {
     chatgptConnected: false,
     chatgptSharing: false,
     chatgptAccount: null,
+    chatgptProfiles: [],
+    chatgptActiveProfile: null,
     defaultProvider: "brave",
   };
 }
@@ -429,6 +431,8 @@ export class AppController {
           settings.chatgptConnected = this.state.settings.chatgptConnected;
           settings.chatgptSharing = this.state.settings.chatgptSharing;
           settings.chatgptAccount = this.state.settings.chatgptAccount;
+          settings.chatgptProfiles = this.state.settings.chatgptProfiles;
+          settings.chatgptActiveProfile = this.state.settings.chatgptActiveProfile;
         }
       }
     }
@@ -1266,36 +1270,59 @@ export class AppController {
       } catch (error) {
         failure = errorMessage(error);
       }
-      if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+      await this.confirmChatGptStatus(failure);
+      this.state.notice = "ChatGPTの接続状態を更新しました。";
+    });
+  }
+
+  async selectChatGptProfile(profileId: string): Promise<void> {
+    if (
+      this.state.view !== "settings" ||
+      this.state.modal ||
+      !this.state.settings?.chatgptProfiles.some((profile) => profile.id === profileId) ||
+      this.state.settings.chatgptActiveProfile === profileId
+    )
+      return;
+    await this.perform(async () => {
+      this.state.openaiModels = [];
+      let failure: string | null = null;
       try {
-        const settings = await this.api.searchSettings();
-        this.acceptSettings(settings);
-        if (settings.errors?.openai !== undefined) {
-          failure = [
-            failure,
-            `接続状態を再確認できませんでした: ${settings.errors.openai || "資格情報を読み取れませんでした。"}`,
-          ]
-            .filter(Boolean)
-            .join(" ");
-        }
+        await this.api.selectChatGptProfile(profileId);
       } catch (error) {
-        const message = errorMessage(error);
-        if (this.state.settings) {
-          this.state.settings = {
-            ...this.state.settings,
-            errors: { ...this.state.settings.errors, openai: message },
-          };
-        }
-        this.state.checkedProviders = this.state.checkedProviders.filter(
-          (provider) => provider !== "openai",
-        );
-        failure = [failure, `接続状態を再確認できませんでした: ${message}`]
+        failure = errorMessage(error);
+      }
+      await this.confirmChatGptStatus(failure);
+      this.state.notice = "保存済みのChatGPTアカウントを選択しました。";
+    });
+  }
+
+  private async confirmChatGptStatus(failure: string | null): Promise<void> {
+    if (this.settingsRead) await this.settingsRead.catch(() => undefined);
+    try {
+      const settings = await this.api.searchSettings();
+      this.acceptSettings(settings);
+      if (settings.errors?.openai !== undefined) {
+        failure = [
+          failure,
+          `接続状態を再確認できませんでした: ${settings.errors.openai || "資格情報を読み取れませんでした。"}`,
+        ]
           .filter(Boolean)
           .join(" ");
       }
-      if (failure !== null) throw new Error(failure);
-      this.state.notice = "ChatGPTの接続状態を更新しました。";
-    });
+    } catch (error) {
+      const message = errorMessage(error);
+      if (this.state.settings) {
+        this.state.settings = {
+          ...this.state.settings,
+          errors: { ...this.state.settings.errors, openai: message },
+        };
+      }
+      this.state.checkedProviders = this.state.checkedProviders.filter(
+        (provider) => provider !== "openai",
+      );
+      failure = [failure, `接続状態を再確認できませんでした: ${message}`].filter(Boolean).join(" ");
+    }
+    if (failure !== null) throw new Error(failure);
   }
 
   async disconnectChatGpt(): Promise<void> {
@@ -1309,11 +1336,17 @@ export class AppController {
         failure = errorMessage(error);
       }
       if (this.state.settings) {
+        const activeProfile = this.state.settings.chatgptActiveProfile;
         this.state.settings = {
           ...this.state.settings,
           chatgptConnected: false,
           chatgptSharing: false,
           chatgptAccount: null,
+          chatgptProfiles: this.state.settings.chatgptProfiles.map((profile) =>
+            profile.id === activeProfile
+              ? { ...profile, connected: false, sharing: false }
+              : profile,
+          ),
           openaiConfigured:
             this.state.settings.openaiAuthMode === "api" && this.state.settings.openaiConfigured,
         };

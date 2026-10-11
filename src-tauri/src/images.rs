@@ -54,6 +54,8 @@ pub struct SearchSettings {
     pub chatgpt_connected: bool,
     pub chatgpt_sharing: bool,
     pub chatgpt_account: Option<String>,
+    pub chatgpt_profiles: Vec<crate::chatgpt::ChatGptProfile>,
+    pub chatgpt_active_profile: Option<String>,
     pub default_provider: SearchProvider,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub errors: HashMap<SearchProvider, String>,
@@ -538,12 +540,13 @@ impl ImageService {
             .lock_shared()
             .map_err(|_| "画像の保存先をロックできませんでした。".to_owned())?;
         verify_app_data(&app_data)?;
+        let credentials = Arc::new(SystemCredentials::new(app_data.clone()));
         Ok(Self {
             app_data,
             directory,
             directory_identity,
             storage_lease: Arc::new(storage_lease),
-            credentials: Arc::new(SystemCredentials),
+            credentials,
             transport: Arc::new(HttpTransport),
             decode_gate: Arc::new(Mutex::new(())),
             buffer_slots: Arc::new(Semaphore::new(MAX_BUFFERED_IMAGES)),
@@ -705,25 +708,36 @@ impl ImageService {
             };
             let brave_configured = configured(SearchProvider::Brave);
             let ollama_configured = configured(SearchProvider::Ollama);
-            let openai = crate::openai::read_settings(credentials.as_ref())?;
-            let openai_api_configured = if openai.auth_mode == OpenAiAuthMode::Api {
+            let openai_settings = crate::openai::read_settings(credentials.as_ref());
+            let openai_api_configured = if openai_settings
+                .as_ref()
+                .is_ok_and(|settings| settings.auth_mode == OpenAiAuthMode::Api)
+            {
                 configured(SearchProvider::Openai)
             } else {
                 false
+            };
+            let (openai, openai_readable) = match openai_settings {
+                Ok(settings) => (settings, true),
+                Err(error) => {
+                    errors.insert(SearchProvider::Openai, error);
+                    (crate::openai::OpenAiSettings::default(), false)
+                }
             };
             let chatgpt = match crate::chatgpt::read_status(credentials.as_ref()) {
                 Ok(status) => status,
                 Err(error) => {
                     if openai.auth_mode == OpenAiAuthMode::Chatgpt {
-                        errors.insert(SearchProvider::Openai, error);
+                        errors.entry(SearchProvider::Openai).or_insert(error);
                     }
                     crate::chatgpt::ChatGptStatus::default()
                 }
             };
-            let openai_configured = match openai.auth_mode {
-                OpenAiAuthMode::Api => openai_api_configured,
-                OpenAiAuthMode::Chatgpt => chatgpt.connected && chatgpt.sharing,
-            };
+            let openai_configured = openai_readable
+                && match openai.auth_mode {
+                    OpenAiAuthMode::Api => openai_api_configured,
+                    OpenAiAuthMode::Chatgpt => chatgpt.connected && chatgpt.sharing,
+                };
             Ok(SearchSettings {
                 brave_configured,
                 ollama_configured,
@@ -733,6 +747,8 @@ impl ImageService {
                 chatgpt_connected: chatgpt.connected,
                 chatgpt_sharing: chatgpt.sharing,
                 chatgpt_account: chatgpt.account,
+                chatgpt_profiles: chatgpt.profiles,
+                chatgpt_active_profile: chatgpt.active_profile,
                 default_provider: if ollama_configured && !brave_configured {
                     SearchProvider::Ollama
                 } else if openai_configured && !brave_configured && !ollama_configured {
@@ -787,8 +803,18 @@ impl ImageService {
         .map_err(|error| error.to_string())?
     }
 
-    pub(crate) fn openai(&self) -> OpenAiClient {
-        OpenAiClient::new(self.credentials.clone())
+    pub(crate) async fn openai_models(&self) -> Result<Vec<String>, String> {
+        let permit = self
+            .settings_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                "検索設定またはモデル一覧の取得が実行中です。少し待ってから再試行してください。"
+                    .to_owned()
+            })?;
+        OpenAiClient::new_with_capacity(self.credentials.clone(), Arc::new(permit))
+            .models()
+            .await
     }
 
     pub(crate) fn chatgpt(&self) -> crate::chatgpt::ChatGptClient {
@@ -928,7 +954,12 @@ impl ImageService {
                 "画像検索が実行中です。少し待ってから再試行してください。".to_owned()
             })?;
         if provider == SearchProvider::Openai {
-            let seeds = self.openai().search(query).await?;
+            let search = Arc::new(search);
+            let seeds = OpenAiClient::new_with_capacity(self.credentials.clone(), search.clone())
+                .search(query)
+                .await?;
+            let search = Arc::try_unwrap(search)
+                .map_err(|_| "OpenAIの認証情報の取得が実行中です。".to_owned())?;
             return Ok((seeds, search));
         }
         let credentials = self.credentials.clone();
@@ -3256,15 +3287,26 @@ mod tests {
     #[tokio::test]
     async fn cancelled_searches_keep_capacity_until_the_keyring_workers_finish() {
         struct BlockingCredentials {
+            blocked_kind: CredentialKind,
             started: tokio::sync::mpsc::UnboundedSender<()>,
             waits: Mutex<Vec<std::sync::mpsc::Receiver<()>>>,
         }
         impl CredentialStore for BlockingCredentials {
-            fn get(&self, _: CredentialKind) -> Result<Option<String>, String> {
-                let wait = self.waits.lock().unwrap().pop();
+            fn get(&self, kind: CredentialKind) -> Result<Option<String>, String> {
+                let wait = if kind == self.blocked_kind {
+                    self.waits.lock().unwrap().pop()
+                } else {
+                    None
+                };
                 if let Some(wait) = wait {
                     self.started.send(()).unwrap();
                     let _ = wait.recv();
+                }
+                if kind == CredentialKind::OpenAiSettings {
+                    return Ok(None);
+                }
+                if kind == CredentialKind::ApiKey(SearchProvider::Openai) {
+                    return Err("mock API-key read denied".into());
                 }
                 Ok(Some("test-key".into()))
             }
@@ -3272,50 +3314,62 @@ mod tests {
                 Ok(())
             }
         }
-        let (_directory, mut service, _) = service(Ok(br#"{"results":[]}"#.to_vec()), vec![]);
-        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-        let (releases, waits): (Vec<_>, Vec<_>) =
-            (0..2).map(|_| std::sync::mpsc::channel()).unzip();
-        service.credentials = Arc::new(BlockingCredentials {
-            started,
-            waits: Mutex::new(waits),
-        });
-        let service = Arc::new(service);
-        for _ in 0..2 {
-            let search = tokio::spawn({
-                let service = service.clone();
-                async move { service.search(SearchProvider::Brave, "image".into()).await }
+        for (provider, blocked_kind) in [
+            (
+                SearchProvider::Brave,
+                CredentialKind::ApiKey(SearchProvider::Brave),
+            ),
+            (SearchProvider::Openai, CredentialKind::OpenAiSettings),
+            (
+                SearchProvider::Openai,
+                CredentialKind::ApiKey(SearchProvider::Openai),
+            ),
+        ] {
+            let (_directory, mut service, _) = service(Ok(br#"{"results":[]}"#.to_vec()), vec![]);
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let (releases, waits): (Vec<_>, Vec<_>) =
+                (0..2).map(|_| std::sync::mpsc::channel()).unzip();
+            service.credentials = Arc::new(BlockingCredentials {
+                blocked_kind,
+                started,
+                waits: Mutex::new(waits),
             });
-            tokio::time::timeout(Duration::from_secs(2), starts.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            search.abort();
-            assert!(search.await.unwrap_err().is_cancelled());
-        }
-        let extra = tokio::time::timeout(
-            Duration::from_millis(100),
-            service.search(SearchProvider::Brave, "another".into()),
-        )
-        .await;
-        drop(releases); // Release workers even if the capacity assertion fails.
-        assert!(
-            extra.is_ok_and(
-                |result| result.is_err_and(|message| message.contains("画像検索が実行中"))
-            )
-        );
-        let candidates = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(candidates) = service.search(SearchProvider::Brave, "later".into()).await
-                {
-                    break candidates;
-                }
-                tokio::task::yield_now().await;
+            let service = Arc::new(service);
+            for _ in 0..2 {
+                let search = tokio::spawn({
+                    let service = service.clone();
+                    async move { service.search(provider, "image".into()).await }
+                });
+                tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                search.abort();
+                assert!(search.await.unwrap_err().is_cancelled());
             }
-        })
-        .await
-        .unwrap();
-        assert!(candidates.is_empty());
+            let extra = tokio::time::timeout(
+                Duration::from_millis(100),
+                service.search(provider, "another".into()),
+            )
+            .await;
+            drop(releases); // Release workers even if the capacity assertion fails.
+            assert!(extra.is_ok_and(|result| {
+                result.is_err_and(|message| message.contains("画像検索が実行中"))
+            }));
+            let candidates = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(candidates) =
+                        service.search(SearchProvider::Brave, "later".into()).await
+                    {
+                        break candidates;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(candidates.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -3337,38 +3391,48 @@ mod tests {
                 Ok(())
             }
         }
-        let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
-        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        service.credentials = Arc::new(BlockingCredentials {
-            started,
-            release: Mutex::new(Some(wait)),
-        });
-        let service = Arc::new(service);
-        let first = tokio::spawn({
-            let service = service.clone();
-            async move { service.settings().await }
-        });
-        tokio::time::timeout(Duration::from_secs(2), starts.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
-        let extra = tokio::time::timeout(Duration::from_millis(100), service.settings()).await;
-        drop(release); // Also releases the worker if any later assertion fails.
-        assert!(extra.is_ok_and(|result| result.is_err_and(|message| message.contains("実行中"))));
-        let settings = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(settings) = service.settings().await {
-                    break settings;
+        for catalog in [false, true] {
+            let (_directory, mut service, _) = service(Ok(Vec::new()), vec![]);
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            service.credentials = Arc::new(BlockingCredentials {
+                started,
+                release: Mutex::new(Some(wait)),
+            });
+            let service = Arc::new(service);
+            let first = tokio::spawn({
+                let service = service.clone();
+                async move {
+                    if catalog {
+                        service.openai_models().await.map(|_| ())
+                    } else {
+                        service.settings().await.map(|_| ())
+                    }
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!settings.brave_configured && !settings.ollama_configured);
+            });
+            tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            let extra = tokio::time::timeout(Duration::from_millis(100), service.settings()).await;
+            drop(release); // Also releases the worker if any later assertion fails.
+            assert!(
+                extra.is_ok_and(|result| result.is_err_and(|message| message.contains("実行中")))
+            );
+            let settings = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(settings) = service.settings().await {
+                        break settings;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!settings.brave_configured && !settings.ollama_configured);
+        }
     }
 
     #[tokio::test]
@@ -3510,6 +3574,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreadable_openai_settings_do_not_disable_healthy_search_providers() {
+        struct BrokenOpenAiSettings {
+            denied: bool,
+            keys: MemoryCredentials,
+        }
+        impl CredentialStore for BrokenOpenAiSettings {
+            fn get(&self, kind: CredentialKind) -> Result<Option<String>, String> {
+                if self.denied && kind == CredentialKind::OpenAiSettings {
+                    Err("OpenAI settings access denied".into())
+                } else {
+                    self.keys.get(kind)
+                }
+            }
+            fn set(&self, kind: CredentialKind, value: &str) -> Result<(), String> {
+                self.keys.set(kind, value)
+            }
+        }
+        for denied in [false, true] {
+            let (_directory, mut service, transport) =
+                service(Ok(br#"{"results":[]}"#.to_vec()), vec![]);
+            let keys = MemoryCredentials::default();
+            keys.set(CredentialKind::OpenAiSettings, "corrupt saved settings")
+                .unwrap();
+            for provider in [
+                SearchProvider::Brave,
+                SearchProvider::Ollama,
+                SearchProvider::Openai,
+            ] {
+                keys.set(CredentialKind::ApiKey(provider), "healthy-secret")
+                    .unwrap();
+            }
+            let credentials = Arc::new(BrokenOpenAiSettings { denied, keys });
+            service.credentials = credentials.clone();
+            let settings = service.settings().await.unwrap();
+            assert!(settings.brave_configured && settings.ollama_configured);
+            assert!(!settings.openai_configured);
+            assert_eq!(settings.errors.len(), 1);
+            assert!(settings.errors.contains_key(&SearchProvider::Openai));
+            for provider in [SearchProvider::Brave, SearchProvider::Ollama] {
+                assert!(service.search(provider, "image".into()).await.is_ok());
+            }
+            let error = service
+                .search(SearchProvider::Openai, "image".into())
+                .await
+                .unwrap_err();
+            assert!(!error.is_empty());
+            assert_eq!(transport.searches.lock().unwrap().len(), 2);
+            assert_eq!(
+                credentials
+                    .keys
+                    .get(CredentialKind::OpenAiSettings)
+                    .unwrap(),
+                Some("corrupt saved settings".into())
+            );
+            assert!(
+                !serde_json::to_string(&settings)
+                    .unwrap()
+                    .contains("healthy-secret")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn successful_credential_mutations_do_not_depend_on_follow_up_keyring_reads() {
         struct UnreadableCredentials(MemoryCredentials);
         impl CredentialStore for UnreadableCredentials {
@@ -3606,7 +3733,7 @@ mod tests {
             .save_openai_settings("unlisted-model".into(), OpenAiAuthMode::Api)
             .await
             .unwrap();
-        assert!(service.openai().models().await.is_err());
+        assert!(service.openai_models().await.is_err());
         let directory = tempfile::tempdir().unwrap();
         let mut restarted = ImageService::new(directory.path().to_path_buf()).unwrap();
         restarted.credentials = service.credentials.clone();

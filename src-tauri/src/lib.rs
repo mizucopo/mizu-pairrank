@@ -560,7 +560,7 @@ async fn save_openai_settings(
 }
 #[tauri::command]
 async fn openai_models(app: AppHandle) -> Result<Vec<String>, String> {
-    image_service(&app)?.openai().models().await
+    image_service(&app)?.openai_models().await
 }
 #[tauri::command]
 async fn connect_chatgpt(app: AppHandle, new_account: bool) -> Result<(), String> {
@@ -572,6 +572,13 @@ async fn connect_chatgpt(app: AppHandle, new_account: bool) -> Result<(), String
 #[tauri::command]
 async fn disconnect_chatgpt(app: AppHandle) -> Result<(), String> {
     image_service(&app)?.chatgpt().disconnect().await
+}
+#[tauri::command]
+async fn select_chatgpt_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
+    image_service(&app)?
+        .chatgpt()
+        .select_profile(profile_id)
+        .await
 }
 #[tauri::command]
 async fn open_chatgpt_usage() -> Result<(), String> {
@@ -757,6 +764,7 @@ pub fn run() {
             openai_models,
             connect_chatgpt,
             disconnect_chatgpt,
+            select_chatgpt_profile,
             open_chatgpt_usage,
             search_images,
             auto_register_image,

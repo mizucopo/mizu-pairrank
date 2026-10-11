@@ -3,7 +3,7 @@
 //! https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions
 //! Tokens stay in the native credential store; this module never reads another app's credentials.
 
-use crate::credentials::{CredentialKind, CredentialStore};
+use crate::credentials::{CredentialKind, CredentialSessionLock, CredentialStore};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use ring::{digest, rand as secure_rand, signature};
@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OwnedMutexGuard},
+    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit},
     time::{sleep, timeout},
 };
 use url::Url;
@@ -36,23 +36,49 @@ const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(180);
 static SESSION_GATE: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
 
 #[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ChatGptStatus {
     pub connected: bool,
     pub sharing: bool,
     pub account: Option<String>,
+    pub profiles: Vec<ChatGptProfile>,
+    pub active_profile: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ChatGptProfile {
+    pub id: String,
+    pub account: Option<String>,
+    pub connected: bool,
+    pub sharing: bool,
 }
 
 pub(crate) fn read_status(credentials: &dyn CredentialStore) -> Result<ChatGptStatus, String> {
-    let session = load_session_record(credentials)?;
+    let _process = credentials.lock_session()?;
+    let registry = load_registry_record(credentials)?;
+    let session = registry.active();
     Ok(ChatGptStatus {
-        connected: session.as_ref().is_some_and(Session::connected),
-        sharing: session.as_ref().is_some_and(Session::sharing),
-        account: session.and_then(|session| session.email),
+        connected: session.is_some_and(Session::connected),
+        sharing: session.is_some_and(Session::sharing),
+        account: session.and_then(|session| session.email.clone()),
+        profiles: registry
+            .profiles
+            .iter()
+            .map(|session| ChatGptProfile {
+                id: session.id.clone(),
+                account: session.email.clone(),
+                connected: session.connected(),
+                sharing: session.sharing(),
+            })
+            .collect(),
+        active_profile: registry.active_profile,
     })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Session {
+    id: String,
     issuer: String,
     subject: String,
     client_id: String,
@@ -62,6 +88,68 @@ struct Session {
     refresh_token: Option<String>,
     scopes: Vec<String>,
     expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Registry {
+    version: u8,
+    active_profile: Option<String>,
+    profiles: Vec<Session>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            active_profile: None,
+            profiles: Vec::new(),
+        }
+    }
+}
+
+impl Registry {
+    fn active(&self) -> Option<&Session> {
+        self.profiles
+            .iter()
+            .find(|profile| Some(&profile.id) == self.active_profile.as_ref())
+    }
+
+    fn active_mut(&mut self) -> Option<&mut Session> {
+        self.profiles
+            .iter_mut()
+            .find(|profile| Some(&profile.id) == self.active_profile.as_ref())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let invalid = || "保存されたChatGPTアカウント登録が不正です。".to_owned();
+        let mut ids = HashSet::new();
+        let mut clients = HashSet::new();
+        if self.version != 1 || self.active_profile.is_none() != self.profiles.is_empty() {
+            return Err(invalid());
+        }
+        for profile in &self.profiles {
+            let id = uuid::Uuid::parse_str(&profile.id).map_err(|_| invalid())?;
+            if id.get_version_num() != 4
+                || id.to_string() != profile.id
+                || !ids.insert(&profile.id)
+                || !clients.insert(&profile.client_id)
+                || profile.issuer != AUTH_ORIGIN
+                || profile.subject.is_empty()
+                || !issued_client_id(&profile.client_id)
+            {
+                return Err(invalid());
+            }
+        }
+        if self
+            .active_profile
+            .as_ref()
+            .is_some_and(|active| !ids.contains(active))
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 
 impl Session {
@@ -168,12 +256,19 @@ struct Callback {
     client_id: String,
 }
 
+struct SessionGuard {
+    _local: OwnedMutexGuard<()>,
+    _process: CredentialSessionLock,
+}
+
+#[derive(Clone)]
 pub(crate) struct ChatGptClient {
     credentials: Arc<dyn CredentialStore>,
     http: Result<Client, String>,
     discovery_url: String,
     trusted_origin: String,
     endpoint_origin: String,
+    capacity: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl ChatGptClient {
@@ -188,7 +283,13 @@ impl ChatGptClient {
             discovery_url: DISCOVERY_URL.to_owned(),
             trusted_origin: AUTH_ORIGIN.to_owned(),
             endpoint_origin: AUTH_ORIGIN.to_owned(),
+            capacity: None,
         }
+    }
+
+    pub(crate) fn with_capacity(mut self, capacity: Arc<OwnedSemaphorePermit>) -> Self {
+        self.capacity = Some(capacity);
+        self
     }
 
     pub(crate) async fn connect(
@@ -196,16 +297,9 @@ impl ChatGptClient {
         new_account: bool,
         open_browser: impl FnOnce(String) -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
-        let guard = Arc::clone(&SESSION_GATE).try_lock_owned().map_err(|_| {
-            "ChatGPTの接続処理が進行中です。完了してから再試行してください。".to_owned()
-        })?;
-        let (guard, previous) = if new_account {
-            // A new registration can recover from an unreadable remembered record.
-            // The existing record remains untouched until the new identity is verified.
-            (guard, None)
-        } else {
-            self.load_session_async(guard).await?
-        };
+        let guard = self.acquire_guard(true).await?;
+        let (guard, mut registry) = self.load_registry_async(guard).await?;
+        let previous = registry.active().cloned();
         let returning = previous.as_ref().filter(|_| !new_account);
         let (guard, host_id) = self.host_id_async(guard).await?;
         let discovery = self.discovery().await?;
@@ -258,8 +352,12 @@ impl ChatGptClient {
         }
         // Authorization URLs contain an ID-token hint on reconnect; never log them.
         let authorization_url = authorization.to_string();
-        let (guard, ()) =
-            serialized_blocking(guard, move || open_browser(authorization_url)).await?;
+        let capacity = self.capacity.clone();
+        let (guard, ()) = serialized_blocking(guard, move || {
+            let _capacity = capacity;
+            open_browser(authorization_url)
+        })
+        .await?;
         let callback = timeout(
             SIGN_IN_TIMEOUT,
             await_callback(
@@ -306,6 +404,7 @@ impl ChatGptClient {
         let scopes = parse_scopes(tokens.scope.as_deref().unwrap_or_default());
         validate_access_fields(&tokens, scopes.iter().any(|scope| scope == PLAN_SCOPE))?;
         let session = Session {
+            id: returning.map_or_else(|| uuid::Uuid::new_v4().to_string(), |s| s.id.clone()),
             issuer: identity.iss,
             subject: identity.sub,
             client_id: callback.client_id,
@@ -316,15 +415,39 @@ impl ChatGptClient {
             scopes,
             expires_at: expiry(tokens.expires_in.unwrap_or_default())?,
         };
-        // Replace the remembered registration only after successful identity validation.
-        let _guard = self.save_session_async(guard, &session).await?;
+        // Each issued registration retains its own verified identity and credential set.
+        if returning.is_some() {
+            *registry.active_mut().expect("validated active profile") = session;
+        } else {
+            registry.active_profile = Some(session.id.clone());
+            registry.profiles.push(session);
+        }
+        let _guard = self.save_registry_async(guard, &registry).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn select_profile(&self, id: String) -> Result<(), String> {
+        let guard = self.acquire_guard(false).await?;
+        let (guard, mut registry) = self.load_registry_async(guard).await?;
+        if !registry.profiles.iter().any(|profile| profile.id == id) {
+            return Err("選択したChatGPTアカウント登録がありません。".to_owned());
+        }
+        registry.active_profile = Some(id);
+        let _guard = self.save_registry_async(guard, &registry).await?;
         Ok(())
     }
 
     pub(crate) async fn disconnect(&self) -> Result<(), String> {
-        let guard = Arc::clone(&SESSION_GATE).lock_owned().await;
-        let (guard, session) = self.load_session_async(guard).await?;
-        let Some(mut session) = session else {
+        let client = self.clone();
+        tokio::spawn(async move { client.disconnect_locked().await })
+            .await
+            .map_err(|_| "ChatGPTのサインアウトを完了できませんでした。".to_owned())?
+    }
+
+    async fn disconnect_locked(&self) -> Result<(), String> {
+        let guard = self.acquire_guard(false).await?;
+        let (guard, mut registry) = self.load_registry_async(guard).await?;
+        let Some(session) = registry.active() else {
             return Ok(());
         };
         let revocation = if let Some(token) = &session.refresh_token {
@@ -332,15 +455,29 @@ impl ChatGptClient {
         } else {
             Ok(())
         };
-        session.clear_tokens();
-        let _guard = self.save_session_async(guard, &session).await?;
+        registry
+            .active_mut()
+            .expect("validated active profile")
+            .clear_tokens();
+        let _guard = self.save_registry_async(guard, &registry).await?;
         revocation.map_err(|_| "このアプリからサインアウトしましたが、ChatGPT側のセッション失効を確認できませんでした。ChatGPTの設定からアプリの接続を解除してください。".to_owned())
     }
 
     pub(crate) async fn access_token(&self) -> Result<String, String> {
-        let guard = Arc::clone(&SESSION_GATE).lock_owned().await;
-        let (guard, session) = self.load_session_async(guard).await?;
-        let mut session = session.ok_or_else(|| "先にChatGPTに接続してください。".to_owned())?;
+        // Rotating refresh tokens must be saved even when a requesting search is cancelled.
+        let client = self.clone();
+        tokio::spawn(async move { client.access_token_locked().await })
+            .await
+            .map_err(|_| "ChatGPT接続の更新を完了できませんでした。".to_owned())?
+    }
+
+    async fn access_token_locked(&self) -> Result<String, String> {
+        let guard = self.acquire_guard(false).await?;
+        let (guard, mut registry) = self.load_registry_async(guard).await?;
+        let mut session = registry
+            .active()
+            .cloned()
+            .ok_or_else(|| "先にChatGPTに接続してください。".to_owned())?;
         if !session.sharing() {
             return Err("ChatGPTプランの使用が有効になっていません。プランの使用を許可して接続し直してください。".to_owned());
         }
@@ -355,7 +492,8 @@ impl ChatGptClient {
             .filter(|token| !token.is_empty())
         else {
             session.clear_tokens();
-            let _guard = self.save_session_async(guard, &session).await?;
+            *registry.active_mut().expect("validated active profile") = session;
+            let _guard = self.save_registry_async(guard, &registry).await?;
             return Err("ChatGPTの接続を更新できません。サインインし直してください。".to_owned());
         };
         let discovery = self.discovery().await?;
@@ -375,7 +513,8 @@ impl ChatGptClient {
             Err(failure) => {
                 if failure.code.as_deref().is_some_and(terminal_refresh_error) {
                     session.clear_tokens();
-                    let _guard = self.save_session_async(guard, &session).await?;
+                    *registry.active_mut().expect("validated active profile") = session;
+                    let _guard = self.save_registry_async(guard, &registry).await?;
                 }
                 return Err(failure.message);
             }
@@ -390,7 +529,8 @@ impl ChatGptClient {
         session.expires_at = expiry(tokens.expires_in.unwrap_or_default())?;
         session.scopes = scopes;
         // Keep the previously verified ID token for the account hint. It may be expired.
-        let _guard = self.save_session_async(guard, &session).await?;
+        *registry.active_mut().expect("validated active profile") = session.clone();
+        let _guard = self.save_registry_async(guard, &registry).await?;
         if !session.sharing() {
             return Err(
                 "ChatGPTプランの使用許可がなくなりました。接続し直してください。".to_owned(),
@@ -405,48 +545,94 @@ impl ChatGptClient {
         self.http.as_ref().map_err(Clone::clone)
     }
 
-    async fn load_session_async(
-        &self,
-        guard: OwnedMutexGuard<()>,
-    ) -> Result<(OwnedMutexGuard<()>, Option<Session>), String> {
+    async fn acquire_guard(&self, fail_if_busy: bool) -> Result<SessionGuard, String> {
+        let local = if fail_if_busy {
+            Arc::clone(&SESSION_GATE).try_lock_owned().map_err(|_| {
+                "ChatGPTの接続処理が進行中です。完了してから再試行してください。".to_owned()
+            })?
+        } else {
+            Arc::clone(&SESSION_GATE).lock_owned().await
+        };
         let credentials = Arc::clone(&self.credentials);
-        serialized_blocking(guard, move || load_session_record(credentials.as_ref())).await
+        let capacity = self.capacity.clone();
+        let (local, process) = serialized_blocking(local, move || {
+            let _capacity = capacity;
+            credentials.lock_session()
+        })
+        .await?;
+        Ok(SessionGuard {
+            _local: local,
+            _process: process,
+        })
     }
 
-    async fn save_session_async(
+    async fn load_registry_async(
         &self,
-        guard: OwnedMutexGuard<()>,
-        session: &Session,
-    ) -> Result<OwnedMutexGuard<()>, String> {
+        guard: SessionGuard,
+    ) -> Result<(SessionGuard, Registry), String> {
         let credentials = Arc::clone(&self.credentials);
-        let session = session.clone();
+        let capacity = self.capacity.clone();
+        serialized_blocking(guard, move || {
+            let _capacity = capacity;
+            load_registry_record(credentials.as_ref())
+        })
+        .await
+    }
+
+    async fn save_registry_async(
+        &self,
+        guard: SessionGuard,
+        registry: &Registry,
+    ) -> Result<SessionGuard, String> {
+        let credentials = Arc::clone(&self.credentials);
+        let registry = registry.clone();
+        let capacity = self.capacity.clone();
         let (guard, ()) = serialized_blocking(guard, move || {
-            save_session_record(credentials.as_ref(), &session)
+            let _capacity = capacity;
+            save_registry_record(credentials.as_ref(), &registry)
         })
         .await?;
         Ok(guard)
     }
 
-    async fn host_id_async(
-        &self,
-        guard: OwnedMutexGuard<()>,
-    ) -> Result<(OwnedMutexGuard<()>, String), String> {
+    async fn host_id_async(&self, guard: SessionGuard) -> Result<(SessionGuard, String), String> {
         let credentials = Arc::clone(&self.credentials);
-        serialized_blocking(guard, move || host_id_record(credentials.as_ref())).await
+        let capacity = self.capacity.clone();
+        serialized_blocking(guard, move || {
+            let _capacity = capacity;
+            host_id_record(credentials.as_ref())
+        })
+        .await
     }
 
     #[cfg(test)]
     fn load_session(&self) -> Result<Option<Session>, String> {
-        load_session_record(self.credentials.as_ref())
+        let _guard = self.credentials.lock_session()?;
+        Ok(load_registry_record(self.credentials.as_ref())?
+            .active()
+            .cloned())
     }
 
     #[cfg(test)]
     fn save_session(&self, session: &Session) -> Result<(), String> {
-        save_session_record(self.credentials.as_ref(), session)
+        let _guard = self.credentials.lock_session()?;
+        let mut registry = load_registry_record(self.credentials.as_ref())?;
+        if let Some(previous) = registry
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == session.id)
+        {
+            *previous = session.clone();
+        } else {
+            registry.profiles.push(session.clone());
+        }
+        registry.active_profile = Some(session.id.clone());
+        save_registry_record(self.credentials.as_ref(), &registry)
     }
 
     #[cfg(test)]
     fn host_id(&self) -> Result<String, String> {
+        let _guard = self.credentials.lock_session()?;
         host_id_record(self.credentials.as_ref())
     }
 
@@ -589,10 +775,10 @@ impl ChatGptClient {
     }
 }
 
-async fn serialized_blocking<T: Send + 'static>(
-    guard: OwnedMutexGuard<()>,
+async fn serialized_blocking<G: Send + 'static, T: Send + 'static>(
+    guard: G,
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<(OwnedMutexGuard<()>, T), String> {
+) -> Result<(G, T), String> {
     // The worker owns the guard until it returns. Dropping an awaiting command cannot
     // release serialization while an OS credential prompt/write is still in progress.
     let (guard, result) = tokio::task::spawn_blocking(move || {
@@ -604,9 +790,19 @@ async fn serialized_blocking<T: Send + 'static>(
     Ok((guard, result?))
 }
 
-fn save_session_record(credentials: &dyn CredentialStore, session: &Session) -> Result<(), String> {
-    let record = serde_json::to_string(session)
+fn save_registry_record(
+    credentials: &dyn CredentialStore,
+    registry: &Registry,
+) -> Result<(), String> {
+    registry.validate()?;
+    let record = serde_json::to_string(registry)
         .map_err(|_| "ChatGPT接続を保存できませんでした。".to_owned())?;
+    if record.len() > MAX_HTTP_BODY {
+        return Err(
+            "ChatGPTアカウント登録の保存容量を超えました。既存の登録は保持されています。"
+                .to_owned(),
+        );
+    }
     credentials.set(CredentialKind::ChatGptSession, &record)
 }
 
@@ -614,7 +810,11 @@ fn host_id_record(credentials: &dyn CredentialStore) -> Result<String, String> {
     if let Some(host) = credentials.get(CredentialKind::ChatGptHost)? {
         if host
             .strip_prefix("urn:uuid:")
-            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .and_then(|value| {
+                uuid::Uuid::parse_str(value)
+                    .ok()
+                    .filter(|id| id.get_version_num() == 4 && id.to_string() == value)
+            })
             .is_none()
         {
             return Err("保存されたChatGPTホストIDが不正です。".to_owned());
@@ -626,24 +826,19 @@ fn host_id_record(credentials: &dyn CredentialStore) -> Result<String, String> {
     Ok(host)
 }
 
-fn load_session_record(credentials: &dyn CredentialStore) -> Result<Option<Session>, String> {
-    credentials
-        .get(CredentialKind::ChatGptSession)?
-        .map(|record| {
+fn load_registry_record(credentials: &dyn CredentialStore) -> Result<Registry, String> {
+    match credentials.get(CredentialKind::ChatGptSession)? {
+        None => Ok(Registry::default()),
+        Some(record) => {
             if record.len() > MAX_HTTP_BODY {
                 return Err("保存されたChatGPT接続の形式が不正です。".to_owned());
             }
-            let session: Session = serde_json::from_str(&record)
+            let registry: Registry = serde_json::from_str(&record)
                 .map_err(|_| "保存されたChatGPT接続を読み取れませんでした。".to_owned())?;
-            if session.issuer != AUTH_ORIGIN
-                || session.subject.is_empty()
-                || !issued_client_id(&session.client_id)
-            {
-                return Err("保存されたChatGPT接続の形式が不正です。".to_owned());
-            }
-            Ok(session)
-        })
-        .transpose()
+            registry.validate()?;
+            Ok(registry)
+        }
+    }
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -944,7 +1139,7 @@ mod tests {
         collections::HashMap,
         sync::{
             Mutex as StdMutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -973,8 +1168,49 @@ mod tests {
         }
     }
 
+    // Only generated mock strings are stored in this test fixture. Production tokens
+    // always use SystemCredentials; the empty production lock is exercised here.
+    struct ProcessFixtureCredentials {
+        root: std::path::PathBuf,
+        locking: crate::credentials::SystemCredentials,
+    }
+
+    impl ProcessFixtureCredentials {
+        fn new(root: std::path::PathBuf) -> Self {
+            assert_eq!(
+                std::fs::read_to_string(root.join("mock-only")).unwrap(),
+                "generated SIWC test fixture"
+            );
+            let prepared = Arc::new(crate::storage::PreparedAppData::open(root.clone()).unwrap());
+            Self {
+                root,
+                locking: crate::credentials::SystemCredentials::new(prepared),
+            }
+        }
+    }
+
+    impl CredentialStore for ProcessFixtureCredentials {
+        fn get(&self, kind: CredentialKind) -> Result<Option<String>, String> {
+            assert_eq!(kind, CredentialKind::ChatGptSession);
+            match std::fs::read_to_string(self.root.join("mock-registry.json")) {
+                Ok(record) => Ok(Some(record)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err("cannot read generated fixture".to_owned()),
+            }
+        }
+        fn set(&self, kind: CredentialKind, value: &str) -> Result<(), String> {
+            assert_eq!(kind, CredentialKind::ChatGptSession);
+            std::fs::write(self.root.join("mock-registry.json"), value)
+                .map_err(|_| "cannot write generated fixture".to_owned())
+        }
+        fn lock_session(&self) -> Result<CredentialSessionLock, String> {
+            self.locking.lock_session()
+        }
+    }
+
     fn saved_session() -> Session {
         Session {
+            id: "f9aad168-6c4e-4d23-94e5-4bdfd7462d82".to_owned(),
             issuer: AUTH_ORIGIN.to_owned(),
             subject: "test-subject".to_owned(),
             client_id: "oaiapp_test".to_owned(),
@@ -1018,6 +1254,9 @@ mod tests {
         token_reply: Arc<StdMutex<(u16, Value)>>,
         revoke_status: Arc<StdMutex<u16>>,
         forms: Arc<StdMutex<Vec<String>>>,
+        pause_token: Arc<AtomicBool>,
+        token_started: Arc<tokio::sync::Notify>,
+        token_release: Arc<tokio::sync::Semaphore>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1037,11 +1276,19 @@ mod tests {
             )));
             let revoke_status = Arc::new(StdMutex::new(200));
             let forms = Arc::new(StdMutex::new(Vec::new()));
+            let pause_token = Arc::new(AtomicBool::new(false));
+            let token_started = Arc::new(tokio::sync::Notify::new());
+            let token_release = Arc::new(tokio::sync::Semaphore::new(0));
             let (server_origin, reply, revoke, requests) = (
                 origin.clone(),
                 token_reply.clone(),
                 revoke_status.clone(),
                 forms.clone(),
+            );
+            let (pause, started, release) = (
+                pause_token.clone(),
+                token_started.clone(),
+                token_release.clone(),
             );
             let task = tokio::spawn(async move {
                 loop {
@@ -1052,6 +1299,8 @@ mod tests {
                         revoke.clone(),
                         requests.clone(),
                     );
+                    let (pause, started, release) =
+                        (pause.clone(), started.clone(), release.clone());
                     tokio::spawn(async move {
                         let mut bytes = Vec::new();
                         let mut buffer = [0_u8; 2048];
@@ -1101,6 +1350,10 @@ mod tests {
                                     )
                                     .into_owned(),
                                 );
+                                started.notify_one();
+                                if pause.load(Ordering::SeqCst) {
+                                    release.acquire().await.unwrap().forget();
+                                }
                                 reply.lock().unwrap().clone()
                             }
                             "/revoke" => (*revoke.lock().unwrap(), Value::Null),
@@ -1124,6 +1377,9 @@ mod tests {
                 token_reply,
                 revoke_status,
                 forms,
+                pause_token,
+                token_started,
+                token_release,
                 task,
             }
         }
@@ -1318,6 +1574,12 @@ mod tests {
         let credentials = Arc::new(MemoryCredentials::default());
         let client = server.client(credentials.clone());
         client.save_session(&saved_session()).unwrap();
+        let mut other = saved_session();
+        other.id = uuid::Uuid::new_v4().to_string();
+        other.client_id = "oaiapp_other".to_owned();
+        other.subject = "other-subject".to_owned();
+        client.save_session(&other).unwrap();
+        client.select_profile(saved_session().id).await.unwrap();
         let before = credentials.get(CredentialKind::ChatGptSession).unwrap();
         *server.token_reply.lock().unwrap() = (503, json!({"error":"temporarily_unavailable"}));
         assert!(client.access_token().await.is_err());
@@ -1336,6 +1598,14 @@ mod tests {
                 && record.refresh_token.is_none()
         );
         assert!(!read_status(credentials.as_ref()).unwrap().connected);
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        let retained = registry
+            .profiles
+            .iter()
+            .find(|profile| profile.id == other.id)
+            .unwrap();
+        assert_eq!(retained.refresh_token, other.refresh_token);
+        assert_eq!(registry.active_profile, Some(saved_session().id));
     }
 
     #[tokio::test]
@@ -1505,6 +1775,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_profiles_remain_separate_and_selected_registration_is_reused() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = server.client(credentials.clone());
+        let original = saved_session();
+        client.save_session(&original).unwrap();
+        let host = client.host_id().unwrap();
+        client
+            .connect(true, browser_callback(&server, "success", true))
+            .await
+            .unwrap();
+        let status = read_status(credentials.as_ref()).unwrap();
+        assert_eq!(status.profiles.len(), 2);
+        assert!(
+            status
+                .profiles
+                .iter()
+                .all(|profile| profile.account == original.email)
+        );
+        assert_ne!(status.profiles[0].id, status.profiles[1].id);
+        let added = status.active_profile.unwrap();
+        let added_record = client.load_session().unwrap().unwrap();
+        let before = credentials.get(CredentialKind::ChatGptSession).unwrap();
+        assert!(
+            client
+                .connect(true, browser_callback(&server, "success", true))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            credentials.get(CredentialKind::ChatGptSession).unwrap(),
+            before
+        );
+        client.select_profile(original.id.clone()).await.unwrap();
+        client
+            .connect(false, browser_callback(&server, "success", false))
+            .await
+            .unwrap();
+        assert_eq!(client.host_id().unwrap(), host);
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert_eq!(registry.profiles.len(), 2);
+        assert_eq!(
+            registry.active_profile.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_eq!(registry.active().unwrap().client_id, original.client_id);
+        assert_eq!(
+            registry
+                .profiles
+                .iter()
+                .find(|profile| profile.id == added)
+                .unwrap()
+                .refresh_token,
+            added_record.refresh_token
+        );
+        client.disconnect().await.unwrap();
+        let status = read_status(credentials.as_ref()).unwrap();
+        assert!(!status.connected);
+        assert_eq!(status.active_profile.as_deref(), Some(original.id.as_str()));
+        assert!(
+            status
+                .profiles
+                .iter()
+                .find(|profile| profile.id == added)
+                .unwrap()
+                .connected
+        );
+        client.select_profile(added).await.unwrap();
+        assert_eq!(client.access_token().await.unwrap(), "connected-access");
+        let before = credentials.get(CredentialKind::ChatGptSession).unwrap();
+        assert!(
+            client
+                .select_profile(uuid::Uuid::new_v4().to_string())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            credentials.get(CredentialKind::ChatGptSession).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_corruption_duplicates_and_oversize_without_replacement() {
+        let _test = TEST_GATE.lock().await;
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = ChatGptClient::new(credentials.clone());
+        client.save_session(&saved_session()).unwrap();
+        let valid = credentials
+            .get(CredentialKind::ChatGptSession)
+            .unwrap()
+            .unwrap();
+        let mut bad_ids: Value = serde_json::from_str(&valid).unwrap();
+        bad_ids["profiles"][0]["id"] = json!("not-a-uuid");
+        let mut duplicate: Value = serde_json::from_str(&valid).unwrap();
+        let profile = duplicate["profiles"][0].clone();
+        duplicate["profiles"].as_array_mut().unwrap().push(profile);
+        let mut duplicate_client = duplicate.clone();
+        duplicate_client["profiles"][1]["id"] = json!(uuid::Uuid::new_v4().to_string());
+        let mut bad_issuer: Value = serde_json::from_str(&valid).unwrap();
+        bad_issuer["profiles"][0]["issuer"] = json!("https://evil.invalid");
+        let mut bad_subject: Value = serde_json::from_str(&valid).unwrap();
+        bad_subject["profiles"][0]["subject"] = json!("");
+        let mut bad_pointer: Value = serde_json::from_str(&valid).unwrap();
+        bad_pointer["active_profile"] = json!(uuid::Uuid::new_v4().to_string());
+        for record in [
+            "invalid-json".to_owned(),
+            bad_ids.to_string(),
+            duplicate.to_string(),
+            duplicate_client.to_string(),
+            bad_issuer.to_string(),
+            bad_subject.to_string(),
+            bad_pointer.to_string(),
+        ] {
+            credentials
+                .set(CredentialKind::ChatGptSession, &record)
+                .unwrap();
+            assert!(read_status(credentials.as_ref()).is_err());
+            assert!(
+                client
+                    .connect(true, |_| panic!(
+                        "corrupt registry must fail before browser"
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                credentials
+                    .get(CredentialKind::ChatGptSession)
+                    .unwrap()
+                    .as_deref(),
+                Some(record.as_str())
+            );
+        }
+        credentials
+            .set(CredentialKind::ChatGptSession, &valid)
+            .unwrap();
+        let mut registry = load_registry_record(credentials.as_ref()).unwrap();
+        registry.profiles[0].access_token = Some("x".repeat(MAX_HTTP_BODY));
+        assert!(save_registry_record(credentials.as_ref(), &registry).is_err());
+        assert_eq!(
+            credentials
+                .get(CredentialKind::ChatGptSession)
+                .unwrap()
+                .as_deref(),
+            Some(valid.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_finishes_rotation_before_releasing_lock_and_capacity() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        server.pause_token.store(true, Ordering::SeqCst);
+        let credentials = Arc::new(MemoryCredentials::default());
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(capacity.clone().acquire_owned().await.unwrap());
+        let client = server
+            .client(credentials.clone())
+            .with_capacity(permit.clone());
+        client.save_session(&saved_session()).unwrap();
+        let requesting = client.clone();
+        let search = tokio::spawn(async move { requesting.access_token().await });
+        server.token_started.notified().await;
+        search.abort();
+        assert!(search.await.unwrap_err().is_cancelled());
+        drop(client);
+        drop(permit);
+        assert_eq!(capacity.available_permits(), 0);
+        assert!(Arc::clone(&SESSION_GATE).try_lock_owned().is_err());
+        server.token_release.add_permits(1);
+        timeout(Duration::from_secs(2), capacity.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let record = load_registry_record(credentials.as_ref()).unwrap();
+        assert_eq!(
+            record.active().unwrap().refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+        assert_eq!(server.forms.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_process_refresh_child() {
+        let Some(root) = std::env::var_os("PAIRRANK_SIWC_MOCK_ROOT") else {
+            return;
+        };
+        let origin = std::env::var("PAIRRANK_SIWC_MOCK_ORIGIN").unwrap();
+        let endpoint = Url::parse(&origin).unwrap();
+        assert_eq!(endpoint.scheme(), "http");
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        let credentials = Arc::new(ProcessFixtureCredentials::new(root.into()));
+        let mut client = ChatGptClient::new(credentials.clone());
+        client.discovery_url = format!("{origin}/.well-known/openid-configuration");
+        client.endpoint_origin = origin;
+        let marker = format!(
+            "ready-{}",
+            std::env::var("PAIRRANK_SIWC_MOCK_WORKER").unwrap()
+        );
+        std::fs::write(credentials.root.join(marker), "ready").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            runtime.block_on(client.access_token()).unwrap(),
+            "new-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_processes_serialize_read_refresh_and_rotating_record_publish() {
+        let _test = TEST_GATE.lock().await;
+        let server = FixtureServer::start().await;
+        server.pause_token.store(true, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("mock-only"), "generated SIWC test fixture").unwrap();
+        let credentials = Arc::new(ProcessFixtureCredentials::new(root.path().to_owned()));
+        ChatGptClient::new(credentials.clone())
+            .save_session(&saved_session())
+            .unwrap();
+        let binary = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for worker in ["one", "two"] {
+            children.push(
+                std::process::Command::new(&binary)
+                    .args(["--exact", "chatgpt::tests::cross_process_refresh_child"])
+                    .env("PAIRRANK_SIWC_MOCK_ROOT", root.path())
+                    .env("PAIRRANK_SIWC_MOCK_ORIGIN", &server.origin)
+                    .env("PAIRRANK_SIWC_MOCK_WORKER", worker)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if root.path().join("ready-one").exists() && root.path().join("ready-two").exists()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), server.token_started.notified())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.forms.lock().unwrap().len(), 1);
+        server.token_release.add_permits(2);
+        for child in children {
+            let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mock child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(server.forms.lock().unwrap().len(), 1);
+        let registry = load_registry_record(credentials.as_ref()).unwrap();
+        assert_eq!(
+            registry.active().unwrap().refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+    }
+
+    #[tokio::test]
     async fn callback_reader_bounds_headers_and_ignores_unverified_requests() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1546,13 +2089,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_process_lock_acquisition_keeps_local_gate_and_capacity() {
+        let _test = TEST_GATE.lock().await;
+        struct WaitingCredentials {
+            locking: crate::credentials::SystemCredentials,
+            started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+        impl CredentialStore for WaitingCredentials {
+            fn get(&self, _: CredentialKind) -> Result<Option<String>, String> {
+                panic!("lock fixture does not access credentials");
+            }
+            fn set(&self, _: CredentialKind, _: &str) -> Result<(), String> {
+                panic!("lock fixture does not access credentials");
+            }
+            fn lock_session(&self) -> Result<CredentialSessionLock, String> {
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    started.send(()).unwrap();
+                }
+                self.locking.lock_session()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let prepared =
+            Arc::new(crate::storage::PreparedAppData::open(root.path().to_owned()).unwrap());
+        let locking = crate::credentials::SystemCredentials::new(prepared.clone());
+        let existing_process = locking.lock_session().unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let credentials = Arc::new(WaitingCredentials {
+            locking: crate::credentials::SystemCredentials::new(prepared),
+            started: StdMutex::new(Some(started)),
+        });
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(capacity.clone().acquire_owned().await.unwrap());
+        let client = ChatGptClient::new(credentials).with_capacity(permit.clone());
+        let requesting = client.clone();
+        let command = tokio::spawn(async move { requesting.acquire_guard(false).await });
+        observed.await.unwrap();
+        command.abort();
+        assert!(command.await.err().unwrap().is_cancelled());
+        drop(client);
+        drop(permit);
+        assert!(Arc::clone(&SESSION_GATE).try_lock_owned().is_err());
+        assert_eq!(capacity.available_permits(), 0);
+        drop(existing_process);
+        let _guard = timeout(
+            Duration::from_secs(2),
+            Arc::clone(&SESSION_GATE).lock_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn cancelling_a_blocking_credential_worker_keeps_the_shared_gate_until_completion() {
         let _test = TEST_GATE.lock().await;
-        let guard = Arc::clone(&SESSION_GATE).lock_owned().await;
+        let root = tempfile::tempdir().unwrap();
+        let prepared =
+            Arc::new(crate::storage::PreparedAppData::open(root.path().to_owned()).unwrap());
+        let credentials = Arc::new(crate::credentials::SystemCredentials::new(prepared));
+        let guard = SessionGuard {
+            _local: Arc::clone(&SESSION_GATE).lock_owned().await,
+            _process: credentials.lock_session().unwrap(),
+        };
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(capacity.clone().acquire_owned().await.unwrap());
         let (started, observed) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let command = tokio::spawn(async move {
             serialized_blocking(guard, move || {
+                let _permit = permit;
                 started.send(()).unwrap();
                 wait.recv().unwrap();
                 Ok(())
@@ -1561,8 +2167,19 @@ mod tests {
         });
         observed.await.unwrap();
         command.abort();
-        assert!(command.await.unwrap_err().is_cancelled());
+        assert!(command.await.err().unwrap().is_cancelled());
         assert!(Arc::clone(&SESSION_GATE).try_lock_owned().is_err());
+        assert_eq!(capacity.available_permits(), 0);
+        let (process_acquired, mut process_observed) = tokio::sync::oneshot::channel();
+        let other_process = tokio::task::spawn_blocking(move || {
+            let _guard = credentials.lock_session().unwrap();
+            process_acquired.send(()).unwrap();
+        });
+        assert!(
+            timeout(Duration::from_millis(100), &mut process_observed)
+                .await
+                .is_err()
+        );
         release.send(()).unwrap();
         let _guard = timeout(
             Duration::from_secs(2),
@@ -1570,5 +2187,11 @@ mod tests {
         )
         .await
         .unwrap();
+        timeout(Duration::from_secs(2), process_observed)
+            .await
+            .unwrap()
+            .unwrap();
+        other_process.await.unwrap();
+        assert_eq!(capacity.available_permits(), 1);
     }
 }

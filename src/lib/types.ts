@@ -48,6 +48,12 @@ export type ImageCandidate = {
   previewUrl: string;
   sourceUrl: string;
 };
+export type ChatGptProfile = {
+  id: string;
+  account: string | null;
+  connected: boolean;
+  sharing: boolean;
+};
 export type SearchSettings = {
   braveConfigured: boolean;
   ollamaConfigured: boolean;
@@ -57,6 +63,8 @@ export type SearchSettings = {
   chatgptConnected: boolean;
   chatgptSharing: boolean;
   chatgptAccount: string | null;
+  chatgptProfiles: ChatGptProfile[];
+  chatgptActiveProfile: string | null;
   defaultProvider: SearchProvider;
   errors?: Partial<Record<SearchProvider, string>>;
 };
@@ -101,6 +109,7 @@ export type AppApi = {
   saveOpenAiSettings: (model: string, authMode: OpenAiAuthMode) => Promise<void>;
   openAiModels: () => Promise<string[]>;
   connectChatGpt: (newAccount: boolean) => Promise<void>;
+  selectChatGptProfile: (profileId: string) => Promise<void>;
   disconnectChatGpt: () => Promise<void>;
   openChatGptUsage: () => Promise<void>;
   searchImages: (provider: SearchProvider, query: string) => Promise<ImageCandidate[]>;

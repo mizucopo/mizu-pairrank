@@ -119,9 +119,14 @@ export function mountApp(
     if (!pendingButtonFocus && focusKey && root.contains(focus)) {
       pendingFieldFocus = {
         key: focusKey,
-        listId: ["braveKey", "ollamaKey", "openaiKey", "openaiModel", "openai-auth-mode"].includes(
-          focusKey,
-        )
+        listId: [
+          "braveKey",
+          "ollamaKey",
+          "openaiKey",
+          "openaiModel",
+          "openai-auth-mode",
+          "chatgpt-profile",
+        ].includes(focusKey)
           ? null
           : renderedListId,
         dialog: Boolean(focus?.closest("dialog")),
@@ -231,6 +236,8 @@ export function mountApp(
       if (target.value !== "api" && target.value !== "chatgpt") return;
       controller.state.openaiAuthMode = target.value;
       render();
+    } else if (target instanceof HTMLSelectElement && target.id === "chatgpt-profile") {
+      void controller.selectChatGptProfile(target.value);
     } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
       void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     } else if (target instanceof HTMLInputElement && target.id === "export-include-images") {

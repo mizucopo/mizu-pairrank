@@ -19,6 +19,8 @@ const openAiSettings = {
   chatgptConnected: false,
   chatgptSharing: false,
   chatgptAccount: null,
+  chatgptProfiles: [],
+  chatgptActiveProfile: null,
 };
 
 function setup(
@@ -97,6 +99,7 @@ function setup(
     saveOpenAiSettings: vi.fn<AppApi["saveOpenAiSettings"]>().mockResolvedValue(undefined),
     openAiModels: vi.fn<AppApi["openAiModels"]>().mockResolvedValue([]),
     connectChatGpt: vi.fn<AppApi["connectChatGpt"]>().mockResolvedValue(undefined),
+    selectChatGptProfile: vi.fn<AppApi["selectChatGptProfile"]>().mockResolvedValue(undefined),
     disconnectChatGpt: vi.fn<AppApi["disconnectChatGpt"]>().mockResolvedValue(undefined),
     openChatGptUsage: vi.fn<AppApi["openChatGptUsage"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
@@ -3382,5 +3385,159 @@ describe("OpenAI search interactions", () => {
       [1, 10, "openai"],
       [1, 11, "openai"],
     ]);
+  });
+});
+
+describe("saved ChatGPT account interactions", () => {
+  const profiles = [
+    { id: "issued-client-a", account: "same@example.org", connected: true, sharing: true },
+    { id: "issued-client-b", account: "same@example.org", connected: true, sharing: true },
+  ];
+  function profileSettings() {
+    return {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiModel: "saved-model",
+      openaiAuthMode: "chatgpt" as const,
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "same@example.org",
+      chatgptProfiles: profiles,
+      chatgptActiveProfile: "issued-client-a",
+      defaultProvider: "openai" as const,
+    };
+  }
+  function chooseProfile(root: HTMLElement, id: string): HTMLSelectElement {
+    const selector = root.querySelector<HTMLSelectElement>("#chatgpt-profile");
+    if (!selector) throw new Error("Missing saved ChatGPT account selector");
+    selector.value = id;
+    selector.dispatchEvent(new Event("change", { bubbles: true }));
+    return selector;
+  }
+
+  it("distinguishes same-email profiles with stable IDs and switches without opening authentication or overwriting a draft", async () => {
+    const { root, controller, api } = setup();
+    const saved = profileSettings();
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValueOnce({
+      ...saved,
+      chatgptActiveProfile: "issued-client-b",
+      defaultProvider: "brave",
+    });
+    await controller.initialize();
+    await click(root, controller, '[data-view="settings"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    const options = [...root.querySelectorAll<HTMLOptionElement>("#chatgpt-profile option")];
+    expect(options.map((option) => option.value)).toEqual(["issued-client-a", "issued-client-b"]);
+    expect(options.map((option) => option.textContent)).toEqual([
+      "same@example.org · issued-client-a",
+      "same@example.org · issued-client-b",
+    ]);
+    expect(options[0]?.selected).toBe(true);
+    const model = root.querySelector<HTMLInputElement>("#openaiModel");
+    if (!model) throw new Error("Missing model input");
+    model.value = "unsaved-manual-model";
+    model.dispatchEvent(new Event("input", { bubbles: true }));
+    chooseProfile(root, "issued-client-b");
+    await settle(controller);
+    expect(root.querySelector<HTMLSelectElement>("#chatgpt-profile")?.value).toBe(
+      "issued-client-b",
+    );
+    expect(root.querySelector<HTMLInputElement>("#openaiModel")?.value).toBe(
+      "unsaved-manual-model",
+    );
+    expect(controller.state.settings?.openaiModel).toBe("saved-model");
+    expect(controller.state.provider).toBe("openai");
+    expect(api.selectChatGptProfile).toHaveBeenCalledExactlyOnceWith("issued-client-b");
+    expect(api.connectChatGpt).not.toHaveBeenCalled();
+    expect(api.openAiModels).not.toHaveBeenCalled();
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+    expect(root.textContent).toContain("Using ChatGPT plan");
+  });
+
+  it("keeps a disconnected profile selected and visible, then explicitly reuses it or selects a connected peer", async () => {
+    const { root, controller, api } = setup();
+    const saved = profileSettings();
+    const disconnected = {
+      ...saved,
+      openaiConfigured: false,
+      chatgptConnected: false,
+      chatgptSharing: false,
+      chatgptAccount: null,
+      chatgptProfiles: profiles.map((profile) =>
+        profile.id === "issued-client-a"
+          ? { ...profile, connected: false, sharing: false }
+          : profile,
+      ),
+      defaultProvider: "brave" as const,
+    };
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValue(disconnected);
+    await controller.initialize();
+    await click(root, controller, '[data-view="settings"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    await click(root, controller, '[data-action="disconnect-chatgpt"]');
+    const selector = root.querySelector<HTMLSelectElement>("#chatgpt-profile");
+    expect(selector?.value).toBe("issued-client-a");
+    expect(selector?.options.length).toBe(2);
+    expect(selector?.selectedOptions[0]?.textContent).toBe("same@example.org · issued-client-a");
+    expect(button(root, '[data-action="connect-chatgpt"]').textContent).toBe(
+      "Continue with ChatGPT",
+    );
+    expect(button(root, '[data-action="new-chatgpt-account"]').textContent).toBe(
+      "別のアカウントを追加",
+    );
+    expect(api.selectChatGptProfile).not.toHaveBeenCalled();
+    expect(api.connectChatGpt).not.toHaveBeenCalled();
+    await click(root, controller, '[data-action="connect-chatgpt"]');
+    expect(api.connectChatGpt).toHaveBeenCalledExactlyOnceWith(false);
+    expect(api.selectChatGptProfile).not.toHaveBeenCalled();
+    api.searchSettings.mockResolvedValueOnce({
+      ...disconnected,
+      openaiConfigured: true,
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "same@example.org",
+      chatgptActiveProfile: "issued-client-b",
+    });
+    chooseProfile(root, "issued-client-b");
+    await settle(controller);
+    expect(root.querySelector<HTMLSelectElement>("#chatgpt-profile")?.value).toBe(
+      "issued-client-b",
+    );
+    expect(root.textContent).toContain("Using ChatGPT plan");
+    expect(api.selectChatGptProfile).toHaveBeenCalledExactlyOnceWith("issued-client-b");
+    expect(controller.state.settings?.chatgptProfiles[0]?.connected).toBe(false);
+  });
+
+  it("preserves account options and the prior selection after a status failure while retaining healthy provider choices", async () => {
+    const { root, controller, api } = setup();
+    const saved = profileSettings();
+    api.searchSettings
+      .mockResolvedValueOnce(saved)
+      .mockRejectedValueOnce(new Error("account status unavailable"));
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, '[data-action="check-search-settings"]');
+    const settingsLink = root.querySelector<HTMLButtonElement>('dialog [data-view="settings"]');
+    if (!settingsLink) throw new Error("Missing image search settings link");
+    settingsLink.click();
+    chooseProfile(root, "issued-client-b");
+    await settle(controller);
+    expect(root.querySelector<HTMLSelectElement>("#chatgpt-profile")?.value).toBe(
+      "issued-client-a",
+    );
+    expect(root.querySelectorAll("#chatgpt-profile option")).toHaveLength(2);
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain(
+      "account status unavailable",
+    );
+    expect(controller.availableBulkProviders()).toEqual(["brave", "ollama"]);
+    await click(root, controller, '[data-action="resume-image-search"]');
+    const provider = root.querySelector<HTMLSelectElement>("#search-provider");
+    if (!provider) throw new Error("Missing search provider");
+    provider.value = "brave";
+    provider.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(false);
+    expect(api.connectChatGpt).not.toHaveBeenCalled();
   });
 });

@@ -9,6 +9,7 @@ use reqwest::{Client, Request, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::sync::OwnedSemaphorePermit;
 
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const MODELS_URL: &str = "https://api.openai.com/v1/models";
@@ -177,6 +178,7 @@ async fn read_http_response(mut response: Response, limit: usize) -> Result<Http
 pub(crate) struct OpenAiClient {
     credentials: Arc<dyn CredentialStore>,
     transport: Arc<dyn OpenAiTransport>,
+    capacity: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl OpenAiClient {
@@ -186,21 +188,39 @@ impl OpenAiClient {
             transport: Arc::new(HttpTransport {
                 http: http_client(),
             }),
+            capacity: None,
+        }
+    }
+
+    pub(crate) fn new_with_capacity(
+        credentials: Arc<dyn CredentialStore>,
+        capacity: Arc<OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            capacity: Some(capacity),
+            ..Self::new(credentials)
         }
     }
 
     async fn settings(&self) -> Result<OpenAiSettings, String> {
         let credentials = self.credentials.clone();
-        tokio::task::spawn_blocking(move || read_settings(credentials.as_ref()))
-            .await
-            .map_err(|_| "OpenAI設定を取得できませんでした。".to_owned())?
+        let capacity = self.capacity.clone();
+        tokio::task::spawn_blocking(move || {
+            // An OS credential prompt can outlive a cancelled search future.
+            let _capacity = capacity;
+            read_settings(credentials.as_ref())
+        })
+        .await
+        .map_err(|_| "OpenAI設定を取得できませんでした。".to_owned())?
     }
 
     async fn authorization(&self, mode: OpenAiAuthMode) -> Result<String, String> {
         match mode {
             OpenAiAuthMode::Api => {
                 let credentials = self.credentials.clone();
+                let capacity = self.capacity.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _capacity = capacity;
                     credentials
                         .get(CredentialKind::ApiKey(SearchProvider::Openai))?
                         .filter(|key| !key.trim().is_empty())
@@ -210,9 +230,12 @@ impl OpenAiClient {
                 .map_err(|_| "OpenAIのAPIキーを取得できませんでした。".to_owned())?
             }
             OpenAiAuthMode::Chatgpt => {
-                ChatGptClient::new(self.credentials.clone())
-                    .access_token()
-                    .await
+                let client = ChatGptClient::new(self.credentials.clone());
+                let client = match &self.capacity {
+                    Some(capacity) => client.with_capacity(capacity.clone()),
+                    None => client,
+                };
+                client.access_token().await
             }
         }
     }
@@ -773,9 +796,13 @@ mod tests {
             .set(CredentialKind::ApiKey(SearchProvider::Openai), API_SECRET)
             .unwrap();
         credentials.set(CredentialKind::ChatGptSession, &json!({
-            "issuer": "https://auth.openai.com", "subject": "test-subject", "client_id": "issued-test-client",
-            "email": "test@example.com", "id_token": "test-id-token", "access_token": CHATGPT_SECRET,
-            "refresh_token": "test-refresh-token", "scopes": ["chatgpt.tokens.use.direct"], "expires_at": u64::MAX
+            "version": 1, "active_profile": "f9aad168-6c4e-4d23-94e5-4bdfd7462d82",
+            "profiles": [{
+                "id": "f9aad168-6c4e-4d23-94e5-4bdfd7462d82",
+                "issuer": "https://auth.openai.com", "subject": "test-subject", "client_id": "oaiapp_test-client",
+                "email": "test@example.com", "id_token": "test-id-token", "access_token": CHATGPT_SECRET,
+                "refresh_token": "test-refresh-token", "scopes": ["chatgpt.tokens.use.direct"], "expires_at": u64::MAX
+            }]
         }).to_string()).unwrap();
         credentials.reads.lock().unwrap().clear();
         credentials.writes.lock().unwrap().clear();
@@ -794,6 +821,7 @@ mod tests {
             OpenAiClient {
                 credentials,
                 transport: transport.clone(),
+                capacity: None,
             },
             transport,
         )
@@ -1364,6 +1392,7 @@ mod tests {
         let client = OpenAiClient {
             credentials: credentials.clone(),
             transport: transport.clone(),
+            capacity: None,
         };
         let error = client.search("cats").await.err().unwrap();
         assert!(error.contains("通信状態"));
@@ -1422,6 +1451,119 @@ mod tests {
         );
         assert!(transport.requests.lock().unwrap().is_empty());
         assert!(credentials.writes.lock().unwrap().is_empty());
+    }
+
+    async fn cancelled_credential_workers_keep_search_capacity(blocked_kind: CredentialKind) {
+        struct BlockingCredentials {
+            blocked_kind: CredentialKind,
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            waits: Mutex<Vec<std::sync::mpsc::Receiver<()>>>,
+        }
+
+        impl CredentialStore for BlockingCredentials {
+            fn get(&self, kind: CredentialKind) -> Result<Option<String>, String> {
+                if kind == self.blocked_kind {
+                    let wait = self.waits.lock().unwrap().pop();
+                    if let Some(wait) = wait {
+                        self.started.send(()).unwrap();
+                        let _ = wait.recv();
+                    }
+                }
+                Ok(match kind {
+                    CredentialKind::OpenAiSettings => None,
+                    CredentialKind::ApiKey(SearchProvider::Openai) => Some(API_SECRET.to_owned()),
+                    _ => panic!("unexpected credential access"),
+                })
+            }
+
+            fn set(&self, _: CredentialKind, _: &str) -> Result<(), String> {
+                panic!("a cancelled search must not write credentials")
+            }
+        }
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        // Dropping the senders also releases workers if any assertion fails.
+        let (mut releases, waits): (Vec<_>, Vec<_>) =
+            (0..2).map(|_| std::sync::mpsc::channel()).unzip();
+        let credentials = Arc::new(BlockingCredentials {
+            blocked_kind,
+            started,
+            waits: Mutex::new(waits),
+        });
+        let transport = Arc::new(MockTransport::default());
+        for remaining in [1, 0] {
+            let capacity = Arc::new(slots.clone().try_acquire_owned().unwrap());
+            let mut client = OpenAiClient::new_with_capacity(credentials.clone(), capacity);
+            client.transport = transport.clone();
+            let search = tokio::spawn(async move { client.search("cats").await });
+            tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            search.abort();
+            assert!(search.await.err().unwrap().is_cancelled());
+            assert_eq!(slots.available_permits(), remaining);
+        }
+        assert!(slots.clone().try_acquire_owned().is_err());
+        assert!(transport.requests.lock().unwrap().is_empty());
+
+        releases.pop().unwrap().send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let completed_capacity = slots.clone().try_acquire_owned().unwrap();
+        assert!(slots.clone().try_acquire_owned().is_err());
+
+        releases.pop().unwrap().send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(completed_capacity);
+        assert_eq!(slots.available_permits(), 2);
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_settings_workers_retain_both_search_slots_until_each_worker_finishes() {
+        cancelled_credential_workers_keep_search_capacity(CredentialKind::OpenAiSettings).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_api_key_workers_retain_both_search_slots_until_each_worker_finishes() {
+        cancelled_credential_workers_keep_search_capacity(CredentialKind::ApiKey(
+            SearchProvider::Openai,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn completed_search_returns_capacity_ownership_to_the_image_pipeline() {
+        for mode in [OpenAiAuthMode::Api, OpenAiAuthMode::Chatgpt] {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let capacity = Arc::new(slots.clone().try_acquire_owned().unwrap());
+            let credentials = credentials(mode);
+            let transport = Arc::new(MockTransport {
+                requests: Mutex::default(),
+                responses: Mutex::new(vec![Ok(success())].into()),
+            });
+            let mut client = OpenAiClient::new_with_capacity(credentials, capacity.clone());
+            client.transport = transport;
+            assert_eq!(client.search("cats").await.unwrap().len(), 1);
+            drop(client);
+            let permit = Arc::try_unwrap(capacity).unwrap();
+            assert_eq!(slots.available_permits(), 0);
+            drop(permit);
+            assert_eq!(slots.available_permits(), 1);
+        }
     }
 
     async fn local_response(raw: Vec<u8>) -> Response {

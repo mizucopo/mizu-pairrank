@@ -37,6 +37,7 @@ describe("OpenAI IPC transport", () => {
     await api.openAiModels();
     await api.connectChatGpt(false);
     await api.connectChatGpt(true);
+    await api.selectChatGptProfile("profile-a");
     await api.disconnectChatGpt();
     await api.openChatGptUsage();
     await api.setApiKey("openai", "test-key");
@@ -47,6 +48,7 @@ describe("OpenAI IPC transport", () => {
       ["openai_models", {}],
       ["connect_chatgpt", { newAccount: false }],
       ["connect_chatgpt", { newAccount: true }],
+      ["select_chatgpt_profile", { profileId: "profile-a" }],
       ["disconnect_chatgpt", {}],
       ["open_chatgpt_usage", {}],
       ["set_api_key", { provider: "openai", key: "test-key" }],
