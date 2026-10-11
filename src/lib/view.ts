@@ -83,12 +83,15 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
           .join("")}</div>`
   }</section><section class="tag-management"><div class="section-heading"><div><h2>タグ管理 <span class="count">${list.tags.length}</span></h2><p class="muted">タグはこのリストの項目に付けられます。項目には複数のタグを付けられます。</p></div><button class="secondary" data-action="manage-tags"${disabled(s)}>タグを管理</button></div>${list.tags.length ? `<div class="tag-summary">${list.tags.map((tag) => `<span class="tag-chip">${e(tag.name)} <small>${list.items.filter((item) => item.tagIds.includes(tag.id)).length} 件</small></span>`).join("")}</div>` : '<p class="muted">タグはまだありません。</p>'}</section>`;
 }
+function undoAnswerButton(s: AppState): string {
+  return `<div class="comparison-undo"><button class="secondary" data-action="undo-answer"${s.busy || !s.canUndoAnswer ? " disabled" : ""}>直前の回答を取り消す</button></div>`;
+}
 function comparisonView(s: AppState, assetUrl: (path: string) => string): string {
   const pair = s.pair;
   if (!pair && s.comparisonPaused && !s.busy)
-    return `<div class="empty"><div class="empty-symbol">⇄</div><h2>比較できるペアをすべて保留しました</h2><p>情報を確認できたら、保留を解除してもう一度比較できます。<br />スキップは評価や比較回数に含まれません。</p><button data-action="resume-skipped-comparisons">保留した比較を再開</button></div>${progress(s)}`;
+    return `<div class="empty"><div class="empty-symbol">⇄</div><h2>比較できるペアをすべて保留しました</h2><p>情報を確認できたら、保留を解除してもう一度比較できます。<br />スキップは評価や比較回数に含まれません。</p><button data-action="resume-skipped-comparisons">保留した比較を再開</button></div>${undoAnswerButton(s)}${progress(s)}`;
   if (!pair)
-    return `<div class="empty"><div class="empty-symbol">⇄</div><h2>${s.busy ? "次の比較を選んでいます" : "比較を再開できます"}</h2><p>順位を知る手がかりになるペアを選びます。</p>${s.busy ? '<span class="spinner" aria-hidden="true"></span>' : '<button data-view="compare">次のペアを表示</button>'}</div>`;
+    return `<div class="empty"><div class="empty-symbol">⇄</div><h2>${s.busy ? "次の比較を選んでいます" : "比較を再開できます"}</h2><p>順位を知る手がかりになるペアを選びます。</p>${s.busy ? '<span class="spinner" aria-hidden="true"></span>' : '<button data-action="continue-comparison">次のペアを表示</button>'}</div>${undoAnswerButton(s)}`;
   return `<section class="comparison"><div class="comparison-heading"><p class="eyebrow">FOLLOW YOUR PREFERENCE</p><h2>どちらが好きですか？</h2><p class="muted">「大好き」は、相手よりかなり好き。「好き」は、少し好き。</p></div><div class="pair-cards">${(
     [
       ["A", pair.a],
@@ -101,7 +104,7 @@ function comparisonView(s: AppState, assetUrl: (path: string) => string): string
     )
     .join(
       "",
-    )}<span class="versus" aria-hidden="true">or</span></div><div class="answers" role="group" aria-label="比較への回答">${answers.map((answer) => `<button class="answer ${answer.value}" data-answer="${answer.value}"${disabled(s)}>${answer.label}<kbd>${answer.key}</kbd></button>`).join("")}</div><p class="comparison-note">${s.busy ? "次の比較を選んでいます…" : "直感で選んで大丈夫。キーボードの1〜5でも回答できます。"}</p><div class="comparison-skip"><button class="secondary" data-action="skip-comparison"${disabled(s)}>情報が足りないのでスキップ</button><p class="muted small">評価せずに保留します。他の比較に${Math.max(1, (s.active?.items.length ?? 2) - 1)}回答すると再び候補になります。</p></div></section>${progress(s)}`;
+    )}<span class="versus" aria-hidden="true">or</span></div><div class="answers" role="group" aria-label="比較への回答">${answers.map((answer) => `<button class="answer ${answer.value}" data-answer="${answer.value}"${disabled(s)}>${answer.label}<kbd>${answer.key}</kbd></button>`).join("")}</div><p class="comparison-note">${s.busy ? "次の比較を選んでいます…" : "直感で選んで大丈夫。キーボードの1〜5でも回答できます。"}</p>${undoAnswerButton(s)}<div class="comparison-skip"><button class="secondary" data-action="skip-comparison"${disabled(s)}>情報が足りないのでスキップ</button><p class="muted small">評価せずに保留します。他の比較に${Math.max(1, (s.active?.items.length ?? 2) - 1)}回答すると再び候補になります。</p></div></section>${progress(s)}`;
 }
 function matchesSelectedTags(item: Item, s: AppState): boolean {
   return s.selectedTagIds.every((id) => item.tagIds.includes(id));
@@ -116,7 +119,7 @@ function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
   const visible = list.items.filter((item) => matchesSelectedTags(item, s));
-  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div></div>${tagFilter(s)}${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
+  return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div></div>${s.canUndoAnswer ? undoAnswerButton(s) : ""}${tagFilter(s)}${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
 }
 function tierView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;

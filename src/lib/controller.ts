@@ -39,6 +39,7 @@ export type AppState = {
   active: ListState | null;
   pair: PairProposal | null;
   comparisonPaused: boolean;
+  canUndoAnswer: boolean;
   view: View;
   selectedTagIds: number[];
   busy: boolean;
@@ -96,6 +97,7 @@ export class AppController {
     active: null,
     pair: null,
     comparisonPaused: false,
+    canUndoAnswer: false,
     view: "items",
     selectedTagIds: [],
     busy: false,
@@ -122,6 +124,11 @@ export class AppController {
   private readRequest: symbol | null = null;
   private settingsRead: Promise<SearchSettings> | null = null;
   private skippedPairs: { ids: ItemPair; remainingAnswers: number }[] = [];
+  private lastAnswer: {
+    pair: PairProposal;
+    revision: number;
+    skippedPairs: { ids: ItemPair; remainingAnswers: number }[];
+  } | null = null;
 
   constructor(
     private readonly api: AppApi,
@@ -206,6 +213,14 @@ export class AppController {
     this.cancelRead("settings");
     if (this.state.busy) return;
     if (view === "compare") {
+      // Resuming a converged list resets its ranking window and invalidates undo.
+      if (this.lastAnswer && this.state.active?.convergence.converged) {
+        this.state.view = "compare";
+        this.state.modal = null;
+        this.state.error = "";
+        this.changed();
+        return;
+      }
       await this.startComparison();
       return;
     }
@@ -411,6 +426,8 @@ export class AppController {
   private acceptCommittedList(list: ListState): void {
     // Keep committed state usable even if a later sidebar refresh fails.
     const previous = this.state.active;
+    if (this.lastAnswer?.pair.listId !== list.id || this.lastAnswer.revision !== list.revision)
+      this.clearUndoAnswer();
     // Replacing the ranking window also detects resets with unchanged answer counts.
     if (
       previous?.id !== list.id ||
@@ -447,6 +464,11 @@ export class AppController {
       this.state.tagDeletingId = null;
     }
     this.updateListSummary(list);
+  }
+
+  private clearUndoAnswer(): void {
+    this.lastAnswer = null;
+    this.state.canUndoAnswer = false;
   }
 
   editTag(tagId: number | null): void {
@@ -676,6 +698,7 @@ export class AppController {
           .deleteList(list.id)
           .catch((error: unknown) => this.handleListError(list.id, error));
         this.state.active = null;
+        this.clearUndoAnswer();
         this.state.pair = null;
         this.state.modal = null;
         this.state.drafts.items = "";
@@ -810,6 +833,7 @@ export class AppController {
       this.state.comparisonPaused = false;
       this.skippedPairs = [];
       this.state.active = null;
+      this.clearUndoAnswer();
       this.state.modal = null;
       this.state.candidates = [];
       this.state.searched = false;
@@ -865,11 +889,13 @@ export class AppController {
     const pair = this.state.pair;
     if (!pair || this.state.view !== "compare" || this.state.modal) return;
     await this.perform(async () => {
+      const skippedPairs = this.skippedPairs;
       let result: ListState;
       try {
         result = await this.api.answer(pair, preference);
       } catch (error) {
         if (errorMessage(error) === staleComparisonMessage) {
+          this.clearUndoAnswer();
           this.state.pair = null;
           throw new Error(comparisonRetryMessage, { cause: error });
         }
@@ -877,6 +903,8 @@ export class AppController {
       }
       // Drop the used proposal before any later I/O; it must never be submitted twice.
       this.acceptCommittedList(result);
+      this.lastAnswer = { pair, revision: result.revision, skippedPairs };
+      this.state.canUndoAnswer = true;
       if (result.convergence.converged) {
         this.state.view = "ranking";
         this.state.notice = "順位ほぼ確定。比較を続けることもできます。";
@@ -895,6 +923,41 @@ export class AppController {
         this.state.pair = next;
         this.state.comparisonPaused = !next;
       }
+    });
+  }
+
+  async undoAnswer(): Promise<void> {
+    const answer = this.lastAnswer;
+    if (!answer || this.state.modal || this.state.busy) return;
+    this.cancelRead("settings");
+    await this.perform(async () => {
+      let restored: ListState;
+      try {
+        restored = await this.api.undoAnswer(answer.pair.listId, answer.revision);
+      } catch (error) {
+        if (
+          errorMessage(error) === staleComparisonMessage ||
+          errorMessage(error) === "取り消せる回答がありません。"
+        ) {
+          this.clearUndoAnswer();
+          this.state.pair = null;
+          const current = await this.api
+            .getList(answer.pair.listId)
+            .catch((reloadError: unknown) => this.handleListError(answer.pair.listId, reloadError));
+          this.acceptCommittedList(current);
+        }
+        return this.handleListError(answer.pair.listId, error);
+      }
+      this.clearUndoAnswer();
+      this.acceptCommittedList(restored);
+      this.skippedPairs = answer.skippedPairs;
+      const a = restored.items.find((item) => item.id === answer.pair.a.id);
+      const b = restored.items.find((item) => item.id === answer.pair.b.id);
+      if (!a || !b) throw new Error(comparisonRetryMessage);
+      this.state.pair = { listId: restored.id, revision: restored.revision, a, b };
+      this.state.view = "compare";
+      this.state.notice = "直前の回答を取り消しました。同じペアにもう一度回答できます。";
+      await this.refreshListSummaries(restored.id);
     });
   }
 

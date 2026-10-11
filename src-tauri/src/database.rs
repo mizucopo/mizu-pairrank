@@ -41,9 +41,20 @@ pub struct ComparisonState {
     pub pair_counts: HashMap<(i64, i64), u64>,
 }
 
+#[derive(Clone)]
+struct UndoAnswer {
+    list_id: i64,
+    revision: u64,
+    items: [(i64, Rating, u64); 2],
+    comparison_id: i64,
+    snapshot_id: i64,
+    evicted_snapshots: Vec<(i64, String)>,
+}
+
 pub struct Database {
     connection: Connection,
     app_data: Option<Arc<crate::storage::PreparedAppData>>,
+    undo_answer: Option<UndoAnswer>,
 }
 
 impl Database {
@@ -112,6 +123,7 @@ impl Database {
         let database = Self {
             connection,
             app_data,
+            undo_answer: None,
         };
         // Never silently interpret stored ratings with a different model or configuration.
         database.list_summaries()?;
@@ -615,7 +627,7 @@ impl Database {
         answer: Preference,
         expected_revision: u64,
     ) -> Result<ListState, String> {
-        self.mutate_list(list_id, |transaction| {
+        let (state, mut undo) = self.mutate_list_with_result(list_id, |transaction| {
             let state = read_list(transaction, list_id)?;
             if state.revision != expected_revision {
                 return Err("リストが更新されています。最新の比較を読み直してください。".to_owned());
@@ -649,8 +661,22 @@ impl Database {
                     params![list_id, a_id, b_id, preference],
                 )
                 .map_err(db_error)?;
+            let comparison_id = transaction.last_insert_rowid();
             append_snapshot(transaction, list_id)?;
+            let snapshot_id = transaction.last_insert_rowid();
             let keep = state.items.len().max(20) + 1;
+            let evicted_snapshots = transaction
+                .prepare(
+                    "SELECT id, ranking FROM rank_snapshots WHERE list_id = ?1
+                     ORDER BY id DESC LIMIT -1 OFFSET ?2",
+                )
+                .map_err(db_error)?
+                .query_map(params![list_id, keep as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(db_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_error)?;
             transaction
                 .execute(
                     "DELETE FROM rank_snapshots WHERE list_id = ?1 AND id NOT IN
@@ -658,8 +684,82 @@ impl Database {
                     params![list_id, keep as i64],
                 )
                 .map_err(db_error)?;
+            Ok(UndoAnswer {
+                list_id,
+                revision: state.revision,
+                items: [
+                    (a.id, a.rating, a.comparison_count),
+                    (b.id, b.rating, b.comparison_count),
+                ],
+                comparison_id,
+                snapshot_id,
+                evicted_snapshots,
+            })
+        })?;
+        undo.revision = state.revision;
+        self.undo_answer = Some(undo);
+        Ok(state)
+    }
+
+    pub fn undo_answer(
+        &mut self,
+        list_id: i64,
+        expected_revision: u64,
+    ) -> Result<ListState, String> {
+        let undo = self.undo_answer.clone();
+        let state = self.mutate_list(list_id, move |transaction| {
+            let current = read_list(transaction, list_id)?;
+            if current.revision != expected_revision {
+                return Err("リストが更新されています。最新の比較を読み直してください。".to_owned());
+            }
+            let undo = undo
+                .filter(|undo| undo.list_id == list_id)
+                .ok_or_else(|| "取り消せる回答がありません。".to_owned())?;
+            if undo.revision != expected_revision {
+                return Err("リストが更新されています。最新の比較を読み直してください。".to_owned());
+            }
+            for (id, rating, comparison_count) in undo.items {
+                require_item_change(transaction.execute(
+                    "UPDATE items SET mu = ?1, sigma = ?2, comparison_count = ?3
+                     WHERE id = ?4 AND list_id = ?5 AND deleted = 0",
+                    params![
+                        rating.mu,
+                        rating.sigma,
+                        comparison_count as i64,
+                        id,
+                        list_id
+                    ],
+                ))?;
+            }
+            for (sql, id) in [
+                (
+                    "DELETE FROM comparisons WHERE id = ?1 AND list_id = ?2",
+                    undo.comparison_id,
+                ),
+                (
+                    "DELETE FROM rank_snapshots WHERE id = ?1 AND list_id = ?2",
+                    undo.snapshot_id,
+                ),
+            ] {
+                let changed = transaction
+                    .execute(sql, params![id, list_id])
+                    .map_err(db_error)?;
+                if changed != 1 {
+                    return Err("取り消す回答が見つかりません。".to_owned());
+                }
+            }
+            for (id, ranking) in undo.evicted_snapshots {
+                transaction
+                    .execute(
+                        "INSERT INTO rank_snapshots (id, list_id, ranking) VALUES (?1, ?2, ?3)",
+                        params![id, list_id, ranking],
+                    )
+                    .map_err(db_error)?;
+            }
             Ok(())
-        })
+        })?;
+        self.undo_answer = None;
+        Ok(state)
     }
 
     fn read_transaction(&self) -> Result<Transaction<'_>, String> {
@@ -1250,6 +1350,7 @@ mod tests {
         SetImage,
         RemoveImage,
         Answer,
+        UndoAnswer,
     }
 
     impl WriteOperation {
@@ -1262,7 +1363,7 @@ mod tests {
             Self::ResumeList,
             Self::RenameList,
         ];
-        const ALL: [Self; 17] = [
+        const ALL: [Self; 18] = [
             Self::CreateList,
             Self::ImportList,
             Self::DuplicateList,
@@ -1280,6 +1381,7 @@ mod tests {
             Self::SetImage,
             Self::RemoveImage,
             Self::Answer,
+            Self::UndoAnswer,
         ];
 
         fn apply(self, database: &mut Database, state: &ListState) -> Result<(), String> {
@@ -1328,6 +1430,7 @@ mod tests {
                         state.revision,
                     )
                     .map(|_| ()),
+                Self::UndoAnswer => database.undo_answer(state.id, state.revision).map(|_| ()),
             }
         }
     }
@@ -3154,6 +3257,376 @@ mod tests {
                 .unwrap()
                 .pair_counts
                 .is_empty()
+        );
+    }
+
+    fn assert_restored_answer(before: &ListState, restored: &ListState) {
+        let mut expected = serde_json::to_value(before).unwrap();
+        expected["revision"] = serde_json::json!(restored.revision);
+        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+        assert_eq!(restored.revision, before.revision + 2);
+    }
+
+    fn answer_rows(database: &Database, list_id: i64) -> (StoredRows, StoredRows) {
+        let rows = |sql| {
+            let mut statement = database.connection.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([list_id], |row| {
+                    (0..columns).map(|index| row.get(index)).collect()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<StoredRows>>()
+                .unwrap()
+        };
+        (
+            rows("SELECT * FROM comparisons WHERE list_id = ?1 ORDER BY id"),
+            rows("SELECT * FROM rank_snapshots WHERE list_id = ?1 ORDER BY id"),
+        )
+    }
+
+    #[test]
+    fn undo_restores_only_the_latest_answer_once_and_allows_reanswering() {
+        let mut database = memory_database();
+        let original = settled_list_with_image(&mut database);
+        let first = answer_once(&mut database, &original);
+        let rows = answer_rows(&database, original.id);
+        let latest = answer_once(&mut database, &first);
+        let restored = database.undo_answer(latest.id, latest.revision).unwrap();
+        assert_restored_answer(&first, &restored);
+        assert_eq!(answer_rows(&database, original.id), rows);
+        assert_eq!(
+            database
+                .undo_answer(restored.id, restored.revision)
+                .unwrap_err(),
+            "取り消せる回答がありません。"
+        );
+        assert_eq!(
+            serde_json::to_value(database.get_list(restored.id).unwrap()).unwrap(),
+            serde_json::to_value(&restored).unwrap()
+        );
+        assert!(
+            database
+                .answer(
+                    restored.id,
+                    restored.items[0].id,
+                    restored.items[1].id,
+                    Preference::BStrong,
+                    first.revision
+                )
+                .is_err()
+        );
+        let corrected = database
+            .answer(
+                restored.id,
+                restored.items[0].id,
+                restored.items[1].id,
+                Preference::BStrong,
+                restored.revision,
+            )
+            .unwrap();
+        assert_eq!(corrected.comparison_count, latest.comparison_count);
+        let restored_again = database
+            .undo_answer(corrected.id, corrected.revision)
+            .unwrap();
+        let mut expected = serde_json::to_value(&restored).unwrap();
+        expected["revision"] = serde_json::json!(restored_again.revision);
+        assert_eq!(serde_json::to_value(restored_again).unwrap(), expected);
+    }
+
+    #[test]
+    fn undo_of_the_first_answer_restores_an_empty_history() {
+        let mut database = memory_database();
+        let before = populated_list(&mut database, "test");
+        assert_eq!(
+            database
+                .undo_answer(before.id, before.revision)
+                .unwrap_err(),
+            "取り消せる回答がありません。"
+        );
+        let answered = answer_once(&mut database, &before);
+        let restored = database
+            .undo_answer(answered.id, answered.revision)
+            .unwrap();
+        assert_restored_answer(&before, &restored);
+        assert!(
+            database
+                .comparison_state(before.id)
+                .unwrap()
+                .pair_counts
+                .is_empty()
+        );
+        assert_eq!(snapshot_count(&database, before.id), 1);
+    }
+
+    #[test]
+    fn undo_restores_convergence_and_a_resumed_comparison_window() {
+        let mut database = memory_database();
+        let mut state = populated_list(&mut database, "test");
+        for _ in 0..19 {
+            state = database
+                .answer(
+                    state.id,
+                    state.items[0].id,
+                    state.items[1].id,
+                    Preference::Equal,
+                    state.revision,
+                )
+                .unwrap();
+        }
+        assert!(!state.convergence.converged);
+        let settled = database
+            .answer(
+                state.id,
+                state.items[0].id,
+                state.items[1].id,
+                Preference::Equal,
+                state.revision,
+            )
+            .unwrap();
+        assert!(settled.convergence.converged);
+        let restored = database.undo_answer(settled.id, settled.revision).unwrap();
+        assert_restored_answer(&state, &restored);
+        let settled = database
+            .answer(
+                restored.id,
+                restored.items[0].id,
+                restored.items[1].id,
+                Preference::Equal,
+                restored.revision,
+            )
+            .unwrap();
+        let resumed = database.resume_list(settled.id).unwrap();
+        assert_eq!(resumed.convergence.observed_answers, 0);
+        let answered = answer_once(&mut database, &resumed);
+        let restored = database
+            .undo_answer(answered.id, answered.revision)
+            .unwrap();
+        assert_restored_answer(&resumed, &restored);
+        assert_eq!(snapshot_count(&database, restored.id), 1);
+    }
+
+    #[test]
+    fn failed_undo_rolls_back_the_evicted_window_and_preserves_the_receipt_for_retry() {
+        let mut database = memory_database();
+        let mut before = populated_list(&mut database, "test");
+        for _ in 0..27 {
+            before = answer_once(&mut database, &before);
+        }
+        let rows = answer_rows(&database, before.id);
+        let answered = answer_once(&mut database, &before);
+        let answered_rows = answer_rows(&database, before.id);
+        database.connection.execute_batch(
+            "CREATE TRIGGER reject_undo BEFORE INSERT ON rank_snapshots BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        assert!(
+            database
+                .undo_answer(answered.id, answered.revision)
+                .is_err()
+        );
+        assert_eq!(answer_rows(&database, before.id), answered_rows);
+        assert_eq!(
+            serde_json::to_value(database.get_list(before.id).unwrap()).unwrap(),
+            serde_json::to_value(&answered).unwrap()
+        );
+        assert!(database.connection.is_autocommit());
+        database
+            .connection
+            .execute_batch("DROP TRIGGER reject_undo")
+            .unwrap();
+        let restored = database
+            .undo_answer(answered.id, answered.revision)
+            .unwrap();
+        assert_restored_answer(&before, &restored);
+        assert_eq!(answer_rows(&database, before.id), rows);
+        assert_eq!(snapshot_count(&database, before.id), 21);
+    }
+
+    #[test]
+    fn a_failed_new_answer_does_not_replace_the_previous_undo_receipt() {
+        let mut database = memory_database();
+        let before = populated_list(&mut database, "test");
+        let answered = answer_once(&mut database, &before);
+        database.connection.execute_batch(
+            "CREATE TRIGGER reject_answer BEFORE INSERT ON comparisons BEGIN SELECT RAISE(ABORT, 'test failure'); END;"
+        ).unwrap();
+        assert!(
+            database
+                .answer(
+                    answered.id,
+                    answered.items[0].id,
+                    answered.items[1].id,
+                    Preference::BWeak,
+                    answered.revision
+                )
+                .is_err()
+        );
+        let restored = database
+            .undo_answer(answered.id, answered.revision)
+            .unwrap();
+        assert_restored_answer(&before, &restored);
+    }
+
+    #[test]
+    fn undo_rejects_every_intervening_list_mutation_without_overwriting_it() {
+        for operation in [
+            WriteOperation::RenameList,
+            WriteOperation::AddItems,
+            WriteOperation::CreateTag,
+            WriteOperation::RenameTag,
+            WriteOperation::DeleteTag,
+            WriteOperation::SetItemTag,
+            WriteOperation::RenameItem,
+            WriteOperation::DeleteItem,
+            WriteOperation::SetImage,
+            WriteOperation::RemoveImage,
+            WriteOperation::ResetComparisons,
+            WriteOperation::ResumeList,
+        ] {
+            let mut database = memory_database();
+            let before = settled_list_with_image(&mut database);
+            let answered = database
+                .answer(
+                    before.id,
+                    before.items[0].id,
+                    before.items[1].id,
+                    Preference::Equal,
+                    before.revision,
+                )
+                .unwrap();
+            operation.apply(&mut database, &answered).unwrap();
+            let changed = database.get_list(before.id).unwrap();
+            let rows = answer_rows(&database, before.id);
+            for revision in [answered.revision, changed.revision] {
+                assert!(
+                    database.undo_answer(before.id, revision).is_err(),
+                    "{operation:?}"
+                );
+                assert_eq!(answer_rows(&database, before.id), rows, "{operation:?}");
+                assert_eq!(
+                    serde_json::to_value(database.get_list(before.id).unwrap()).unwrap(),
+                    serde_json::to_value(&changed).unwrap(),
+                    "{operation:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn undo_is_session_local_and_rejects_another_instances_answer_or_edit() {
+        for another_answer in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("undo.sqlite3");
+            let mut first = Database::open(&path).unwrap();
+            let before = populated_list(&mut first, "shared");
+            let answered = answer_once(&mut first, &before);
+            let mut second = Database::open(&path).unwrap();
+            assert_eq!(
+                second
+                    .undo_answer(answered.id, answered.revision)
+                    .unwrap_err(),
+                "取り消せる回答がありません。"
+            );
+            let changed = if another_answer {
+                answer_once(&mut second, &answered)
+            } else {
+                second
+                    .rename_item(answered.id, answered.items[0].id, "Changed".into())
+                    .unwrap()
+            };
+            let rows = answer_rows(&second, before.id);
+            assert!(first.undo_answer(answered.id, answered.revision).is_err());
+            assert_eq!(answer_rows(&second, before.id), rows);
+            assert_eq!(
+                serde_json::to_value(first.get_list(before.id).unwrap()).unwrap(),
+                serde_json::to_value(changed).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn undo_rechecks_revision_after_waiting_for_a_competing_writer() {
+        use std::cell::RefCell;
+        use std::sync::mpsc;
+
+        thread_local! {
+            static UNDO_WAITING: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
+        }
+        for mode in ["DELETE", "WAL"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("undo-waiting.sqlite3");
+            let mut first = Database::open(&path).unwrap();
+            first
+                .connection
+                .pragma_update(None, "journal_mode", mode)
+                .unwrap();
+            let before = populated_list(&mut first, "shared");
+            let answered = answer_once(&mut first, &before);
+            let mut second = Database::open(&path).unwrap();
+            let writer = second.write_transaction().unwrap();
+            writer
+                .execute(
+                    "UPDATE lists SET name = 'Changed', revision = revision + 1 WHERE id = ?1",
+                    [before.id],
+                )
+                .unwrap();
+            let (waiting, notified) = mpsc::channel();
+            let id = answered.id;
+            let worker = std::thread::spawn(move || {
+                UNDO_WAITING.with(|signal| *signal.borrow_mut() = Some(waiting));
+                first
+                    .connection
+                    .busy_handler(Some(|_| {
+                        UNDO_WAITING.with(|signal| {
+                            if let Some(waiting) = signal.borrow_mut().take() {
+                                let _ = waiting.send(());
+                            }
+                        });
+                        std::thread::sleep(Duration::from_millis(1));
+                        true
+                    }))
+                    .unwrap();
+                let result = first.undo_answer(answered.id, answered.revision);
+                (first, result)
+            });
+            let did_wait = notified.recv_timeout(Duration::from_secs(5));
+            writer.commit().unwrap();
+            let (first, result) = worker.join().unwrap();
+            did_wait.unwrap();
+            assert_eq!(
+                result.unwrap_err(),
+                "リストが更新されています。最新の比較を読み直してください。"
+            );
+            let changed = second.get_list(id).unwrap();
+            assert_eq!(changed.name, "Changed");
+            assert_eq!(changed.comparison_count, 1);
+            assert_eq!(
+                serde_json::to_value(first.get_list(id).unwrap()).unwrap(),
+                serde_json::to_value(changed).unwrap()
+            );
+            assert_eq!(answer_rows(&first, id), answer_rows(&second, id));
+            assert!(first.connection.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn an_answer_on_another_list_replaces_the_single_undo_receipt() {
+        let mut database = memory_database();
+        let first = populated_list(&mut database, "first");
+        let second = populated_list(&mut database, "second");
+        let first = answer_once(&mut database, &first);
+        let second = answer_once(&mut database, &second);
+        assert_eq!(
+            database.undo_answer(first.id, first.revision).unwrap_err(),
+            "取り消せる回答がありません。"
+        );
+        assert_eq!(database.get_list(first.id).unwrap().comparison_count, 1);
+        assert_eq!(
+            database
+                .undo_answer(second.id, second.revision)
+                .unwrap()
+                .comparison_count,
+            0
         );
     }
 

@@ -79,6 +79,7 @@ function setup(
       nextPair.mockResolvedValue({ ...pair, revision });
       return { ...state, revision, comparisonCount };
     }),
+    undoAnswer: vi.fn<AppApi["undoAnswer"]>().mockResolvedValue(state),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
@@ -2658,4 +2659,215 @@ describe("desktop app interaction", () => {
       expect(root.querySelector<HTMLElement>(".tag-editor-list")?.[axis]).toBe(650);
     },
   );
+});
+
+describe("undo answer controls", () => {
+  const undoSelector = '[data-action="undo-answer"]';
+
+  it("shows a disabled undo control before answering and while another pair is loading", async () => {
+    const { root, controller, api, pair } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    expect(button(root, undoSelector).disabled).toBe(true);
+    let finish!: (value: PairProposal) => void;
+    api.nextPair.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const pending = controller.startComparison();
+    await vi.waitFor(() => expect(api.nextPair).toHaveBeenCalledTimes(2));
+    expect(button(root, undoSelector).textContent).toContain("直前の回答を取り消す");
+    expect(button(root, undoSelector).disabled).toBe(true);
+    button(root, undoSelector).click();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+    finish(pair);
+    await pending;
+    await settle(controller);
+    expect(button(root, undoSelector).disabled).toBe(true);
+  });
+
+  it("disables undo and answers during a pending undo, consumes once, and permits keyboard reanswer", async () => {
+    const { root, controller, api, state, pair } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    await click(root, controller, '[data-answer="a_weak"]');
+    expect(button(root, undoSelector).disabled).toBe(false);
+    const restored = { ...state, revision: state.revision + 2 };
+    let finish!: (value: ListState) => void;
+    api.undoAnswer.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    button(root, undoSelector).focus();
+    button(root, undoSelector).click();
+    expect(button(root, undoSelector).disabled).toBe(true);
+    expect(button(root, '[data-answer="equal"]').disabled).toBe(true);
+    button(root, undoSelector).click();
+    root.dispatchEvent(new KeyboardEvent("keydown", { key: "3", bubbles: true }));
+    expect(api.undoAnswer).toHaveBeenCalledExactlyOnceWith(state.id, state.revision + 1);
+    expect(api.answer).toHaveBeenCalledTimes(1);
+    finish(restored);
+    await settle(controller);
+    expect(button(root, undoSelector).disabled).toBe(true);
+    expect(controller.state.active).toEqual(restored);
+    expect(controller.state.pair).toEqual({ ...pair, revision: restored.revision });
+    expect(root.querySelector(".page-header")?.textContent).toContain("0 回の比較");
+    expect(root.querySelector(".list-link")?.textContent).toContain("0 回比較");
+    button(root, undoSelector).click();
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+    const focus = document.activeElement;
+    expect(focus instanceof HTMLElement && root.contains(focus)).toBe(true);
+    if (!focus) throw new Error("Missing keyboard focus after undo");
+    const reanswered = { ...state, revision: restored.revision + 1, comparisonCount: 1 };
+    api.answer.mockResolvedValueOnce(reanswered);
+    api.nextPair.mockResolvedValue({ ...pair, revision: reanswered.revision });
+    focus.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    await settle(controller);
+    expect(api.answer).toHaveBeenNthCalledWith(
+      2,
+      { ...pair, revision: restored.revision },
+      "a_strong",
+    );
+    expect(controller.state.active).toEqual(reanswered);
+    expect(button(root, undoSelector).disabled).toBe(false);
+  });
+
+  it.each(["held", "next pair failed"] as const)(
+    "keeps undo available when the comparison has no displayed pair because it is %s",
+    async (reason) => {
+      const { root, controller, api, state, pair } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-view="compare"]');
+      if (reason === "next pair failed")
+        api.nextPair.mockRejectedValueOnce("候補を読み込めません。");
+      await click(root, controller, '[data-answer="equal"]');
+      if (reason === "held") {
+        api.nextPair.mockResolvedValueOnce(null);
+        await click(root, controller, '[data-action="skip-comparison"]');
+        expect(root.textContent).toContain("比較できるペアをすべて保留しました");
+      } else
+        expect(root.querySelector('[role="alert"]')?.textContent).toContain(
+          "候補を読み込めません。",
+        );
+      expect(controller.state.pair).toBeNull();
+      expect(button(root, undoSelector).disabled).toBe(false);
+      const restored = { ...state, revision: state.revision + 2 };
+      api.undoAnswer.mockResolvedValue(restored);
+      await click(root, controller, undoSelector);
+      expect(root.querySelectorAll("[data-answer]")).toHaveLength(5);
+      expect(controller.state.pair).toEqual({ ...pair, revision: restored.revision });
+      expect(root.querySelector('[role="alert"]')).toBeNull();
+      expect(button(root, undoSelector).disabled).toBe(true);
+    },
+  );
+
+  it("preserves final-answer undo on ranking and comparison pages and restores convergence, tags and images", async () => {
+    const { root, controller, api, state, pair } = setup();
+    const initial: ListState = {
+      ...state,
+      comparisonCount: 20,
+      comparisonWindow: [1, 21],
+      tags: [{ id: 1, listId: state.id, name: "果物" }],
+      items: state.items.map((item) => ({
+        ...item,
+        image: { path: `/images/${item.id}.png`, sourceUrl: null },
+        tagIds: [1],
+        comparisonCount: 20,
+      })),
+      convergence: { ...state.convergence, observedAnswers: 20 },
+    };
+    const currentPair = { ...pair, a: initial.items[1]!, b: initial.items[0]! };
+    const saved: ListState = {
+      ...initial,
+      revision: initial.revision + 1,
+      comparisonCount: 21,
+      comparisonWindow: [2, 22],
+      items: initial.items.map((item) => ({
+        ...item,
+        rating: { mu: 30, sigma: 2 },
+        comparisonCount: 21,
+      })),
+      convergence: { ...initial.convergence, converged: true, maxSigma: 2 },
+    };
+    const restored = { ...initial, revision: saved.revision + 1 };
+    api.getList.mockResolvedValue(initial);
+    api.resumeList.mockResolvedValue(initial);
+    api.nextPair.mockResolvedValue(currentPair);
+    api.answer.mockResolvedValue(saved);
+    api.undoAnswer.mockResolvedValue(restored);
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    await click(root, controller, '[data-answer="a_strong"]');
+    expect(controller.state.view).toBe("ranking");
+    expect(root.querySelector(".converged-banner")).not.toBeNull();
+    expect(button(root, undoSelector).disabled).toBe(false);
+    api.resumeList.mockClear();
+    await click(root, controller, '.tabs [data-view="tier"]');
+    await click(root, controller, '.tabs [data-view="compare"]');
+    expect(api.resumeList).not.toHaveBeenCalled();
+    expect(button(root, undoSelector).disabled).toBe(false);
+    await click(root, controller, undoSelector);
+    expect(controller.state.active).toEqual(restored);
+    expect(controller.state.pair).toEqual({ ...currentPair, revision: restored.revision });
+    expect(root.querySelector(".converged-banner")).toBeNull();
+    expect(root.querySelectorAll(".pair-cards img")).toHaveLength(2);
+    await click(root, controller, '.tabs [data-view="ranking"]');
+    expect(root.querySelector(".tag-filter")?.textContent).toContain("果物");
+    expect(root.querySelector(".page-header")?.textContent).toContain("20 回の比較");
+  });
+
+  it("explicit continuation resets convergence and removes the previous undo control", async () => {
+    const { root, controller, api, state, pair } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    const saved = {
+      ...state,
+      revision: state.revision + 1,
+      comparisonCount: 1,
+      convergence: { ...state.convergence, converged: true },
+    };
+    api.answer.mockResolvedValue(saved);
+    await click(root, controller, '[data-answer="equal"]');
+    expect(button(root, undoSelector).disabled).toBe(false);
+    const resumed = {
+      ...saved,
+      revision: saved.revision + 1,
+      comparisonWindow: [100, 100] as [number, number],
+      convergence: { ...saved.convergence, converged: false },
+    };
+    api.resumeList.mockResolvedValue(resumed);
+    api.nextPair.mockResolvedValue({ ...pair, revision: resumed.revision });
+    await click(root, controller, '.tabs [data-view="compare"]');
+    await click(root, controller, '[data-action="continue-comparison"]');
+    expect(controller.state.active).toEqual(resumed);
+    expect(root.querySelector(".converged-banner")).toBeNull();
+    expect(button(root, undoSelector).disabled).toBe(true);
+    button(root, undoSelector).click();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+  });
+
+  it("shows a retryable undo error without changing the displayed comparison", async () => {
+    const { root, controller, api, state, pair } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-view="compare"]');
+    await click(root, controller, '[data-answer="equal"]');
+    const before = controller.state.active;
+    const next = controller.state.pair;
+    api.undoAnswer.mockRejectedValueOnce("保存できません。");
+    await click(root, controller, undoSelector);
+    expect(root.querySelector('[role="alert"]')?.textContent).toContain("保存できません。");
+    expect(controller.state.active).toEqual(before);
+    expect(controller.state.pair).toEqual(next);
+    expect(button(root, undoSelector).disabled).toBe(false);
+    const restored = { ...state, revision: state.revision + 2 };
+    api.undoAnswer.mockResolvedValue(restored);
+    await click(root, controller, undoSelector);
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(controller.state.pair).toEqual({ ...pair, revision: restored.revision });
+    expect(api.undoAnswer).toHaveBeenCalledTimes(2);
+  });
 });
