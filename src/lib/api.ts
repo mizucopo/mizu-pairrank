@@ -41,6 +41,12 @@ export const api: AppApi = {
   undoAnswer: (listId, expectedRevision) => invoke("undo_answer", { listId, expectedRevision }),
   searchSettings: () => invoke("search_settings"),
   setApiKey: (provider, key) => invoke("set_api_key", { provider, key }),
+  saveOpenAiSettings: (model, authMode) => invoke("save_openai_settings", { model, authMode }),
+  openAiModels: () => invoke("openai_models"),
+  connectChatGpt: (newAccount) => invoke("connect_chatgpt", { newAccount }),
+  selectChatGptProfile: (profileId) => invoke("select_chatgpt_profile", { profileId }),
+  disconnectChatGpt: () => invoke("disconnect_chatgpt"),
+  openChatGptUsage: () => invoke("open_chatgpt_usage"),
   searchImages: (provider, query) => invoke("search_images", { provider, query }),
   autoRegisterImage: (listId, itemId, provider) =>
     invoke("auto_register_image", { listId, itemId, provider }),

@@ -11,8 +11,13 @@ function draftField(value: string | undefined): value is keyof AppState["drafts"
     value === "items" ||
     value === "query" ||
     value === "braveKey" ||
-    value === "ollamaKey"
+    value === "ollamaKey" ||
+    value === "openaiKey" ||
+    value === "openaiModel"
   );
+}
+function searchProvider(value: string | undefined): SearchProvider | null {
+  return value === "brave" || value === "ollama" || value === "openai" ? value : null;
 }
 export function mountApp(
   root: HTMLElement,
@@ -114,7 +119,16 @@ export function mountApp(
     if (!pendingButtonFocus && focusKey && root.contains(focus)) {
       pendingFieldFocus = {
         key: focusKey,
-        listId: focusKey === "braveKey" || focusKey === "ollamaKey" ? null : renderedListId,
+        listId: [
+          "braveKey",
+          "ollamaKey",
+          "openaiKey",
+          "openaiModel",
+          "openai-auth-mode",
+          "chatgpt-profile",
+        ].includes(focusKey)
+          ? null
+          : renderedListId,
         dialog: Boolean(focus?.closest("dialog")),
         selection:
           (focus instanceof HTMLInputElement || focus instanceof HTMLTextAreaElement) &&
@@ -207,15 +221,23 @@ export function mountApp(
   root.addEventListener("change", (event) => {
     const target = event.target;
     if (target instanceof HTMLSelectElement && target.id === "search-provider") {
-      controller.state.provider = target.value === "ollama" ? "ollama" : "brave";
-      controller.state.candidates = [];
-      controller.state.searched = false;
+      if (controller.state.busy) return;
+      const provider = searchProvider(target.value);
+      if (!provider) return;
+      controller.state.provider = provider;
       controller.state.error = "";
       render();
     } else if (target instanceof HTMLSelectElement && target.id === "bulk-provider") {
-      controller.state.bulkProvider =
-        target.value === "brave" || target.value === "ollama" ? target.value : null;
+      if (controller.state.busy) return;
+      controller.state.bulkProvider = searchProvider(target.value);
       render();
+    } else if (target instanceof HTMLSelectElement && target.id === "openai-auth-mode") {
+      if (controller.state.busy) return;
+      if (target.value !== "api" && target.value !== "chatgpt") return;
+      controller.state.openaiAuthMode = target.value;
+      render();
+    } else if (target instanceof HTMLSelectElement && target.id === "chatgpt-profile") {
+      void controller.selectChatGptProfile(target.value);
     } else if (target instanceof HTMLInputElement && target.dataset.tagId) {
       void controller.toggleItemTag(Number(target.dataset.tagId), target.checked);
     } else if (target instanceof HTMLInputElement && target.id === "export-include-images") {
@@ -248,8 +270,13 @@ export function mountApp(
       case "search-images":
         void controller.searchImages();
         break;
-      case "save-key":
-        void controller.saveKey(form.dataset.provider === "ollama" ? "ollama" : "brave");
+      case "save-key": {
+        const provider = searchProvider(form.dataset.provider);
+        if (provider) void controller.saveKey(provider);
+        break;
+      }
+      case "save-openai-settings":
+        void controller.saveOpenAiSettings();
         break;
     }
   });
@@ -275,11 +302,13 @@ export function mountApp(
       view === "tier" ||
       view === "settings"
     ) {
-      void controller.navigate(view);
+      if (view === "settings" && controller.state.modal?.kind === "image")
+        controller.editImageSearchSettings();
+      else void controller.navigate(view);
       return;
     }
     const id = Number(button.dataset.id);
-    const provider: SearchProvider = button.dataset.provider === "ollama" ? "ollama" : "brave";
+    const provider = searchProvider(button.dataset.provider);
     switch (button.dataset.action) {
       case "toggle-tag":
         controller.toggleTag(id);
@@ -420,7 +449,25 @@ export function mountApp(
         break;
       }
       case "remove-key":
-        void controller.saveKey(provider, true);
+        if (provider) void controller.saveKey(provider, true);
+        break;
+      case "refresh-openai-models":
+        void controller.refreshOpenAiModels();
+        break;
+      case "resume-image-search":
+        controller.resumeImageSearch();
+        break;
+      case "connect-chatgpt":
+        void controller.connectChatGpt();
+        break;
+      case "new-chatgpt-account":
+        void controller.connectChatGpt(true);
+        break;
+      case "disconnect-chatgpt":
+        void controller.disconnectChatGpt();
+        break;
+      case "chatgpt-usage":
+        void controller.openChatGptUsage();
         break;
     }
   });

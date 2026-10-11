@@ -7,16 +7,27 @@ import type { Item, SearchProvider } from "./types.js";
 const e = escapeHtml;
 const disabled = (state: AppState): string => (state.busy ? " disabled" : "");
 const number = (value: number): string => value.toFixed(2);
+const providerNames: Record<SearchProvider, string> = {
+  brave: "Brave",
+  ollama: "Ollama",
+  openai: "OpenAI",
+};
 
 function keyStatus(s: AppState, provider: SearchProvider): string {
   if (s.settings?.errors?.[provider] !== undefined) return "確認できません";
   if (!s.checkedProviders.includes(provider)) return "未確認";
-  return (provider === "brave" ? s.settings?.braveConfigured : s.settings?.ollamaConfigured)
+  return (
+    provider === "brave"
+      ? s.settings?.braveConfigured
+      : provider === "ollama"
+        ? s.settings?.ollamaConfigured
+        : s.settings?.openaiConfigured
+  )
     ? "設定済み"
     : "未設定";
 }
 function credentialAccess(s: AppState): string {
-  return `<div class="settings-note"><p>画像検索のAPIキーを安全に保存・読み出すため、OSの資格情報ストアを使います。macOSではキーチェーンの確認が出ることがあります。</p><p class="muted small">画像検索を使わなくても、比較やファイルからの画像登録を続けられます。</p><p class="small">Brave: ${keyStatus(s, "brave")} · Ollama: ${keyStatus(s, "ollama")}</p><button type="button" class="secondary" data-action="check-search-settings"${disabled(s)}>保存済みキーを確認</button></div>`;
+  return `<div class="settings-note"><p>画像検索のAPIキーを安全に保存・読み出すため、OSの資格情報ストアを使います。macOSではキーチェーンの確認が出ることがあります。</p><p class="muted small">画像検索を使わなくても、比較やファイルからの画像登録を続けられます。</p><p class="small">Brave: ${keyStatus(s, "brave")} · Ollama: ${keyStatus(s, "ollama")} · OpenAI: ${keyStatus(s, "openai")}</p><button type="button" class="secondary" data-action="check-search-settings"${disabled(s)}>保存済みキー・接続を確認</button></div>`;
 }
 function picture(item: Item, assetUrl: (path: string) => string, large = false): string {
   return item.image
@@ -118,7 +129,7 @@ function tierView(s: AppState, assetUrl: (path: string) => string): string {
   return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && allRows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div><button class="secondary" data-action="export-report"${disabled(s)}>表を出力</button></div>${tagFilter(s)}${hasVisibleItems ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item }) => `<li class="tier-card">${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
 }
 function settingsView(s: AppState): string {
-  return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスのAPIキーを登録してください。</p></div></header>${credentialAccess(s)}<section class="settings-grid">${(
+  return `<header class="page-header"><div><p class="eyebrow">SETTINGS</p><h1>画像検索の設定</h1><p class="muted">使いたいサービスの取得方法を設定してください。</p></div></header>${s.imageSearchReturn ? `<button type="button" class="secondary" data-action="resume-image-search"${disabled(s)}>画像検索に戻る</button>` : ""}${credentialAccess(s)}<section class="settings-grid">${(
     ["brave", "ollama"] as const
   )
     .map((provider) => {
@@ -133,7 +144,23 @@ function settingsView(s: AppState): string {
     })
     .join(
       "",
-    )}</section><p class="settings-note">APIキーはこの端末の資格情報ストアに保存されます。画像検索を設定しなくても、手動登録・画像なしで比較できます。</p><p class="muted small">Image search powered by Brave Search API / Ollama Web Search</p>`;
+    )}${openAiSettings(s)}</section><p class="settings-note">APIキーはこの端末の資格情報ストアに保存されます。画像検索を設定しなくても、手動登録・画像なしで比較できます。</p><p class="muted small">Image search powered by Brave Search API / Ollama Web Search / OpenAI</p>`;
+}
+function openAiSettings(s: AppState): string {
+  const settings = s.settings;
+  const error = settings?.errors?.openai;
+  const chatgpt = s.openaiAuthMode === "chatgpt";
+  const connected = settings?.chatgptConnected;
+  const sharing = settings?.chatgptSharing;
+  const account = settings?.chatgptAccount;
+  const profiles = settings?.chatgptProfiles ?? [];
+  const profileChoice = profiles.length
+    ? `<label for="chatgpt-profile">保存済みのChatGPTアカウント</label><select id="chatgpt-profile" data-focus="chatgpt-profile" aria-describedby="chatgpt-profile-help"${disabled(s)}>${settings?.chatgptActiveProfile ? "" : '<option value="" selected>選択してください</option>'}${profiles.map((profile) => `<option value="${e(profile.id)}"${profile.id === settings?.chatgptActiveProfile ? " selected" : ""}>${e(profile.account ?? "保存済みアカウント")} · ${e(profile.id)}</option>`).join("")}</select><p id="chatgpt-profile-help" class="muted small">保存済みのアカウントへ切り替えます。モデルIDと取得方法は変わりません。</p>`
+    : "";
+  const authentication = chatgpt
+    ? `${profileChoice}<p>${connected ? `ChatGPTに接続済み${account ? `: ${e(account)}` : ""}` : "ChatGPTに接続してください。"}</p>${connected && sharing ? '<p class="badge ready">Using ChatGPT plan</p>' : connected ? '<p class="muted">このアプリへの共有を許可するため、もう一度接続してください。</p>' : ""}<p class="muted small">ChatGPTプランの利用制限が適用されます。</p><div class="form-actions">${!connected || !sharing ? `<button type="button" data-action="connect-chatgpt"${disabled(s)}>Continue with ChatGPT</button>` : ""}${connected || profiles.length ? `<button type="button" class="secondary" data-action="new-chatgpt-account"${disabled(s)}>別のアカウントを追加</button>` : ""}${connected ? `<button type="button" class="text-button" data-action="chatgpt-usage"${disabled(s)}>利用状況を管理</button><button type="button" class="text-button danger-text" data-action="disconnect-chatgpt"${disabled(s)}>接続を解除</button>` : ""}</div>`
+    : `<p class="muted small">APIの都度課金が適用されます。ChatGPTプランとは別の料金です。platform.openai.com でAPIキーを取得できます。</p><form data-form="save-key" data-provider="openai"><label for="openaiKey">APIキー</label><input type="password" id="openaiKey" data-draft="openaiKey" data-focus="openaiKey" value="${e(s.drafts.openaiKey)}" autocomplete="off" placeholder="APIキーを入力" required${disabled(s)} /><div class="form-actions"><button type="submit"${disabled(s)}>保存</button><button class="text-button danger-text" type="button" data-action="remove-key" data-provider="openai"${disabled(s)}>キーを削除</button></div></form>`;
+  return `<article class="settings-card"><div class="section-heading"><h2>OpenAI Image Search</h2><span class="badge ${configuredSearchProviders(s).includes("openai") ? "ready" : ""}">${keyStatus(s, "openai")}</span></div>${error === undefined ? "" : `<p class="error" role="alert">${e(error || "接続状態を確認できませんでした。")}</p>`}<p>Web上の画像を検索し、候補を表示します。</p>${settings && settings.openaiAuthMode !== s.openaiAuthMode ? `<p class="muted small" role="status">取得方法の変更は未保存です。検索には保存済みの${settings.openaiAuthMode === "chatgpt" ? "ChatGPTプラン" : "API（都度課金）"}を使います。</p>` : ""}<form data-form="save-openai-settings"><label for="openai-auth-mode">取得方法</label><select id="openai-auth-mode" data-focus="openai-auth-mode"${disabled(s)}><option value="api"${chatgpt ? "" : " selected"}>API（都度課金）</option><option value="chatgpt"${chatgpt ? " selected" : ""}>ChatGPTプラン</option></select><label for="openaiModel">モデルID</label><input id="openaiModel" data-draft="openaiModel" data-focus="openaiModel" list="openai-models" value="${e(s.drafts.openaiModel)}" required maxlength="128" aria-describedby="openai-model-help"${disabled(s)} /><datalist id="openai-models">${s.openaiModels.map((model) => `<option value="${e(model)}"></option>`).join("")}</datalist><p id="openai-model-help" class="muted small">一覧にないモデルも直接入力して保存できます。一覧への掲載は画像検索への対応を保証しません。一覧は保存済みの取得方法で取得するため、取得方法を変更したら先に保存してください。保存した取得方法とモデルは次の検索に適用されます。</p><div class="form-actions"><button type="submit"${disabled(s)}>取得方法とモデルを保存</button><button type="button" class="secondary" data-action="refresh-openai-models"${s.busy || (settings && settings.openaiAuthMode !== s.openaiAuthMode) ? " disabled" : ""}>モデル一覧を更新</button></div></form>${authentication}</article>`;
 }
 function sourceHost(source: string): string {
   try {
@@ -166,9 +193,9 @@ function modalView(s: AppState): string {
     let providerChoice =
       '<p class="muted">設定済みの検索元がまだ確認できていません。<button type="button" class="text-button" data-view="settings">検索設定を開く</button></p>';
     if (providers.length > 1) {
-      providerChoice = `<label for="bulk-provider">検索元</label><select id="bulk-provider" data-focus="bulk-provider"${run || s.busy ? " disabled" : ""}><option value=""${s.bulkProvider ? "" : " selected"}>選択してください</option>${providers.map((provider) => `<option value="${provider}"${s.bulkProvider === provider ? " selected" : ""}>${provider === "brave" ? "Brave" : "Ollama"}</option>`).join("")}</select>`;
+      providerChoice = `<label for="bulk-provider">検索元</label><select id="bulk-provider" data-focus="bulk-provider"${run || s.busy ? " disabled" : ""}><option value=""${s.bulkProvider ? "" : " selected"}>選択してください</option>${providers.map((provider) => `<option value="${provider}"${s.bulkProvider === provider ? " selected" : ""}>${providerNames[provider]}</option>`).join("")}</select>`;
     } else if (providers.length === 1) {
-      providerChoice = `<p>検索元: ${providers[0] === "ollama" ? "Ollama" : "Brave"}</p>`;
+      providerChoice = `<p>検索元: ${providerNames[providers[0]!]}</p>`;
     }
     const summary = run
       ? `<div class="bulk-progress" role="status"><p>${run.done} / ${run.total} 件を処理 · 登録 ${run.registered} 件 · 見送り ${run.skipped} 件</p><progress max="${run.total}" value="${run.done}" aria-label="画像登録の進捗"></progress>${run.running ? `<p class="muted">${run.stopping ? "現在の項目が終わり次第停止します…" : "画像を検索して登録しています…"}</p>` : `<p>${run.stopped ? "停止しました。" : s.error ? "途中で停止しました。" : "一括処理が完了しました。"}</p>`}</div>`
@@ -204,9 +231,9 @@ function modalView(s: AppState): string {
     const readError =
       error === undefined ? undefined : error || "資格情報ストアから読み取れませんでした。";
     const settingsMessage = readError
-      ? `APIキーの状態を確認できません: ${e(readError)}`
-      : `APIキーは${keyStatus(s, s.provider)}です。`;
-    body = `<div class="image-options"><button class="secondary" data-action="local-image"${disabled(s)}>ファイルから登録</button><button class="text-button" data-action="no-image"${s.busy || !item?.image ? " disabled" : ""}>画像なしにする</button></div><div class="divider"></div><h3>ネットで画像を探す</h3>${credentialAccess(s)}<form data-form="search-images" class="image-search"><label class="sr-only" for="search-provider">検索元</label><select id="search-provider" data-focus="provider"${disabled(s)}><option value="brave"${s.provider === "brave" ? " selected" : ""}>Brave</option><option value="ollama"${s.provider === "ollama" ? " selected" : ""}>Ollama</option></select><label class="sr-only" for="image-query">検索語</label><input id="image-query" data-draft="query" data-focus="query" value="${e(s.drafts.query)}" required${disabled(s)} /><button type="submit"${disabled(s)}${!configured ? " disabled" : ""}>検索</button></form>${readError || !configured ? `<p class="muted">${settingsMessage}<button class="text-button" data-view="settings"${disabled(s)}>検索設定を開く</button></p>` : ""}${s.busy ? '<p role="status">処理中です…</p>' : ""}${s.searched && !s.candidates.length ? '<p class="empty compact">画像が見つかりませんでした。検索語や検索元を変えてみてください。</p>' : ""}<div class="image-results">${s.candidates.map((candidate, index) => `<button class="image-result" data-action="choose-image" data-index="${index}"${disabled(s)}><img src="${e(candidate.previewUrl)}" alt="${e(candidate.title)}" loading="lazy" /><span>${e(candidate.title)}</span><small title="${e(candidate.sourceUrl)}">${e(sourceHost(candidate.sourceUrl))}</small></button>`).join("")}</div>${item?.image?.sourceUrl ? `<p class="muted source-url">現在の画像の出典：${e(item.image.sourceUrl)}</p>` : ""}`;
+      ? `検索の接続状態を確認できません: ${e(readError)}`
+      : `検索の接続状態は${keyStatus(s, s.provider)}です。`;
+    body = `<div class="image-options"><button class="secondary" data-action="local-image"${disabled(s)}>ファイルから登録</button><button class="text-button" data-action="no-image"${s.busy || !item?.image ? " disabled" : ""}>画像なしにする</button></div><div class="divider"></div><h3>ネットで画像を探す</h3>${credentialAccess(s)}<form data-form="search-images" class="image-search"><label class="sr-only" for="search-provider">検索元</label><select id="search-provider" data-focus="provider"${disabled(s)}><option value="brave"${s.provider === "brave" ? " selected" : ""}>Brave</option><option value="ollama"${s.provider === "ollama" ? " selected" : ""}>Ollama</option><option value="openai"${s.provider === "openai" ? " selected" : ""}>OpenAI</option></select><label class="sr-only" for="image-query">検索語</label><input id="image-query" data-draft="query" data-focus="query" value="${e(s.drafts.query)}" required${disabled(s)} /><button type="submit"${disabled(s)}${!configured ? " disabled" : ""}>検索</button></form>${s.provider === "openai" ? `<p class="muted small">モデル: ${e(s.settings?.openaiModel ?? s.drafts.openaiModel)} · ${s.settings?.openaiAuthMode === "chatgpt" ? (s.settings.chatgptConnected && s.settings.chatgptSharing ? "Using ChatGPT plan" : "ChatGPTプラン（未接続）") : "API（都度課金）"} <button type="button" class="text-button" data-view="settings"${disabled(s)}>モデル・取得方法を変更</button></p>` : ""}${readError || !configured ? `<p class="muted">${settingsMessage}<button class="text-button" data-view="settings"${disabled(s)}>検索設定を開く</button></p>` : ""}${s.busy ? '<p role="status">処理中です…</p>' : ""}${s.searched && !s.candidates.length ? '<p class="empty compact">画像が見つかりませんでした。検索語や検索元を変えてみてください。</p>' : ""}<div class="image-results">${s.candidates.map((candidate, index) => `<button class="image-result" data-action="choose-image" data-index="${index}"${disabled(s)}><img src="${e(candidate.previewUrl)}" alt="${e(candidate.title)}" loading="lazy" /><span>${e(candidate.title)}</span><small title="${e(candidate.sourceUrl)}">${e(sourceHost(candidate.sourceUrl))}</small></button>`).join("")}</div>${item?.image?.sourceUrl ? `<p class="muted source-url">現在の画像の出典：${e(item.image.sourceUrl)}</p>` : ""}`;
   } else if (modal.kind === "reset-comparisons") {
     title = "比較をリセット";
     body = `<p>「${e(s.active?.name ?? "")}」の比較を最初からやり直しますか？</p><p>比較履歴・評価・比較回数・順位ほぼ確定の判定履歴を初期化します。この操作は元に戻せません。</p><p class="muted">リスト名・項目・タグ・画像は残ります。順位は登録順に戻ります。</p><div class="form-actions"><button class="danger" data-action="confirm-reset-comparisons"${disabled(s)}>リセットする</button><button class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;

@@ -2313,6 +2313,7 @@ dependencies = [
  "puruspe",
  "rand 0.10.3",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "rustix",
  "same-file",

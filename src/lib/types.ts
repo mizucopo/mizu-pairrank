@@ -1,5 +1,6 @@
 export type Preference = "a_strong" | "a_weak" | "equal" | "b_weak" | "b_strong";
-export type SearchProvider = "brave" | "ollama";
+export type SearchProvider = "brave" | "ollama" | "openai";
+export type OpenAiAuthMode = "api" | "chatgpt";
 export type AutoRegisterOutcome = "registered" | "skipped" | "unavailable";
 export type ReportView = "ranking" | "tier";
 export type ReportFormat = "html" | "pdf";
@@ -47,9 +48,23 @@ export type ImageCandidate = {
   previewUrl: string;
   sourceUrl: string;
 };
+export type ChatGptProfile = {
+  id: string;
+  account: string | null;
+  connected: boolean;
+  sharing: boolean;
+};
 export type SearchSettings = {
   braveConfigured: boolean;
   ollamaConfigured: boolean;
+  openaiConfigured: boolean;
+  openaiModel: string;
+  openaiAuthMode: OpenAiAuthMode;
+  chatgptConnected: boolean;
+  chatgptSharing: boolean;
+  chatgptAccount: string | null;
+  chatgptProfiles: ChatGptProfile[];
+  chatgptActiveProfile: string | null;
   defaultProvider: SearchProvider;
   errors?: Partial<Record<SearchProvider, string>>;
 };
@@ -91,6 +106,12 @@ export type AppApi = {
   undoAnswer: (listId: number, expectedRevision: number) => Promise<ListState>;
   searchSettings: () => Promise<SearchSettings>;
   setApiKey: (provider: SearchProvider, key: string) => Promise<void>;
+  saveOpenAiSettings: (model: string, authMode: OpenAiAuthMode) => Promise<void>;
+  openAiModels: () => Promise<string[]>;
+  connectChatGpt: (newAccount: boolean) => Promise<void>;
+  selectChatGptProfile: (profileId: string) => Promise<void>;
+  disconnectChatGpt: () => Promise<void>;
+  openChatGptUsage: () => Promise<void>;
   searchImages: (provider: SearchProvider, query: string) => Promise<ImageCandidate[]>;
   autoRegisterImage: (
     listId: number,

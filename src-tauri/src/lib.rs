@@ -1,7 +1,9 @@
+mod chatgpt;
 mod credentials;
 mod database;
 mod images;
 mod models;
+mod openai;
 mod rating;
 mod report;
 mod sqlite_vfs;
@@ -11,6 +13,7 @@ mod transfer;
 use database::{Database, ImageChange};
 use images::{ImageCandidate, ImageService, SearchProvider, SearchSettings};
 use models::{ImageAsset, ListState, ListSummary};
+use openai::OpenAiAuthMode;
 use rating::Preference;
 use report::ReportFormat;
 use std::collections::HashMap;
@@ -546,6 +549,69 @@ async fn set_api_key(app: AppHandle, provider: SearchProvider, key: String) -> R
     image_service(&app)?.set_api_key(provider, key).await
 }
 #[tauri::command]
+async fn save_openai_settings(
+    app: AppHandle,
+    model: String,
+    auth_mode: OpenAiAuthMode,
+) -> Result<(), String> {
+    image_service(&app)?
+        .save_openai_settings(model, auth_mode)
+        .await
+}
+#[tauri::command]
+async fn openai_models(app: AppHandle) -> Result<Vec<String>, String> {
+    image_service(&app)?.openai_models().await
+}
+#[tauri::command]
+async fn connect_chatgpt(app: AppHandle, new_account: bool) -> Result<(), String> {
+    image_service(&app)?
+        .chatgpt()
+        .connect(new_account, open_browser)
+        .await
+}
+#[tauri::command]
+async fn disconnect_chatgpt(app: AppHandle) -> Result<(), String> {
+    image_service(&app)?.chatgpt().disconnect().await
+}
+#[tauri::command]
+async fn select_chatgpt_profile(app: AppHandle, profile_id: String) -> Result<(), String> {
+    image_service(&app)?
+        .chatgpt()
+        .select_profile(profile_id)
+        .await
+}
+#[tauri::command]
+async fn open_chatgpt_usage() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| open_browser("https://chatgpt.com/settings/usage".into()))
+        .await
+        .map_err(|_| "ブラウザーを開けませんでした。".to_owned())?
+}
+
+fn open_browser(url: String) -> Result<(), String> {
+    // The URL is app-created; pass it as one argument without a shell.
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "macos")]
+    command.arg("--");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    let status = command
+        .arg(url)
+        .status()
+        .map_err(|_| "ブラウザーを開けませんでした。".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("ブラウザーを開けませんでした。".to_owned())
+    }
+}
+#[tauri::command]
 async fn search_images(
     app: AppHandle,
     provider: SearchProvider,
@@ -694,6 +760,12 @@ pub fn run() {
             undo_answer,
             search_settings,
             set_api_key,
+            save_openai_settings,
+            openai_models,
+            connect_chatgpt,
+            disconnect_chatgpt,
+            select_chatgpt_profile,
+            open_chatgpt_usage,
             search_images,
             auto_register_image,
             set_local_image,

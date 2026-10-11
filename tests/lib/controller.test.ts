@@ -12,6 +12,17 @@ import type {
   ReportView,
 } from "../../src/lib/types.js";
 
+const openAiSettings = {
+  openaiConfigured: false,
+  openaiModel: "gpt-6-luna",
+  openaiAuthMode: "api" as const,
+  chatgptConnected: false,
+  chatgptSharing: false,
+  chatgptAccount: null,
+  chatgptProfiles: [],
+  chatgptActiveProfile: null,
+};
+
 function list(id = 1): ListState {
   return {
     id,
@@ -57,6 +68,7 @@ function proposal(value: ListState): PairProposal {
 
 function backend(first = list(), second = list(2)) {
   const settings = {
+    ...openAiSettings,
     braveConfigured: false,
     ollamaConfigured: false,
     defaultProvider: "brave" as const,
@@ -90,6 +102,12 @@ function backend(first = list(), second = list(2)) {
     undoAnswer: vi.fn<AppApi["undoAnswer"]>().mockResolvedValue(first),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
+    saveOpenAiSettings: vi.fn<AppApi["saveOpenAiSettings"]>().mockResolvedValue(undefined),
+    openAiModels: vi.fn<AppApi["openAiModels"]>().mockResolvedValue([]),
+    connectChatGpt: vi.fn<AppApi["connectChatGpt"]>().mockResolvedValue(undefined),
+    selectChatGptProfile: vi.fn<AppApi["selectChatGptProfile"]>().mockResolvedValue(undefined),
+    disconnectChatGpt: vi.fn<AppApi["disconnectChatGpt"]>().mockResolvedValue(undefined),
+    openChatGptUsage: vi.fn<AppApi["openChatGptUsage"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
     autoRegisterImage: vi.fn<AppApi["autoRegisterImage"]>().mockResolvedValue("skipped"),
     setLocalImage: vi.fn<AppApi["setLocalImage"]>().mockResolvedValue(first),
@@ -1661,7 +1679,7 @@ describe("explicit credential access", () => {
     controller.closeModal();
     await controller.checkSearchSettings();
     expect(api.searchSettings).toHaveBeenCalledOnce();
-    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama", "openai"]);
   });
 
   it("keeps unknown, unset and denied status distinct and retries only on an explicit check", async () => {
@@ -1674,12 +1692,13 @@ describe("explicit credential access", () => {
     await controller.checkSearchSettings();
     expect(controller.state.settings?.braveConfigured).toBe(false);
     expect(controller.state.settings?.errors?.brave).toBeUndefined();
-    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama", "openai"]);
     api.searchSettings.mockRejectedValueOnce(new Error("OSでアクセスが拒否されました。"));
     await controller.checkSearchSettings();
     expect(controller.state.settings?.errors).toEqual({
       brave: "OSでアクセスが拒否されました。",
       ollama: "OSでアクセスが拒否されました。",
+      openai: "OSでアクセスが拒否されました。",
     });
     expect(controller.availableBulkProviders()).toEqual([]);
     await controller.navigate("items");
@@ -1690,6 +1709,7 @@ describe("explicit credential access", () => {
     await controller.navigate("settings");
     expect(api.searchSettings).toHaveBeenCalledTimes(2);
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1724,6 +1744,7 @@ describe("explicit credential access", () => {
   it("opens bulk registration without reading keys and waits for an explicit successful check", async () => {
     const api = backend();
     api.searchSettings.mockResolvedValueOnce({
+      ...openAiSettings,
       braveConfigured: false,
       ollamaConfigured: true,
       defaultProvider: "ollama",
@@ -1770,6 +1791,7 @@ describe("explicit credential access", () => {
       await controller.openModal({ kind: "image", itemId: 11 });
       if (status !== "unknown") {
         api.searchSettings.mockResolvedValueOnce({
+          ...openAiSettings,
           braveConfigured: status === "error",
           ollamaConfigured: false,
           defaultProvider: "brave",
@@ -1789,6 +1811,7 @@ describe("image search validation", () => {
   it("rejects whitespace-only queries without a request and permits correction", async () => {
     const api = backend();
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -1829,6 +1852,7 @@ describe("settings navigation", () => {
             finishOld = () => {
               if (outcome === "success") {
                 resolve({
+                  ...openAiSettings,
                   braveConfigured: true,
                   ollamaConfigured: false,
                   defaultProvider: "brave",
@@ -1841,6 +1865,7 @@ describe("settings navigation", () => {
       const abandoned = controller.checkSearchSettings();
       await controller.openModal({ kind: "create-list" });
       const settings = {
+        ...openAiSettings,
         braveConfigured: false,
         ollamaConfigured: true,
         defaultProvider: "ollama" as const,
@@ -1885,6 +1910,7 @@ describe("settings navigation", () => {
       expect(controller.state.settings?.errors).toEqual({
         brave: "initial settings read failed",
         ollama: "initial settings read failed",
+        openai: "initial settings read failed",
       });
       await controller.openModal({ kind: "create-list" });
       if (outcome === "failure") {
@@ -1928,6 +1954,7 @@ describe("settings navigation", () => {
             finishOld = () => {
               if (outcome === "success") {
                 resolve({
+                  ...openAiSettings,
                   braveConfigured: false,
                   ollamaConfigured: false,
                   defaultProvider: "brave",
@@ -1979,7 +2006,12 @@ describe("settings navigation", () => {
       () =>
         new Promise((resolve) => {
           finish = () =>
-            resolve({ braveConfigured: false, ollamaConfigured: true, defaultProvider: "ollama" });
+            resolve({
+              ...openAiSettings,
+              braveConfigured: false,
+              ollamaConfigured: true,
+              defaultProvider: "ollama",
+            });
         }),
     );
     await controller.navigate("settings");
@@ -2013,6 +2045,7 @@ describe("settings navigation", () => {
             finishOld = () => {
               if (outcome === "success") {
                 resolve({
+                  ...openAiSettings,
                   braveConfigured: true,
                   ollamaConfigured: false,
                   defaultProvider: "brave",
@@ -2028,6 +2061,7 @@ describe("settings navigation", () => {
         finishNew = resolve;
       });
       const currentSettings = {
+        ...openAiSettings,
         braveConfigured: false,
         ollamaConfigured: true,
         defaultProvider: "ollama" as const,
@@ -2092,7 +2126,12 @@ describe("settings navigation", () => {
       return new Promise((resolve) => {
         finish = () => {
           occupied = false;
-          resolve({ braveConfigured: true, ollamaConfigured: false, defaultProvider: "brave" });
+          resolve({
+            ...openAiSettings,
+            braveConfigured: true,
+            ollamaConfigured: false,
+            defaultProvider: "brave",
+          });
         };
       });
     });
@@ -2116,7 +2155,7 @@ describe("settings navigation", () => {
     finish();
     await retry;
     expect(controller.state.settings?.braveConfigured).toBe(true);
-    expect(controller.state.checkedProviders).toEqual(["brave", "ollama"]);
+    expect(controller.state.checkedProviders).toEqual(["brave", "ollama", "openai"]);
     expect(controller.state.error).toBe("");
     expect(api.searchSettings).toHaveBeenCalledTimes(2);
   });
@@ -2131,6 +2170,7 @@ describe("settings navigation", () => {
         new Promise((resolve) => {
           finishRead = () =>
             resolve({
+              ...openAiSettings,
               braveConfigured: true,
               ollamaConfigured: false,
               defaultProvider: "brave",
@@ -2229,6 +2269,7 @@ describe("credential mutation acknowledgments", () => {
     async (remove) => {
       const api = backend();
       api.searchSettings.mockResolvedValueOnce({
+        ...openAiSettings,
         braveConfigured: false,
         ollamaConfigured: true,
         defaultProvider: "ollama",
@@ -2256,6 +2297,7 @@ describe("credential mutation acknowledgments", () => {
     async (provider) => {
       const api = backend();
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: false,
         ollamaConfigured: false,
         defaultProvider: "brave",
@@ -2304,6 +2346,7 @@ describe("credential mutation acknowledgments", () => {
       await controller.saveKey(provider, remove);
       expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
       expect(controller.state.settings).toEqual({
+        ...openAiSettings,
         braveConfigured,
         ollamaConfigured,
         defaultProvider,
@@ -2330,6 +2373,7 @@ describe("credential mutation acknowledgments", () => {
     async (provider, remove, defaultProvider) => {
       const api = backend();
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: remove,
         ollamaConfigured: remove,
         defaultProvider: "brave",
@@ -2350,6 +2394,7 @@ describe("credential mutation acknowledgments", () => {
       expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith(provider, remove ? "" : "saved-key");
       expect(controller.state.drafts[field]).toBe("");
       expect(controller.state.settings).toMatchObject({
+        ...openAiSettings,
         braveConfigured: provider === "brave" ? !remove : remove,
         ollamaConfigured: provider === "ollama" ? !remove : remove,
         defaultProvider,
@@ -2375,6 +2420,7 @@ describe("credential mutation acknowledgments", () => {
     async (provider, remove, checked) => {
       const api = backend();
       const settings = {
+        ...openAiSettings,
         braveConfigured: true,
         ollamaConfigured: true,
         defaultProvider: "brave" as const,
@@ -2409,6 +2455,7 @@ describe("credential mutation acknowledgments", () => {
     await controller.navigate("settings");
     controller.state.drafts.ollamaKey = "saved-key";
     const current = {
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: true,
       defaultProvider: "brave" as const,
@@ -2489,6 +2536,7 @@ describe("comparison state and persistence boundaries", () => {
     };
     const api = backend(settled, list(2));
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -2510,6 +2558,7 @@ describe("comparison state and persistence boundaries", () => {
     };
     const api = backend(settled);
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -2537,6 +2586,7 @@ describe("comparison state and persistence boundaries", () => {
     api.listSummaries.mockResolvedValueOnce([summary(settled), summary(remaining)]);
     api.listSummaries.mockResolvedValue([summary(remaining)]);
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -2560,6 +2610,7 @@ describe("comparison state and persistence boundaries", () => {
     };
     const api = backend(settled);
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -2586,6 +2637,7 @@ describe("comparison state and persistence boundaries", () => {
     api.listSummaries.mockResolvedValueOnce([summary(settled), summary(remaining)]);
     api.listSummaries.mockResolvedValue([summary(remaining)]);
     api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
       braveConfigured: true,
       ollamaConfigured: false,
       defaultProvider: "brave",
@@ -3416,6 +3468,7 @@ describe("comparison state and persistence boundaries", () => {
             finishOld = () => {
               if (outcome === "success")
                 resolve({
+                  ...openAiSettings,
                   braveConfigured: false,
                   ollamaConfigured: false,
                   defaultProvider: "brave",
@@ -3429,6 +3482,7 @@ describe("comparison state and persistence boundaries", () => {
       const oldOpen = controller.checkSearchSettings();
       controller.closeModal();
       const currentSettings = {
+        ...openAiSettings,
         braveConfigured: false,
         ollamaConfigured: true,
         defaultProvider: "ollama" as const,
@@ -3492,6 +3546,7 @@ describe("comparison state and persistence boundaries", () => {
       const initial = list();
       const api = backend(initial);
       api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
         braveConfigured: true,
         ollamaConfigured: false,
         defaultProvider: "brave",
@@ -3910,5 +3965,800 @@ describe("undoing the last comparison answer", () => {
     expect(api.nextPair.mock.lastCall?.[1]).toEqual([[11, 12]]);
     await controller.answer("equal");
     expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+  });
+});
+
+describe("OpenAI image search settings", () => {
+  it.each(["api", "chatgpt"] as const)(
+    "saves and reloads a manual model ID for %s independently of credentials",
+    async (authMode) => {
+      const api = backend();
+      let savedModel = "gpt-6-luna";
+      let savedMode: "api" | "chatgpt" = "api";
+      api.saveOpenAiSettings.mockImplementation(async (model, mode) => {
+        savedModel = model;
+        savedMode = mode;
+      });
+      api.searchSettings.mockImplementation(async () => ({
+        ...openAiSettings,
+        braveConfigured: false,
+        ollamaConfigured: false,
+        defaultProvider: "brave",
+        openaiModel: savedModel,
+        openaiAuthMode: savedMode,
+      }));
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      controller.state.drafts.openaiModel = " unlisted-image-model ";
+      controller.state.openaiAuthMode = authMode;
+      await controller.saveOpenAiSettings();
+      expect(api.saveOpenAiSettings).toHaveBeenCalledExactlyOnceWith(
+        "unlisted-image-model",
+        authMode,
+      );
+      expect(api.setApiKey).not.toHaveBeenCalled();
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      expect(api.openAiModels).not.toHaveBeenCalled();
+      const restarted = new AppController(api, vi.fn());
+      await restarted.navigate("settings");
+      await restarted.checkSearchSettings();
+      expect(restarted.state.drafts.openaiModel).toBe("unlisted-image-model");
+      expect(restarted.state.openaiAuthMode).toBe(authMode);
+      expect(restarted.state.settings?.openaiModel).toBe("unlisted-image-model");
+    },
+  );
+
+  it.each(["listed-model", "unlisted-model"])(
+    "saves %s after a model-list failure without replacing the previous list or draft",
+    async (model) => {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      api.openAiModels.mockResolvedValueOnce(["listed-model"]);
+      await controller.refreshOpenAiModels();
+      controller.state.drafts.openaiModel = model;
+      api.openAiModels.mockRejectedValueOnce(new Error("network unavailable"));
+      await controller.refreshOpenAiModels();
+      expect(controller.state.openaiModels).toEqual(["listed-model"]);
+      expect(controller.state.drafts.openaiModel).toBe(model);
+      expect(controller.state.error).toContain("直接入力して保存できます");
+      await controller.saveOpenAiSettings();
+      expect(api.saveOpenAiSettings).toHaveBeenCalledExactlyOnceWith(model, "api");
+      expect(controller.state.error).toBe("");
+      expect(api.searchSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the model and mode draft when saving fails and allows correction", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    controller.state.drafts.openaiModel = "unlisted-model";
+    controller.state.openaiAuthMode = "chatgpt";
+    api.saveOpenAiSettings.mockRejectedValueOnce(new Error("settings write failed"));
+    await controller.saveOpenAiSettings();
+    expect(controller.state.settings).toBeNull();
+    expect(controller.state.drafts.openaiModel).toBe("unlisted-model");
+    expect(controller.state.openaiAuthMode).toBe("chatgpt");
+    expect(controller.state.error).toBe("settings write failed");
+    await controller.saveOpenAiSettings();
+    expect(controller.state.settings?.openaiModel).toBe("unlisted-model");
+    expect(api.saveOpenAiSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a model list response after leaving settings, including while another write is busy", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("settings");
+    let finishModels = (_models: string[]) => {};
+    api.openAiModels.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishModels = resolve;
+        }),
+    );
+    const reading = controller.refreshOpenAiModels();
+    await controller.navigate("items");
+    await controller.openModal({ kind: "rename-list" });
+    controller.state.drafts.name = "renamed";
+    let finishWrite = (_list: ListState) => {};
+    api.renameList.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishWrite = resolve;
+        }),
+    );
+    const writing = controller.saveName();
+    finishModels(["late-model"]);
+    await reading;
+    expect(controller.state.openaiModels).toEqual([]);
+    expect(controller.state.drafts.openaiModel).toBe("gpt-6-luna");
+    expect(controller.state.busy).toBe(true);
+    finishWrite(list());
+    await writing;
+  });
+
+  it.each([
+    "モデルID archived-model は提供終了の可能性があります。モデルを変更してください。",
+    "モデルID archived-model にアクセスできません。アクセス権を確認してください。",
+    "モデルID archived-model は見つからないか利用できません。モデルIDを確認してください。",
+    "モデルID archived-model で画像検索ツールを利用できません。モデルを変更してください。",
+    "モデルID archived-model の認証に失敗しました。APIキーを確認してください。",
+    "モデルID archived-model の利用制限に達しました。時間を置いて再試行してください。",
+    "モデルID archived-model の検索に接続できません。通信状態を確認してください。",
+  ])(
+    "retains selected model, provider, images and candidates after an OpenAI failure: %s",
+    async (message) => {
+      const initial = list();
+      initial.items[0]!.image = { path: "existing.png", sourceUrl: "https://example.org/source" };
+      const api = backend(initial);
+      const settings = {
+        ...openAiSettings,
+        braveConfigured: true,
+        ollamaConfigured: true,
+        openaiConfigured: true,
+        openaiModel: "archived-model",
+        defaultProvider: "openai" as const,
+      };
+      api.searchSettings.mockResolvedValue(settings);
+      const candidate: ImageCandidate = {
+        id: "previous",
+        title: "Previous image",
+        previewUrl: "data:image/png;base64,AA==",
+        sourceUrl: "https://example.org/previous",
+      };
+      api.searchImages.mockResolvedValueOnce([candidate]).mockRejectedValueOnce(new Error(message));
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.openModal({ kind: "image", itemId: 11 });
+      await controller.checkSearchSettings();
+      await controller.searchImages();
+      await controller.searchImages();
+      expect(controller.state.candidates).toEqual([candidate]);
+      expect(controller.state.searched).toBe(true);
+      expect(controller.state.active).toEqual(initial);
+      expect(controller.state.settings).toEqual(settings);
+      expect(controller.state.provider).toBe("openai");
+      expect(controller.state.error).toBe(message);
+      expect(api.searchImages.mock.calls).toEqual([
+        ["openai", "項目1"],
+        ["openai", "項目1"],
+      ]);
+      expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+      expect(api.setRemoteImage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves OpenAI settings and provider on a subsequent credential read failure", async () => {
+    const api = backend();
+    const settings = {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiModel: "saved-model",
+      defaultProvider: "openai" as const,
+    };
+    api.searchSettings
+      .mockResolvedValueOnce(settings)
+      .mockRejectedValueOnce(new Error("keyring denied"));
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    await controller.checkSearchSettings();
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.state.settings).toMatchObject(settings);
+    expect(controller.state.drafts.openaiModel).toBe("saved-model");
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+
+  it.each(["api", "chatgpt"] as const)(
+    "uses OpenAI for manual and bulk search with %s authentication",
+    async (authMode) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
+        braveConfigured: false,
+        ollamaConfigured: false,
+        openaiConfigured: true,
+        openaiAuthMode: authMode,
+        chatgptConnected: authMode === "chatgpt",
+        chatgptSharing: authMode === "chatgpt",
+        defaultProvider: "openai",
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.openModal({ kind: "image", itemId: 11 });
+      await controller.checkSearchSettings();
+      await controller.searchImages();
+      expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("openai", "項目1");
+      controller.closeModal();
+      controller.openBulkImages();
+      expect(controller.state.bulkProvider).toBe("openai");
+      await controller.runBulkImages();
+      expect(api.autoRegisterImage.mock.calls).toEqual([
+        [1, 11, "openai"],
+        [1, 12, "openai"],
+      ]);
+    },
+  );
+});
+
+describe("ChatGPT status transitions", () => {
+  it("keeps explicitly selected OpenAI and the saved model when connecting or changing an account with healthy peers", async () => {
+    const api = backend();
+    const saved = {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiAuthMode: "chatgpt" as const,
+      openaiModel: "saved-unlisted-model",
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "first@example.org",
+      defaultProvider: "openai" as const,
+    };
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValue({
+      ...saved,
+      chatgptAccount: "second@example.org",
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    controller.state.openaiModels = ["old-account-model"];
+    await controller.connectChatGpt(true);
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.state.settings?.openaiModel).toBe("saved-unlisted-model");
+    expect(controller.state.drafts.openaiModel).toBe("saved-unlisted-model");
+    expect(controller.state.settings?.chatgptAccount).toBe("second@example.org");
+    expect(controller.state.openaiModels).toEqual([]);
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "failure", "partial failure"] as const)(
+    "clears local readiness while preserving an uncertain revocation error when status refresh is a %s",
+    async (refresh) => {
+      const api = backend();
+      const saved = {
+        ...openAiSettings,
+        braveConfigured: true,
+        ollamaConfigured: true,
+        openaiConfigured: true,
+        openaiAuthMode: "chatgpt" as const,
+        chatgptConnected: true,
+        chatgptSharing: true,
+        chatgptAccount: "person@example.org",
+        defaultProvider: "openai" as const,
+      };
+      api.searchSettings.mockResolvedValueOnce(saved);
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      await controller.checkSearchSettings();
+      controller.state.openaiModels = ["previous-model"];
+      api.disconnectChatGpt.mockRejectedValueOnce(
+        new Error("端末の接続は解除しましたが、リモートでの失効を確認できませんでした。"),
+      );
+      const disconnected = {
+        ...saved,
+        openaiConfigured: false,
+        chatgptConnected: false,
+        chatgptSharing: false,
+        chatgptAccount: null,
+        defaultProvider: "brave" as const,
+      };
+      if (refresh === "failure")
+        api.searchSettings.mockRejectedValueOnce(new Error("keyring denied"));
+      else
+        api.searchSettings.mockResolvedValueOnce(
+          refresh === "success"
+            ? disconnected
+            : { ...disconnected, errors: { openai: "status unavailable" } },
+        );
+      await controller.disconnectChatGpt();
+      expect(controller.state.settings?.chatgptConnected).toBe(false);
+      expect(controller.state.settings?.chatgptSharing).toBe(false);
+      expect(controller.state.settings?.chatgptAccount).toBeNull();
+      expect(controller.state.settings?.openaiConfigured).toBe(false);
+      expect(controller.state.provider).toBe("openai");
+      expect(controller.availableBulkProviders()).not.toContain("openai");
+      expect(controller.state.error).toContain("リモートでの失効を確認できませんでした");
+      expect(controller.state.openaiModels).toEqual([]);
+      expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("requires saving a changed authentication mode before refreshing model suggestions", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    controller.state.openaiModels = ["api-model"];
+    controller.state.openaiAuthMode = "chatgpt";
+    await controller.refreshOpenAiModels();
+    expect(api.openAiModels).not.toHaveBeenCalled();
+    await controller.saveOpenAiSettings();
+    expect(controller.state.openaiModels).toEqual([]);
+    await controller.refreshOpenAiModels();
+    expect(api.openAiModels).toHaveBeenCalledOnce();
+  });
+});
+
+describe("independent OpenAI credential settings", () => {
+  it("does not acknowledge ChatGPT readiness or clear its error when saving an API key before a mode change", async () => {
+    const api = backend();
+    const settings = {
+      ...openAiSettings,
+      braveConfigured: false,
+      ollamaConfigured: false,
+      openaiAuthMode: "chatgpt" as const,
+      defaultProvider: "openai" as const,
+      errors: { openai: "ChatGPTの接続を確認してください。" },
+    };
+    api.searchSettings.mockResolvedValue(settings);
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    controller.state.openaiAuthMode = "api";
+    controller.state.drafts.openaiKey = "new-api-key";
+    await controller.saveKey("openai");
+    expect(api.setApiKey).toHaveBeenCalledExactlyOnceWith("openai", "new-api-key");
+    expect(controller.state.settings?.openaiAuthMode).toBe("chatgpt");
+    expect(controller.state.settings?.errors?.openai).toBe("ChatGPTの接続を確認してください。");
+    expect(controller.availableBulkProviders()).not.toContain("openai");
+    expect(controller.state.checkedProviders).not.toContain("openai");
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("initial saved OpenAI preferences", () => {
+  it("shows persisted model and mode on a first partial credential read failure", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
+      braveConfigured: false,
+      ollamaConfigured: false,
+      openaiModel: "persisted-unlisted-model",
+      openaiAuthMode: "chatgpt",
+      defaultProvider: "brave",
+      errors: { openai: "ChatGPT credentials unavailable" },
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    expect(controller.state.drafts.openaiModel).toBe("persisted-unlisted-model");
+    expect(controller.state.openaiAuthMode).toBe("chatgpt");
+    expect(controller.state.settings?.openaiModel).toBe("persisted-unlisted-model");
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatGPT connection status confirmation", () => {
+  function connectedSettings() {
+    return {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiAuthMode: "chatgpt" as const,
+      openaiModel: "saved-unlisted-model",
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "first@example.org",
+      defaultProvider: "openai" as const,
+    };
+  }
+
+  it("accepts a newly persisted account after native connect returns a previous-record cleanup warning", async () => {
+    const api = backend();
+    const saved = connectedSettings();
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValueOnce({
+      ...saved,
+      chatgptAccount: "second@example.org",
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    controller.state.openaiModels = ["previous-account-model"];
+    api.connectChatGpt.mockRejectedValueOnce(
+      new Error("新しい接続は保存しましたが、以前の資格情報を削除できませんでした。"),
+    );
+    await controller.connectChatGpt(true);
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    expect(controller.state.settings?.chatgptAccount).toBe("second@example.org");
+    expect(controller.state.settings?.chatgptConnected).toBe(true);
+    expect(controller.state.settings?.chatgptSharing).toBe(true);
+    expect(controller.state.settings?.openaiModel).toBe("saved-unlisted-model");
+    expect(controller.state.drafts.openaiModel).toBe("saved-unlisted-model");
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.availableBulkProviders()).toContain("openai");
+    expect(controller.state.error).toBe(
+      "新しい接続は保存しましたが、以前の資格情報を削除できませんでした。",
+    );
+    expect(controller.state.openaiModels).toEqual([]);
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("preserves a confirmed existing account when connection fails before authentication", async () => {
+    const api = backend();
+    const saved = connectedSettings();
+    api.searchSettings.mockResolvedValue(saved);
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    api.connectChatGpt.mockRejectedValueOnce(new Error("認証の開始前に接続できませんでした。"));
+    await controller.connectChatGpt(true);
+    expect(controller.state.settings).toEqual(saved);
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.availableBulkProviders()).toContain("openai");
+    expect(controller.state.error).toBe("認証の開始前に接続できませんでした。");
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["success", "error"] as const)(
+    "preserves prior account state but marks readiness unconfirmed after connect %s and failed status refresh",
+    async (outcome) => {
+      const api = backend();
+      const saved = connectedSettings();
+      api.searchSettings
+        .mockResolvedValueOnce(saved)
+        .mockRejectedValueOnce(new Error("status read failed"));
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      await controller.checkSearchSettings();
+      if (outcome === "error")
+        api.connectChatGpt.mockRejectedValueOnce(new Error("previous-record cleanup failed"));
+      await controller.connectChatGpt(true);
+      expect(controller.state.settings).toMatchObject(saved);
+      expect(controller.state.settings?.errors?.openai).toBe("status read failed");
+      expect(controller.state.provider).toBe("openai");
+      expect(controller.state.drafts.openaiModel).toBe("saved-unlisted-model");
+      expect(controller.state.checkedProviders).not.toContain("openai");
+      expect(controller.availableBulkProviders()).not.toContain("openai");
+      expect(controller.state.error).toContain(
+        "接続状態を再確認できませんでした: status read failed",
+      );
+      if (outcome === "error")
+        expect(controller.state.error).toContain("previous-record cleanup failed");
+      expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("combines a connection warning with a partial OpenAI status-read error while preserving the prior summary", async () => {
+    const api = backend();
+    const saved = connectedSettings();
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValueOnce({
+      ...saved,
+      chatgptConnected: false,
+      chatgptSharing: false,
+      chatgptAccount: null,
+      openaiConfigured: false,
+      errors: { openai: "status unavailable" },
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    api.connectChatGpt.mockRejectedValueOnce(new Error("previous-record cleanup failed"));
+    await controller.connectChatGpt(true);
+    expect(controller.state.settings).toMatchObject(saved);
+    expect(controller.state.settings?.errors?.openai).toBe("status unavailable");
+    expect(controller.availableBulkProviders()).not.toContain("openai");
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.state.error).toContain("previous-record cleanup failed");
+    expect(controller.state.error).toContain(
+      "接続状態を再確認できませんでした: status unavailable",
+    );
+  });
+});
+
+describe("saved ChatGPT profiles", () => {
+  const profiles = [
+    { id: "issued-client-a", account: "same@example.org", connected: true, sharing: true },
+    { id: "issued-client-b", account: "same@example.org", connected: true, sharing: true },
+  ];
+  function profileSettings() {
+    return {
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: true,
+      openaiConfigured: true,
+      openaiAuthMode: "chatgpt" as const,
+      openaiModel: "saved-unlisted-model",
+      chatgptConnected: true,
+      chatgptSharing: true,
+      chatgptAccount: "same@example.org",
+      chatgptProfiles: profiles,
+      chatgptActiveProfile: "issued-client-a",
+      defaultProvider: "openai" as const,
+    };
+  }
+
+  it("switches to a stored profile without authentication and preserves model, mode, provider, results and drafts", async () => {
+    const api = backend();
+    const saved = profileSettings();
+    api.searchSettings.mockResolvedValueOnce(saved).mockResolvedValueOnce({
+      ...saved,
+      chatgptActiveProfile: "issued-client-b",
+      defaultProvider: "brave",
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    const candidate: ImageCandidate = {
+      id: "previous",
+      title: "Previous",
+      previewUrl: "data:image/png;base64,AA==",
+      sourceUrl: "https://example.org/image",
+    };
+    controller.state.candidates = [candidate];
+    controller.state.searched = true;
+    controller.editImageSearchSettings();
+    controller.state.drafts.openaiModel = "unsaved-model-draft";
+    controller.state.openaiAuthMode = "api";
+    controller.state.drafts.openaiKey = "unsaved-key";
+    controller.state.openaiModels = ["previous-account-model"];
+    await controller.selectChatGptProfile("issued-client-b");
+    expect(api.selectChatGptProfile).toHaveBeenCalledExactlyOnceWith("issued-client-b");
+    expect(controller.state.settings?.chatgptProfiles).toEqual(profiles);
+    expect(controller.state.settings?.chatgptActiveProfile).toBe("issued-client-b");
+    expect(controller.state.settings?.openaiModel).toBe("saved-unlisted-model");
+    expect(controller.state.settings?.openaiAuthMode).toBe("chatgpt");
+    expect(controller.state.provider).toBe("openai");
+    expect(controller.state.drafts.openaiModel).toBe("unsaved-model-draft");
+    expect(controller.state.openaiAuthMode).toBe("api");
+    expect(controller.state.drafts.openaiKey).toBe("unsaved-key");
+    expect(controller.state.candidates).toEqual([candidate]);
+    expect(controller.state.searched).toBe(true);
+    expect(controller.state.openaiModels).toEqual([]);
+    expect(api.connectChatGpt).not.toHaveBeenCalled();
+    expect(api.openAiModels).not.toHaveBeenCalled();
+    expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+    expect(api.setApiKey).not.toHaveBeenCalled();
+    controller.resumeImageSearch();
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+    expect(controller.state.candidates).toEqual([candidate]);
+  });
+
+  it("retains all profiles when adding another account and can switch back locally", async () => {
+    const api = backend();
+    const saved = profileSettings();
+    const added = {
+      id: "issued-client-c",
+      account: "third@example.org",
+      connected: true,
+      sharing: true,
+    };
+    const updated = {
+      ...saved,
+      chatgptProfiles: [...profiles, added],
+      chatgptActiveProfile: added.id,
+      chatgptAccount: added.account,
+    };
+    api.searchSettings
+      .mockResolvedValueOnce(saved)
+      .mockResolvedValueOnce(updated)
+      .mockResolvedValueOnce({
+        ...updated,
+        chatgptActiveProfile: profiles[0]!.id,
+        chatgptAccount: profiles[0]!.account,
+      });
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    await controller.connectChatGpt(true);
+    expect(controller.state.settings?.chatgptProfiles).toEqual([...profiles, added]);
+    await controller.selectChatGptProfile("issued-client-a");
+    expect(controller.state.settings?.chatgptActiveProfile).toBe("issued-client-a");
+    expect(controller.state.settings?.chatgptProfiles).toHaveLength(3);
+    expect(api.connectChatGpt).toHaveBeenCalledExactlyOnceWith(true);
+    expect(api.selectChatGptProfile).toHaveBeenCalledExactlyOnceWith("issued-client-a");
+  });
+
+  it.each(["success", "failure"] as const)(
+    "disconnects only the active profile, preserving selection and peers when status refresh is %s",
+    async (refresh) => {
+      const api = backend();
+      const saved = profileSettings();
+      const disconnectedProfiles = profiles.map((profile) =>
+        profile.id === "issued-client-a"
+          ? { ...profile, connected: false, sharing: false }
+          : profile,
+      );
+      const disconnected = {
+        ...saved,
+        openaiConfigured: false,
+        chatgptConnected: false,
+        chatgptSharing: false,
+        chatgptAccount: null,
+        chatgptProfiles: disconnectedProfiles,
+        defaultProvider: "brave" as const,
+      };
+      api.searchSettings.mockResolvedValueOnce(saved);
+      if (refresh === "success") api.searchSettings.mockResolvedValueOnce(disconnected);
+      else api.searchSettings.mockRejectedValueOnce(new Error("status refresh unavailable"));
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      await controller.checkSearchSettings();
+      await controller.disconnectChatGpt();
+      expect(controller.state.settings?.chatgptProfiles).toEqual(disconnectedProfiles);
+      expect(controller.state.settings?.chatgptActiveProfile).toBe("issued-client-a");
+      expect(controller.state.provider).toBe("openai");
+      expect(controller.availableBulkProviders()).not.toContain("openai");
+      expect(controller.availableBulkProviders()).toEqual(
+        expect.arrayContaining(["brave", "ollama"]),
+      );
+      expect(api.selectChatGptProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["failure", "partial failure"] as const)(
+    "retains the registry and previous selection when a profile status refresh is a %s",
+    async (refresh) => {
+      const api = backend();
+      const saved = profileSettings();
+      api.searchSettings.mockResolvedValueOnce(saved);
+      if (refresh === "failure")
+        api.searchSettings.mockRejectedValueOnce(new Error("registry read failed"));
+      else
+        api.searchSettings.mockResolvedValueOnce({
+          ...saved,
+          chatgptProfiles: [],
+          chatgptActiveProfile: null,
+          chatgptConnected: false,
+          chatgptSharing: false,
+          chatgptAccount: null,
+          openaiConfigured: false,
+          errors: { openai: "registry read failed" },
+        });
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      await controller.checkSearchSettings();
+      await controller.selectChatGptProfile("issued-client-b");
+      expect(controller.state.settings?.chatgptProfiles).toEqual(profiles);
+      expect(controller.state.settings?.chatgptActiveProfile).toBe("issued-client-a");
+      expect(controller.state.settings?.chatgptAccount).toBe("same@example.org");
+      expect(controller.state.settings?.openaiModel).toBe("saved-unlisted-model");
+      expect(controller.state.provider).toBe("openai");
+      expect(controller.state.error).toContain("registry read failed");
+      expect(controller.availableBulkProviders()).not.toContain("openai");
+      expect(controller.availableBulkProviders()).toEqual(
+        expect.arrayContaining(["brave", "ollama"]),
+      );
+      expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+      expect(api.connectChatGpt).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves a confirmed prior selection if activation fails and ignores unknown or already active entries", async () => {
+    const api = backend();
+    const saved = profileSettings();
+    api.searchSettings.mockResolvedValue(saved);
+    const controller = new AppController(api, vi.fn());
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    await controller.selectChatGptProfile("issued-client-a");
+    await controller.selectChatGptProfile("missing-profile");
+    expect(api.selectChatGptProfile).not.toHaveBeenCalled();
+    api.selectChatGptProfile.mockRejectedValueOnce(new Error("profile selection write failed"));
+    await controller.selectChatGptProfile("issued-client-b");
+    expect(controller.state.settings).toEqual(saved);
+    expect(controller.state.error).toBe("profile selection write failed");
+    expect(controller.availableBulkProviders()).toContain("openai");
+  });
+});
+
+describe("OpenAI settings read recovery", () => {
+  const settings = {
+    ...openAiSettings,
+    braveConfigured: false,
+    ollamaConfigured: false,
+    openaiConfigured: true,
+    openaiModel: "persisted-model",
+    defaultProvider: "openai" as const,
+  };
+
+  it("selects healthy OpenAI on the first settings read when both peers fail", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue({
+      ...settings,
+      errors: { brave: "Brave keyring denied", ollama: "Ollama keyring denied" },
+    });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    expect(controller.availableBulkProviders()).toEqual(["openai"]);
+    expect(controller.state.settings?.defaultProvider).toBe("openai");
+    expect(controller.state.provider).toBe("openai");
+    await controller.searchImages();
+    expect(api.searchImages).toHaveBeenCalledExactlyOnceWith("openai", "項目1");
+  });
+
+  it.each(["before initial read", "after initial read"] as const)(
+    "keeps unsaved model and authentication-mode edits made %s when checking credentials",
+    async (timing) => {
+      const api = backend();
+      api.searchSettings.mockResolvedValue(settings);
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      if (timing === "after initial read") await controller.checkSearchSettings();
+      controller.state.drafts.openaiModel = "unsaved-manual-model";
+      controller.state.openaiAuthMode = "chatgpt";
+      await controller.checkSearchSettings();
+      expect(controller.state.drafts.openaiModel).toBe("unsaved-manual-model");
+      expect(controller.state.openaiAuthMode).toBe("chatgpt");
+      expect(controller.state.settings?.openaiModel).toBe("persisted-model");
+      expect(controller.state.settings?.openaiAuthMode).toBe("api");
+      expect(api.saveOpenAiSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "waits for a cancelled model-list worker's %s before a new settings read uses the native slot",
+    async (outcome) => {
+      const api = backend();
+      let nativeBusy = false;
+      let finishModels = () => {};
+      api.openAiModels.mockImplementationOnce(() => {
+        nativeBusy = true;
+        return new Promise((resolve, reject) => {
+          finishModels = () => {
+            nativeBusy = false;
+            if (outcome === "success") resolve(["abandoned-model"]);
+            else reject(new Error("abandoned model request failed"));
+          };
+        });
+      });
+      api.searchSettings.mockImplementation(async () => {
+        if (nativeBusy) throw new Error("native settings slot already in use");
+        return settings;
+      });
+      const controller = new AppController(api, vi.fn());
+      await controller.navigate("settings");
+      const modelsRead = controller.refreshOpenAiModels();
+      await controller.navigate("items");
+      await controller.navigate("settings");
+      const settingsRead = controller.checkSearchSettings();
+      await Promise.resolve();
+      const callsWhileNativeBusy = api.searchSettings.mock.calls.length;
+      finishModels();
+      await Promise.all([modelsRead, settingsRead]);
+      expect(callsWhileNativeBusy).toBe(0);
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      expect(controller.state.settings).toEqual(settings);
+      expect(controller.state.openaiModels).toEqual([]);
+      expect(controller.state.error).toBe("");
+      expect(controller.state.busy).toBe(false);
+    },
+  );
+
+  it("keeps the image-search return target when navigating to settings again on the same page", async () => {
+    const api = backend();
+    api.searchSettings.mockResolvedValue(settings);
+    const candidate: ImageCandidate = {
+      id: "kept",
+      title: "Previous result",
+      previewUrl: "data:image/png;base64,AA==",
+      sourceUrl: "https://example.org/image",
+    };
+    api.searchImages.mockResolvedValue([candidate]);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.openModal({ kind: "image", itemId: 11 });
+    await controller.checkSearchSettings();
+    await controller.searchImages();
+    controller.editImageSearchSettings();
+    const target = controller.state.imageSearchReturn;
+    await controller.navigate("settings");
+    expect(controller.state.imageSearchReturn).toEqual(target);
+    controller.resumeImageSearch();
+    expect(controller.state.modal).toEqual({ kind: "image", itemId: 11 });
+    expect(controller.state.candidates).toEqual([candidate]);
+    expect(controller.state.searched).toBe(true);
+    expect(controller.state.drafts.query).toBe("項目1");
   });
 });
