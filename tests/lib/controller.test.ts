@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { AppController } from "../../src/lib/controller.js";
+import * as report from "../../src/lib/report.js";
 import type {
   AppApi,
   ImageCandidate,
@@ -68,6 +69,8 @@ function backend(first = list(), second = list(2)) {
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(first),
     duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(first),
     exportList: vi.fn<AppApi["exportList"]>().mockResolvedValue(true),
+    reportImages: vi.fn<AppApi["reportImages"]>().mockResolvedValue({}),
+    saveReport: vi.fn<AppApi["saveReport"]>().mockResolvedValue(true),
     importList: vi.fn<AppApi["importList"]>().mockResolvedValue(first),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(first),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
@@ -91,6 +94,17 @@ function backend(first = list(), second = list(2)) {
     setRemoteImage: vi.fn<AppApi["setRemoteImage"]>().mockResolvedValue(first),
     removeImage: vi.fn<AppApi["removeImage"]>().mockResolvedValue(first),
   } satisfies AppApi;
+}
+
+const reportPng =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+
+function savedReportHtml(api: ReturnType<typeof backend>, index = 0): string {
+  const call = api.saveReport.mock.calls[index];
+  if (!call) throw new Error("No report was saved");
+  expect(call[0]).toBe("html");
+  expect(call[1]).toBeInstanceOf(Uint8Array);
+  return new TextDecoder().decode(call[1]);
 }
 
 async function comparison() {
@@ -505,6 +519,347 @@ describe("comparison reset", () => {
     expect(controller.state.active?.id).toBe(2);
     expect(controller.state.modal).toBeNull();
     expect(controller.state.error).toBe("リストが見つかりません。");
+  });
+});
+
+describe("ranking and tier reports", () => {
+  it("keeps rendered PDF bytes unchanged when handing them to the API", async () => {
+    const bytes = new Uint8Array([37, 80, 68, 70, 45]);
+    const render = vi.spyOn(report, "reportPdf").mockResolvedValueOnce(bytes);
+    try {
+      const api = backend();
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate("ranking");
+      await controller.openModal({ kind: "export-report", view: "ranking" });
+
+      await controller.exportReport();
+
+      expect(api.saveReport).toHaveBeenCalledOnce();
+      expect(api.saveReport.mock.calls[0]?.[1]).toBe(bytes);
+    } finally {
+      render.mockRestore();
+    }
+  });
+
+  it.each([50 * 1024 * 1024, 50 * 1024 * 1024 + 1])(
+    "checks the %i-byte report size before handing typed bytes to the API",
+    async (size) => {
+      const bytes = new Uint8Array(size);
+      const render = vi.spyOn(report, "reportPdf").mockResolvedValueOnce(bytes);
+      try {
+        const api = backend();
+        const controller = new AppController(api, vi.fn());
+        await controller.initialize();
+        await controller.navigate("ranking");
+        await controller.openModal({ kind: "export-report", view: "ranking" });
+
+        await controller.exportReport();
+
+        if (size === 50 * 1024 * 1024) {
+          expect(api.saveReport).toHaveBeenCalledOnce();
+          expect(api.saveReport.mock.calls[0]?.[1] === bytes).toBe(true);
+          expect(controller.state.modal).toBeNull();
+        } else {
+          expect(api.saveReport).not.toHaveBeenCalled();
+          expect(controller.state.error).toContain("50 MiB");
+          expect(controller.state.modal?.kind).toBe("export-report");
+        }
+      } finally {
+        render.mockRestore();
+      }
+    },
+  );
+
+  it("requires an active report view and modal, and resets format and image opt-in on reopen", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.exportReport();
+    controller.setReportFormat("html");
+    expect(controller.state.reportFormat).toBe("pdf");
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    expect(controller.state.modal).toBeNull();
+    expect(api.saveReport).not.toHaveBeenCalled();
+
+    await controller.navigate("ranking");
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    expect(controller.state.reportFormat).toBe("pdf");
+    expect(controller.state.exportIncludeImages).toBe(false);
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+    controller.closeModal();
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    expect(controller.state.reportFormat).toBe("pdf");
+    expect(controller.state.exportIncludeImages).toBe(false);
+    controller.closeModal();
+    controller.state.active = null;
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    await controller.exportReport();
+    expect(controller.state.modal).toBeNull();
+    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.saveReport).not.toHaveBeenCalled();
+  });
+
+  it("saves the full AND-filtered ranking in authoritative order without reading images or changing data", async () => {
+    const initial = list();
+    initial.tags = [
+      { id: 3, listId: 1, name: "共通" },
+      { id: 4, listId: 1, name: "選択" },
+    ];
+    const template = initial.items[0]!;
+    initial.items = [
+      { ...template, id: 100, name: "除外する最高評価", rating: { mu: 50, sigma: 8 }, tagIds: [3] },
+      ...Array.from({ length: 80 }, (_, index) => ({
+        ...template,
+        id: 99 - index,
+        name: `出力項目_${String(index).padStart(3, "0")}`,
+        rating: { mu: 30, sigma: 8 },
+        tagIds: [3, 4],
+        image: { path: `/private/images/${index}.png`, sourceUrl: "https://private.example/item" },
+      })),
+      { ...template, id: 101, name: "除外する最低評価", rating: { mu: 0, sigma: 8 }, tagIds: [4] },
+    ];
+    const before = structuredClone(initial);
+    const api = backend(initial);
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("ranking");
+    controller.toggleTag(3);
+    controller.toggleTag(4);
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    controller.setReportFormat("html");
+    await controller.exportReport();
+
+    const html = savedReportHtml(api);
+    const positions = initial.items.slice(1, -1).map((item) => html.indexOf(item.name));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    expect(html).not.toContain("除外する");
+    expect(html).not.toContain("/private/images");
+    expect(html).not.toContain("private.example");
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, []);
+    expect(api.exportList).not.toHaveBeenCalled();
+    expect(api.searchSettings).not.toHaveBeenCalled();
+    expect(controller.state.active).toEqual(before);
+    expect(controller.state.selectedTagIds).toEqual([3, 4]);
+    expect(controller.state.view).toBe("ranking");
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.notice).not.toBe("");
+  });
+
+  it("requests only filtered items with images using the captured list revision", async () => {
+    const initial = list();
+    initial.tags = [{ id: 3, listId: 1, name: "対象" }];
+    const template = initial.items[0]!;
+    initial.items = [
+      {
+        ...template,
+        id: 42,
+        name: "対象画像",
+        tagIds: [3],
+        image: { path: "/private/a.png", sourceUrl: "https://source.example/a" },
+      },
+      { ...template, id: 7, name: "対象画像なし", tagIds: [3] },
+      {
+        ...template,
+        id: 99,
+        name: "対象外画像",
+        tagIds: [],
+        image: { path: "/private/b.png", sourceUrl: null },
+      },
+    ];
+    const api = backend(initial);
+    api.reportImages.mockResolvedValueOnce({ "42": reportPng });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("ranking");
+    controller.toggleTag(3);
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+    await controller.exportReport();
+
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, [42]);
+    const html = savedReportHtml(api);
+    expect(html).toContain(reportPng);
+    expect(html).toContain("対象画像なし");
+    expect(html).not.toContain("対象外画像");
+    expect(html).not.toContain("/private/");
+    expect(html).not.toContain("source.example");
+  });
+
+  it("validates the revision without requesting image IDs when matching items have no images", async () => {
+    const api = backend();
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("tier");
+    await controller.openModal({ kind: "export-report", view: "tier" });
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+    await controller.exportReport();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, list().revision, []);
+    expect(savedReportHtml(api)).toContain("項目1");
+  });
+
+  it.each([
+    ["ranking", false],
+    ["ranking", true],
+    ["tier", false],
+    ["tier", true],
+  ] as const)(
+    "rejects an outdated image-free %s report with image opt-in %s and exports only after reload",
+    async (view, includeImages) => {
+      const initial = list();
+      const current = {
+        ...initial,
+        revision: initial.revision + 1,
+        items: [{ ...initial.items[1]!, name: "別窓で更新された項目" }],
+      };
+      const api = backend(initial);
+      const stale = "リストが更新されています。ランキングを読み直して再試行してください。";
+      api.reportImages.mockRejectedValueOnce(stale);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate(view);
+      await controller.openModal({ kind: "export-report", view });
+      controller.setReportFormat("html");
+      controller.setExportIncludeImages(includeImages);
+
+      await controller.exportReport();
+      expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, []);
+      expect(api.saveReport).not.toHaveBeenCalled();
+      expect(controller.state.error).toBe(stale);
+      expect(controller.state.modal).toEqual({ kind: "export-report", view });
+      expect(controller.state.active).toEqual(initial);
+
+      api.getList.mockResolvedValueOnce(current);
+      await controller.selectList(1);
+      await controller.navigate(view);
+      await controller.openModal({ kind: "export-report", view });
+      controller.setReportFormat("html");
+      await controller.exportReport();
+      expect(api.reportImages).toHaveBeenLastCalledWith(1, current.revision, []);
+      expect(api.saveReport).toHaveBeenCalledOnce();
+      const html = savedReportHtml(api);
+      expect(html).toContain("別窓で更新された項目");
+      expect(html).not.toContain("項目1");
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it("keeps native save cancellation and failures retryable with the selected options", async () => {
+    const initial = list();
+    const api = backend(initial);
+    api.saveReport.mockResolvedValueOnce(false).mockRejectedValueOnce("保存できません。");
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("ranking");
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+
+    await controller.exportReport();
+    expect(controller.state.modal).toEqual({ kind: "export-report", view: "ranking" });
+    expect(controller.state.notice).toBe("");
+    expect(controller.state.error).toBe("");
+    await controller.exportReport();
+    expect(controller.state.error).toBe("保存できません。");
+    expect(controller.state.reportFormat).toBe("html");
+    expect(controller.state.exportIncludeImages).toBe(true);
+    expect(controller.state.active).toEqual(initial);
+    await controller.exportReport();
+    expect(api.saveReport.mock.calls.map(([format]) => format)).toEqual(["html", "html", "html"]);
+    expect(controller.state.error).toBe("");
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.notice).not.toBe("");
+  });
+
+  it("retains image options and skips saving after a native image failure, then retries", async () => {
+    const initial = list();
+    initial.items[0]!.image = { path: "/private/picked.png", sourceUrl: null };
+    const api = backend(initial);
+    api.reportImages
+      .mockRejectedValueOnce("画像を読み取れません。")
+      .mockResolvedValueOnce({ "11": reportPng });
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("ranking");
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+    await controller.exportReport();
+    expect(api.saveReport).not.toHaveBeenCalled();
+    expect(controller.state.error).toBe("画像を読み取れません。");
+    expect(controller.state.exportIncludeImages).toBe(true);
+    expect(controller.state.modal?.kind).toBe("export-report");
+    await controller.exportReport();
+    expect(api.reportImages).toHaveBeenCalledTimes(2);
+    expect(api.saveReport).toHaveBeenCalledOnce();
+    expect(controller.state.error).toBe("");
+  });
+
+  it("gates dismissal, navigation, filters, options, and duplicate submits while images are pending", async () => {
+    const initial = list();
+    initial.tags = [{ id: 3, listId: 1, name: "対象" }];
+    initial.items[0]!.tagIds = [3];
+    initial.items[0]!.image = { path: "/private/picked.png", sourceUrl: null };
+    const api = backend(initial);
+    let finish!: () => void;
+    api.reportImages.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve({ "11": reportPng });
+        }),
+    );
+    const controller = new AppController(api, vi.fn());
+    await controller.initialize();
+    await controller.navigate("tier");
+    controller.toggleTag(3);
+    await controller.openModal({ kind: "export-report", view: "tier" });
+    controller.setReportFormat("html");
+    controller.setExportIncludeImages(true);
+    const pending = controller.exportReport();
+    expect(controller.state.busy).toBe(true);
+    controller.closeModal();
+    controller.toggleTag(3);
+    controller.setReportFormat("pdf");
+    controller.setExportIncludeImages(false);
+    await controller.navigate("ranking");
+    await controller.openModal({ kind: "create-list" });
+    await controller.exportReport();
+    expect(controller.state.modal).toEqual({ kind: "export-report", view: "tier" });
+    expect(controller.state.view).toBe("tier");
+    expect(controller.state.reportFormat).toBe("html");
+    expect(controller.state.exportIncludeImages).toBe(true);
+    expect(controller.state.selectedTagIds).toEqual([3]);
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, [11]);
+    expect(api.saveReport).not.toHaveBeenCalled();
+    finish();
+    await pending;
+    expect(api.saveReport).toHaveBeenCalledOnce();
+    expect(savedReportHtml(api)).toContain(reportPng);
+    expect(savedReportHtml(api)).not.toContain("項目2");
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it("preserves the saved answer and undo eligibility through a successful report", async () => {
+    const { api, controller, saved, restored } = await answeredComparison();
+    await controller.navigate("ranking");
+    const active = controller.state.active;
+    const summaries = structuredClone(controller.state.lists);
+    const reads = api.getList.mock.calls.length;
+    await controller.openModal({ kind: "export-report", view: "ranking" });
+    controller.setReportFormat("html");
+    await controller.exportReport();
+    expect(controller.state.active).toBe(active);
+    expect(controller.state.active?.revision).toBe(saved.revision);
+    expect(controller.state.lists).toEqual(summaries);
+    expect(controller.state.canUndoAnswer).toBe(true);
+    expect(api.getList).toHaveBeenCalledTimes(reads);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledExactlyOnceWith(saved.id, saved.revision);
+    expect(controller.state.active).toEqual(restored);
   });
 });
 

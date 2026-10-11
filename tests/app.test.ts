@@ -60,6 +60,8 @@ function setup(
     createList: vi.fn<AppApi["createList"]>().mockResolvedValue(state),
     duplicateList: vi.fn<AppApi["duplicateList"]>().mockResolvedValue(state),
     exportList: vi.fn<AppApi["exportList"]>().mockResolvedValue(true),
+    reportImages: vi.fn<AppApi["reportImages"]>().mockResolvedValue({}),
+    saveReport: vi.fn<AppApi["saveReport"]>().mockResolvedValue(true),
     importList: vi.fn<AppApi["importList"]>().mockResolvedValue(state),
     renameList: vi.fn<AppApi["renameList"]>().mockResolvedValue(state),
     deleteList: vi.fn<AppApi["deleteList"]>().mockResolvedValue(undefined),
@@ -92,6 +94,22 @@ function setup(
   document.body.append(root);
   const controller = mountApp(root, api, assetUrl);
   return { root, controller, api, state, pair };
+}
+
+function selectReportHtml(root: HTMLElement): void {
+  const select = root.querySelector<HTMLSelectElement>("#report-format");
+  if (!select) throw new Error("Missing report format select");
+  select.value = "html";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function savedReportDocument(api: ReturnType<typeof setup>["api"], index = 0): Document {
+  const call = api.saveReport.mock.calls[index];
+  if (!call) throw new Error("No report was saved");
+  expect(call[0]).toBe("html");
+  expect(call[1]).toBeInstanceOf(Uint8Array);
+  const html = new TextDecoder().decode(call[1]);
+  return new DOMParser().parseFromString(html, "text/html");
 }
 
 function button(root: HTMLElement, selector: string): HTMLButtonElement {
@@ -396,6 +414,220 @@ describe("desktop app interaction", () => {
       [...root.querySelectorAll(".settings-card .badge")].map((badge) => badge.textContent),
     ).toEqual(["未設定", "未確認"]);
     expect(api.searchSettings).not.toHaveBeenCalled();
+  });
+
+  it("offers report export only in ranking and tier views and keeps ZIP transfer separate", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    expect(root.querySelector('[data-action="export-report"]')).toBeNull();
+    expect(button(root, '[data-action="export-list"]')).toBeDefined();
+    for (const view of ["ranking", "tier"] as const) {
+      await controller.navigate(view);
+      const opener = button(root, '[data-action="export-report"]');
+      opener.focus();
+      await click(root, controller, '[data-action="export-report"]');
+      expect(controller.state.modal).toEqual({ kind: "export-report", view });
+      expect(root.querySelector<HTMLSelectElement>("#report-format")?.value).toBe("pdf");
+      expect(root.querySelector<HTMLInputElement>("#export-include-images")?.checked).toBe(false);
+      expect(root.querySelector("dialog")?.textContent).toContain("画像");
+      expect(root.querySelector("dialog")?.textContent).not.toContain("比較履歴・評価は含みません");
+      selectReportHtml(root);
+      await click(root, controller, '[data-action="confirm-report-export"]');
+      expect(
+        savedReportDocument(api, api.saveReport.mock.calls.length - 1).body.textContent,
+      ).toContain("りんご");
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button(root, '[data-action="export-report"]'));
+      expect(root.querySelector(".notice")?.textContent).not.toBe("");
+      await click(root, controller, '[data-action="export-report"]');
+      expect(root.querySelector<HTMLSelectElement>("#report-format")?.value).toBe("pdf");
+      await click(root, controller, '[data-action="close-modal"]');
+    }
+    await controller.navigate("compare");
+    expect(root.querySelector('[data-action="export-report"]')).toBeNull();
+    await controller.navigate("settings");
+    expect(root.querySelector('[data-action="export-report"]')).toBeNull();
+    expect(api.exportList).not.toHaveBeenCalled();
+    expect(api.reportImages.mock.calls).toEqual([
+      [state.id, state.revision, []],
+      [state.id, state.revision, []],
+    ]);
+  });
+
+  it.each(["close button", "Escape"] as const)(
+    "returns focus when %s dismisses a report without starting native work",
+    async (dismissal) => {
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await controller.navigate("ranking");
+      button(root, '[data-action="export-report"]').focus();
+      await click(root, controller, '[data-action="export-report"]');
+      if (dismissal === "close button") button(root, '[data-action="close-modal"]').click();
+      else root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+      expect(root.querySelector("dialog")).toBeNull();
+      expect(document.activeElement).toBe(button(root, '[data-action="export-report"]'));
+      expect(api.saveReport).not.toHaveBeenCalled();
+      expect(api.reportImages).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps report options, escaped errors, and focus retryable after cancellation and failure", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    await controller.navigate("ranking");
+    api.saveReport
+      .mockResolvedValueOnce(false)
+      .mockRejectedValueOnce(new Error('<保存できません><img onerror="alert(1)">'));
+    await click(root, controller, '[data-action="export-report"]');
+    selectReportHtml(root);
+    const checkbox = root.querySelector<HTMLInputElement>("#export-include-images");
+    if (!checkbox) throw new Error("Missing report image option");
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    button(root, '[data-action="confirm-report-export"]').focus();
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    expect(root.querySelector("dialog")).not.toBeNull();
+    expect(root.querySelector(".notice, [role=alert]")).toBeNull();
+    expect(document.activeElement).toBe(button(root, '[data-action="confirm-report-export"]'));
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe(
+      '<保存できません><img onerror="alert(1)">',
+    );
+    expect(root.querySelector("dialog img, dialog [onerror]")).toBeNull();
+    expect(root.querySelector<HTMLSelectElement>("#report-format")?.value).toBe("html");
+    expect(root.querySelector<HTMLInputElement>("#export-include-images")?.checked).toBe(true);
+    expect(controller.state.active).toEqual(state);
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    expect(api.saveReport).toHaveBeenCalledTimes(3);
+    expect(root.querySelector("dialog")).toBeNull();
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(document.activeElement).toBe(button(root, '[data-action="export-report"]'));
+  });
+
+  it("disables report options, navigation, filters, dismissal, and repeated saves while saving", async () => {
+    const { root, controller, api, state } = setup();
+    state.tags = [{ id: 3, listId: 1, name: "対象" }];
+    state.items[0]!.tagIds = [3];
+    let finish!: () => void;
+    api.saveReport.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = () => resolve(false);
+        }),
+    );
+    await controller.initialize();
+    await controller.navigate("ranking");
+    await click(root, controller, '[data-action="export-report"]');
+    selectReportHtml(root);
+    button(root, '[data-action="confirm-report-export"]').focus();
+    button(root, '[data-action="confirm-report-export"]').click();
+    await vi.waitFor(() => expect(api.saveReport).toHaveBeenCalledOnce());
+    expect(controller.state.busy).toBe(true);
+    for (const selector of [
+      '[data-action="confirm-report-export"]',
+      '[data-action="close-modal"]',
+      '[data-action="export-report"]',
+      '[data-action="toggle-tag"][data-id="3"]',
+      '.tabs [data-view="tier"]',
+    ])
+      expect(button(root, selector).disabled).toBe(true);
+    expect(root.querySelector<HTMLSelectElement>("#report-format")?.disabled).toBe(true);
+    expect(root.querySelector<HTMLInputElement>("#export-include-images")?.disabled).toBe(true);
+    button(root, '[data-action="confirm-report-export"]').click();
+    root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+    expect(root.querySelector("dialog")).not.toBeNull();
+    expect(api.saveReport).toHaveBeenCalledOnce();
+    finish();
+    await settle(controller);
+    expect(button(root, '[data-action="confirm-report-export"]').disabled).toBe(false);
+    expect(document.activeElement).toBe(button(root, '[data-action="confirm-report-export"]'));
+  });
+
+  it("exports escaped list, item, and tag names as text with the selected AND filter", async () => {
+    const { root, controller, api, state } = setup();
+    const hostile = '<script>alert("export")</script><img src=x onerror="alert(1)">&';
+    state.name = `果物 ${hostile}`;
+    state.tags = [
+      { id: 3, listId: 1, name: hostile },
+      { id: 4, listId: 1, name: "共通" },
+    ];
+    state.items[0]!.name = `項目 ${hostile}`;
+    state.items[0]!.tagIds = [3, 4];
+    state.items[1]!.name = "対象外の項目";
+    state.items[1]!.tagIds = [3];
+    await controller.initialize();
+    await controller.navigate("ranking");
+    await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
+    await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="4"]');
+    await click(root, controller, '[data-action="export-report"]');
+    selectReportHtml(root);
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    const report = savedReportDocument(api);
+    expect(report.body.textContent).toContain(state.name);
+    expect(report.body.textContent).toContain(state.items[0]!.name);
+    expect(report.body.textContent).toContain(hostile);
+    expect(report.body.textContent).not.toContain("対象外の項目");
+    expect([...report.querySelectorAll("tbody th")].map((cell) => cell.textContent)).toEqual(["1"]);
+    expect(report.querySelector("script, img, [onerror], [onclick]")).toBeNull();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(state.id, state.revision, []);
+    expect(controller.state.selectedTagIds).toEqual([3, 4]);
+  });
+
+  it("exports the selected Tier view using the full list range before applying AND filters", async () => {
+    const { root, controller, api, state } = setup();
+    const template = state.items[0]!;
+    state.tags = [
+      { id: 3, listId: 1, name: "対象" },
+      { id: 4, listId: 1, name: "共通" },
+    ];
+    state.items = [
+      { ...template, id: 1, name: "最高評価", rating: { mu: 50, sigma: 8 }, tagIds: [] },
+      { ...template, id: 42, name: "Bに残る項目", rating: { mu: 30, sigma: 8 }, tagIds: [3, 4] },
+      { ...template, id: 7, name: "片方のタグのみ", rating: { mu: 20, sigma: 8 }, tagIds: [3] },
+      { ...template, id: 2, name: "最低評価", rating: { mu: 0, sigma: 8 }, tagIds: [] },
+    ];
+    await controller.initialize();
+    await controller.navigate("tier");
+    await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
+    await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="4"]');
+    await click(root, controller, '[data-action="export-report"]');
+    selectReportHtml(root);
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    const report = savedReportDocument(api);
+    expect(report.querySelector("h2")?.textContent).toContain("Tier 表");
+    expect([...report.querySelectorAll("section > h3")].map((label) => label.textContent)).toEqual([
+      "S",
+      "A",
+      "B",
+      "C",
+      "D",
+    ]);
+    const entry = [...report.querySelectorAll("li")].find((node) =>
+      node.textContent?.includes("Bに残る項目"),
+    );
+    expect(entry?.closest("section")?.querySelector("h3")?.textContent).toBe("B");
+    expect(report.querySelectorAll("li")).toHaveLength(1);
+    for (const excluded of ["最高評価", "片方のタグのみ", "最低評価"])
+      expect(report.body.textContent).not.toContain(excluded);
+    expect(report.querySelector("table")).toBeNull();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(state.id, state.revision, []);
+  });
+
+  it("exports a valid empty filtered report without including unmatched items", async () => {
+    const { root, controller, api, state } = setup();
+    state.tags = [{ id: 3, listId: 1, name: "未割当" }];
+    await controller.initialize();
+    await controller.navigate("ranking");
+    await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
+    await click(root, controller, '[data-action="export-report"]');
+    selectReportHtml(root);
+    await click(root, controller, '[data-action="confirm-report-export"]');
+    const report = savedReportDocument(api);
+    expect(report.body.textContent).toContain("未割当");
+    expect(report.body.textContent).not.toContain("りんご");
+    expect(report.body.textContent).not.toContain("みかん");
+    expect(report.body.textContent).toContain("項目");
+    expect(api.saveReport).toHaveBeenCalledOnce();
   });
 
   it("exports without images by default, explains redistribution, and resets opt-in when reopened", async () => {

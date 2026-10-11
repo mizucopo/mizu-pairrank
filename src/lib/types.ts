@@ -1,6 +1,8 @@
 export type Preference = "a_strong" | "a_weak" | "equal" | "b_weak" | "b_strong";
 export type SearchProvider = "brave" | "ollama";
 export type AutoRegisterOutcome = "registered" | "skipped" | "unavailable";
+export type ReportView = "ranking" | "tier";
+export type ReportFormat = "html" | "pdf";
 export type Rating = { mu: number; sigma: number };
 export type ImageAsset = { path: string; sourceUrl: string | null };
 export type Tag = { id: number; listId: number; name: string };
@@ -57,6 +59,12 @@ export type AppApi = {
   createList: (name: string) => Promise<ListState>;
   duplicateList: (listId: number) => Promise<ListState>;
   exportList: (listId: number, includeImages: boolean) => Promise<boolean>;
+  reportImages: (
+    listId: number,
+    expectedRevision: number,
+    itemIds: number[],
+  ) => Promise<Record<string, string>>;
+  saveReport: (format: ReportFormat, bytes: Uint8Array) => Promise<boolean>;
   importList: () => Promise<ListState | null>;
   renameList: (listId: number, name: string) => Promise<ListState>;
   deleteList: (listId: number) => Promise<void>;

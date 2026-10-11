@@ -8,6 +8,10 @@ export const api: AppApi = {
   createList: (name) => invoke("create_list", { name }),
   duplicateList: (listId) => invoke("duplicate_list", { listId }),
   exportList: (listId, includeImages) => invoke("export_list", { listId, includeImages }),
+  reportImages: (listId, expectedRevision, itemIds) =>
+    invoke("report_images", { listId, expectedRevision, itemIds }),
+  saveReport: (format, bytes) =>
+    invoke("save_report", bytes, { headers: { "x-pairrank-report-format": format } }),
   importList: () => invoke("import_list"),
   renameList: (listId, name) => invoke("rename_list", { listId, name }),
   deleteList: (listId) => invoke("delete_list", { listId }),

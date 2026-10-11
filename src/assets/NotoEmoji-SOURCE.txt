@@ -1,0 +1,28 @@
+NotoEmoji.ttf is the unmodified monochrome Noto Emoji variable font.
+Upstream: https://github.com/google/fonts/tree/main/ofl/notoemoji
+Source: https://raw.githubusercontent.com/google/fonts/main/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf
+Retrieved: 2026-10-11
+SHA-256: de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551
+Copyright 2013 Google LLC (retained in the unmodified font and upstream OFL.txt).
+License: SIL Open Font License 1.1 (NotoEmoji-OFL.txt)
+
+The .coverage.txt assets list inclusive hexadecimal character ranges from each
+bundled font's characterSet, generated using pdfmake's fontkit 2.0.4 dependency.
+They let PDF export fail explicitly for uncovered characters without bundling a
+second font parser. Regenerate them whenever replacing either font:
+
+node --input-type=module <<'JS'
+import fs from 'node:fs';
+import { create } from 'fontkit';
+for (const name of ['NotoSansJP-Regular.otf', 'NotoEmoji.ttf']) {
+  const font = create(fs.readFileSync(`src/assets/${name}`));
+  const points = [...font.characterSet].sort((a, b) => a - b);
+  const ranges = [];
+  for (const point of points) {
+    const last = ranges.at(-1);
+    if (last && point === last[1] + 1) last[1] = point;
+    else ranges.push([point, point]);
+  }
+  fs.writeFileSync(`src/assets/${name}.coverage.txt`, ranges.map(([start, end]) => `${start.toString(16)}-${end.toString(16)}`).join(',') + '\n');
+}
+JS

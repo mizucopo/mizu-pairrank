@@ -44,6 +44,10 @@ Docker image tag は展開後の `+` を `_` に変換する（例 `1.2.3+build.
 
 ## 配布案内
 
+Tauri の Windows 配布 ZIP には exe と `NotoSansJP-OFL.txt`、`NotoEmoji-OFL.txt`、`THIRD_PARTY_NOTICES.txt` を同梱し、ライセンスファイルが欠けていれば ZIP 作成を失敗させる。macOS は同じ3ファイルを app bundle の `Contents/Resources/licenses` 配下へ含め、原文との一致を ZIP 作成前に確認する。
+
+NOTICE は全 production JavaScript 依存と pdfmake の内包コードを対象にする。offline 入力は原文の取得元 version と bundle/source map の SHA-256 を記録し、未公開の component version は推測しない。依存更新時は入力を確認し、`npm run notices:generate` の結果をレビューする。bundle 変更時は内包コードの inventory も再確認する。`npm run check` 内の `notices:check` は原文の欠落・不明な license・NOTICE の差分・bundle 変更で失敗する。
+
 汎用 Release・Docker Release・Docker project pipeline は、添付済み asset と公開設定の image を本文の管理ブロックに案内する。既存のリリースノート・手書き本文は保持し、再実行では同じブロックを更新する。Docker Hub はリンクと実際の version tag の PULL コマンドを載せ、ECR は ECR の PULL コマンドを載せる。公開先の照会失敗・未提供 image は公開前に停止する。
 
 `use_rust=true` の汎用 Release・Docker Release は、root Cargo package のdefault features の実行バイナリを Linux x64（GNU）向けにビルドし、`<package>-<tag>-linux-x86_64.tar.gz` を添付してから draft を公開する。library のみなら実行バイナリは添付しない。他の OS・architecture は配布しない。Python project 等に Rust バイナリの案内は生成しない。
