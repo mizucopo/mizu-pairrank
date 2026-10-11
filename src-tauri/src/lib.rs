@@ -931,6 +931,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let (_directory, backend) = backend();
+            // Test worker admission and the DB mutex without timing disk flushes.
+            *backend.database.lock().unwrap() = Ok(Database::open(Path::new(":memory:")).unwrap());
             let (_, _, image) = list_with_image(&backend).await;
             let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
             let mut releases = Vec::new();
@@ -960,8 +962,8 @@ mod tests {
             for _ in 0..MAX_IMAGE_RESPONSES {
                 tokio::time::timeout(Duration::from_secs(2), starts.recv())
                     .await
-                    .unwrap()
-                    .unwrap();
+                    .expect("image response worker did not start within two seconds")
+                    .expect("image response start channel closed");
             }
             for job in &mut waiting {
                 std::future::poll_fn(|cx| {
@@ -981,14 +983,27 @@ mod tests {
             // Unblock every response before asserting, including when admission is broken.
             drop(releases);
             for job in active {
-                job.await.unwrap().unwrap();
+                job.await
+                    .expect("active image response task failed")
+                    .expect("active image response worker failed");
             }
             for job in waiting {
-                job.await.unwrap();
+                job.await.expect("waiting image response worker failed");
             }
-            assert!(database.is_ok_and(|result| result.is_ok()));
-            assert_eq!(unrelated.unwrap().unwrap(), 42);
-            assert!(!extra_started);
+            let list = database
+                .expect("database job timed out while image responses were held")
+                .expect("database job failed while image responses were held");
+            assert_eq!(list.name, "Still usable");
+            assert_eq!(
+                unrelated
+                    .expect("unrelated job timed out while image responses were held")
+                    .expect("unrelated blocking worker failed"),
+                42
+            );
+            assert!(
+                !extra_started,
+                "a waiting image response started before release"
+            );
         });
     }
 
