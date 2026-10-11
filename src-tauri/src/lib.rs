@@ -463,6 +463,16 @@ async fn answer(
     })
     .await
 }
+
+#[tauri::command]
+async fn undo_answer(
+    app: AppHandle,
+    list_id: i64,
+    expected_revision: u64,
+) -> Result<ListState, String> {
+    database_job(app, move |db| db.undo_answer(list_id, expected_revision)).await
+}
+
 #[tauri::command]
 async fn search_settings(app: AppHandle) -> Result<SearchSettings, String> {
     image_service(&app)?.settings().await
@@ -615,6 +625,7 @@ pub fn run() {
             resume_list,
             next_pair,
             answer,
+            undo_answer,
             search_settings,
             set_api_key,
             search_images,

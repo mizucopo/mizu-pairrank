@@ -80,6 +80,7 @@ export type AppApi = {
     expectedRevision?: number,
   ) => Promise<PairProposal | null>;
   answer: (pair: PairProposal, preference: Preference) => Promise<ListState>;
+  undoAnswer: (listId: number, expectedRevision: number) => Promise<ListState>;
   searchSettings: () => Promise<SearchSettings>;
   setApiKey: (provider: SearchProvider, key: string) => Promise<void>;
   searchImages: (provider: SearchProvider, query: string) => Promise<ImageCandidate[]>;

@@ -615,6 +615,10 @@ small,
 .comparison-skip {
   text-align: center;
 }
+.comparison-undo {
+  margin: 16px 0;
+  text-align: center;
+}
 .comparison-skip p {
   margin: 8px 0 0;
 }

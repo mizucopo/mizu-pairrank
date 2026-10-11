@@ -284,6 +284,12 @@ export function mountApp(
       case "skip-comparison":
         void controller.skipComparison();
         break;
+      case "undo-answer":
+        void controller.undoAnswer();
+        break;
+      case "continue-comparison":
+        void controller.startComparison();
+        break;
       case "resume-skipped-comparisons":
         void controller.resumeSkippedComparisons();
         break;

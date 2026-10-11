@@ -32,6 +32,7 @@ export const api: AppApi = {
       preference,
       expectedRevision: pair.revision,
     }),
+  undoAnswer: (listId, expectedRevision) => invoke("undo_answer", { listId, expectedRevision }),
   searchSettings: () => invoke("search_settings"),
   setApiKey: (provider, key) => invoke("set_api_key", { provider, key }),
   searchImages: (provider, query) => invoke("search_images", { provider, query }),

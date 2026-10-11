@@ -82,6 +82,7 @@ function backend(first = list(), second = list(2)) {
     resetComparisons: vi.fn<AppApi["resetComparisons"]>().mockResolvedValue(first),
     nextPair: vi.fn<AppApi["nextPair"]>().mockResolvedValue(proposal(first)),
     answer: vi.fn<AppApi["answer"]>().mockResolvedValue(first),
+    undoAnswer: vi.fn<AppApi["undoAnswer"]>().mockResolvedValue(first),
     searchSettings: vi.fn<AppApi["searchSettings"]>().mockResolvedValue(settings),
     setApiKey: vi.fn<AppApi["setApiKey"]>().mockResolvedValue(undefined),
     searchImages: vi.fn<AppApi["searchImages"]>().mockResolvedValue([]),
@@ -123,6 +124,7 @@ async function skippingComparison(itemCount = 3) {
     })),
   };
   let current = initial;
+  let beforeAnswer = initial;
   const api = backend(initial);
   api.resumeList.mockImplementation(async () => current);
   api.getList.mockImplementation(async () => current);
@@ -136,12 +138,17 @@ async function skippingComparison(itemCount = 3) {
     return null;
   });
   api.answer.mockImplementation(async () => {
+    beforeAnswer = current;
     current = {
       ...current,
       revision: current.revision + 1,
       comparisonCount: current.comparisonCount + 1,
       comparisonWindow: [current.comparisonWindow[0], current.comparisonWindow[1] + 1],
     };
+    return current;
+  });
+  api.undoAnswer.mockImplementation(async () => {
+    current = { ...beforeAnswer, revision: current.revision + 1 };
     return current;
   });
   const controller = new AppController(api, vi.fn());
@@ -3163,4 +3170,365 @@ describe("comparison state and persistence boundaries", () => {
       expect(controller.state.error).toBe("");
     },
   );
+});
+
+async function answeredComparison() {
+  const context = await comparison();
+  const { api, initial, saved, controller } = context;
+  const restored = { ...initial, revision: saved.revision + 1 };
+  api.answer.mockResolvedValue(saved);
+  api.nextPair.mockResolvedValue({ ...proposal(saved), a: saved.items[0]!, b: saved.items[1]! });
+  api.resumeList.mockResolvedValue(saved);
+  api.getList.mockResolvedValue(saved);
+  api.undoAnswer.mockResolvedValue(restored);
+  await controller.answer("a_weak");
+  return { ...context, restored };
+}
+
+describe("undoing the last comparison answer", () => {
+  it("does nothing without a committed answer or after a failed first answer", async () => {
+    const { api, controller } = await comparison();
+    expect(controller.state.canUndoAnswer).toBe(false);
+    await controller.undoAnswer();
+    api.answer.mockRejectedValueOnce("保存できません。");
+    await controller.answer("equal");
+    await controller.undoAnswer();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+    expect(controller.state.canUndoAnswer).toBe(false);
+  });
+
+  it("restores the last snapshot once, preserves A/B order, and reanswers using the new revision", async () => {
+    const { api, controller, initial, saved, restored } = await answeredComparison();
+    expect(controller.state.pair?.a.id).not.toBe(proposal(initial).a.id);
+    expect(controller.state.canUndoAnswer).toBe(true);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledExactlyOnceWith(initial.id, saved.revision);
+    expect(controller.state.active).toEqual(restored);
+    expect(controller.state.lists.find((entry) => entry.id === initial.id)).toEqual(
+      summary(restored),
+    );
+    expect(controller.state.pair).toEqual(proposal(restored));
+    expect(controller.state.view).toBe("compare");
+    expect(controller.state.canUndoAnswer).toBe(false);
+    expect(controller.state.notice).toContain("同じペアにもう一度回答");
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+    const revisedAnswer = { ...saved, revision: restored.revision + 1 };
+    api.answer.mockResolvedValue(revisedAnswer);
+    api.nextPair.mockResolvedValue(proposal(revisedAnswer));
+    await controller.answer("b_strong");
+    expect(api.answer).toHaveBeenNthCalledWith(2, proposal(restored), "b_strong");
+    expect(controller.state.active).toEqual(revisedAnswer);
+    expect(controller.state.canUndoAnswer).toBe(true);
+  });
+
+  it("replaces the undo receipt on the next answer and never exposes an older answer", async () => {
+    const { api, controller, saved } = await answeredComparison();
+    const second = { ...saved, revision: saved.revision + 1, comparisonCount: 2 };
+    api.answer.mockResolvedValue(second);
+    api.nextPair.mockResolvedValue(proposal(second));
+    await controller.answer("equal");
+    const restored = { ...saved, revision: second.revision + 1 };
+    api.undoAnswer.mockResolvedValue(restored);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledExactlyOnceWith(second.id, second.revision);
+    expect(controller.state.active?.comparisonCount).toBe(1);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+    expect(controller.state.active).toEqual(restored);
+  });
+
+  it.each(["string", "Error"] as const)(
+    "keeps the snapshot and receipt retryable after a transient undo failure reported as %s",
+    async (representation) => {
+      const { api, controller, saved, restored } = await answeredComparison();
+      const pair = controller.state.pair;
+      const message = "取り消しを保存できません。";
+      api.undoAnswer.mockRejectedValueOnce(
+        representation === "string" ? message : new Error(message),
+      );
+      await controller.undoAnswer();
+      expect(controller.state.active).toEqual(saved);
+      expect(controller.state.pair).toEqual(pair);
+      expect(controller.state.canUndoAnswer).toBe(true);
+      expect(controller.state.error).toBe(message);
+      await controller.undoAnswer();
+      expect(api.undoAnswer).toHaveBeenCalledTimes(2);
+      expect(controller.state.active).toEqual(restored);
+      expect(controller.state.canUndoAnswer).toBe(false);
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it("serializes repeated undo clicks, answers, skips and navigation while undo is pending", async () => {
+    const { api, controller, saved, restored } = await answeredComparison();
+    let finish!: (value: ListState) => void;
+    api.undoAnswer.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const pending = controller.undoAnswer();
+    await controller.undoAnswer();
+    await controller.answer("equal");
+    await controller.skipComparison();
+    await controller.navigate("items");
+    await controller.openModal({ kind: "rename-list" });
+    expect(api.undoAnswer).toHaveBeenCalledExactlyOnceWith(saved.id, saved.revision);
+    expect(api.answer).toHaveBeenCalledTimes(1);
+    expect(api.nextPair).toHaveBeenCalledTimes(2);
+    expect(controller.state.active).toEqual(saved);
+    expect(controller.state.view).toBe("compare");
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.busy).toBe(true);
+    finish(restored);
+    await pending;
+    expect(controller.state.busy).toBe(false);
+    expect(controller.state.active).toEqual(restored);
+  });
+
+  it("does not undo while another answer is pending or while a modal is open", async () => {
+    const { api, controller, saved } = await answeredComparison();
+    await controller.openModal({ kind: "rename-list" });
+    await controller.undoAnswer();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+    controller.closeModal();
+    let finish!: (value: ListState) => void;
+    api.answer.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const pending = controller.answer("equal");
+    await controller.undoAnswer();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+    expect(controller.state.active).toEqual(saved);
+    const second = { ...saved, revision: saved.revision + 1, comparisonCount: 2 };
+    api.nextPair.mockResolvedValue(proposal(second));
+    finish(second);
+    await pending;
+    expect(controller.state.canUndoAnswer).toBe(true);
+  });
+
+  it.each(["sidebar", "next pair"] as const)(
+    "can undo an already committed answer even if fetching the %s failed",
+    async (failure) => {
+      const { api, controller, initial, saved } = await comparison();
+      const restored = { ...initial, revision: saved.revision + 1 };
+      api.answer.mockResolvedValue(saved);
+      api.undoAnswer.mockResolvedValue(restored);
+      if (failure === "sidebar") api.listSummaries.mockRejectedValueOnce("更新に失敗。");
+      else api.nextPair.mockRejectedValueOnce("更新に失敗。");
+      await controller.answer("a_weak");
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.canUndoAnswer).toBe(true);
+      await controller.undoAnswer();
+      expect(controller.state.active).toEqual(restored);
+      expect(controller.state.pair).toEqual(proposal(restored));
+      expect(controller.state.error).toBe("");
+    },
+  );
+
+  it("keeps a committed undo and same pair usable when refreshing its sidebar fails", async () => {
+    const { api, controller, restored } = await answeredComparison();
+    api.listSummaries.mockRejectedValueOnce("一覧を更新できません。");
+    await controller.undoAnswer();
+    expect(controller.state.active).toEqual(restored);
+    expect(controller.state.pair).toEqual(proposal(restored));
+    expect(controller.state.canUndoAnswer).toBe(false);
+    expect(controller.state.error).toBe("一覧を更新できません。");
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains undo through same-list pages and selection while the revision is unchanged", async () => {
+    const { api, controller, saved, restored } = await answeredComparison();
+    for (const view of ["ranking", "tier", "items", "settings"] as const) {
+      await controller.navigate(view);
+      expect(controller.state.canUndoAnswer).toBe(true);
+    }
+    await controller.selectList(saved.id);
+    expect(controller.state.canUndoAnswer).toBe(true);
+    await controller.navigate("compare");
+    expect(controller.state.canUndoAnswer).toBe(true);
+    await controller.undoAnswer();
+    expect(controller.state.pair).toEqual(proposal(restored));
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  it("undoes the converging final answer after page navigation without resetting its ranking window", async () => {
+    const { api, controller, initial, saved } = await comparison();
+    const settled = { ...saved, convergence: { ...saved.convergence, converged: true } };
+    const restored = { ...initial, revision: settled.revision + 1 };
+    api.answer.mockResolvedValue(settled);
+    api.undoAnswer.mockResolvedValue(restored);
+    await controller.answer("a_strong");
+    expect(controller.state.view).toBe("ranking");
+    expect(controller.state.canUndoAnswer).toBe(true);
+    api.resumeList.mockClear();
+    await controller.navigate("tier");
+    await controller.navigate("compare");
+    expect(api.resumeList).not.toHaveBeenCalled();
+    expect(controller.state.active).toEqual(settled);
+    expect(controller.state.canUndoAnswer).toBe(true);
+    await controller.undoAnswer();
+    expect(controller.state.active).toEqual(restored);
+    expect(controller.state.active?.convergence.converged).toBe(false);
+    expect(controller.state.pair).toEqual(proposal(restored));
+  });
+
+  it("invalidates undo when deliberately continuing a converged comparison resets its window", async () => {
+    const { api, controller, saved } = await comparison();
+    const settled = { ...saved, convergence: { ...saved.convergence, converged: true } };
+    api.answer.mockResolvedValue(settled);
+    await controller.answer("equal");
+    const resumed = {
+      ...settled,
+      revision: settled.revision + 1,
+      comparisonWindow: [100, 100] as [number, number],
+      convergence: { ...settled.convergence, converged: false, observedAnswers: 0 },
+    };
+    api.resumeList.mockResolvedValue(resumed);
+    api.nextPair.mockResolvedValue(proposal(resumed));
+    await controller.startComparison();
+    expect(controller.state.active).toEqual(resumed);
+    expect(controller.state.canUndoAnswer).toBe(false);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+  });
+
+  it.each(["rename", "add", "delete", "tag", "image", "reset"] as const)(
+    "invalidates undo after a committed %s operation changes revision",
+    async (operation) => {
+      const { api, controller, saved } = await answeredComparison();
+      const changed = { ...saved, revision: saved.revision + 1 };
+      if (operation === "rename") {
+        api.renameList.mockResolvedValue(changed);
+        await controller.openModal({ kind: "rename-list" });
+        controller.state.drafts.name = "変更後";
+        await controller.saveName();
+      } else if (operation === "add") {
+        api.addItems.mockResolvedValue(changed);
+        controller.state.drafts.items = "追加項目";
+        await controller.addItems();
+      } else if (operation === "delete") {
+        api.deleteItem.mockResolvedValue({ ...changed, items: changed.items.slice(1) });
+        await controller.openModal({ kind: "delete-item", itemId: saved.items[0]!.id });
+        await controller.confirmDelete();
+      } else if (operation === "tag") {
+        api.createTag.mockResolvedValue(changed);
+        await controller.openModal({ kind: "tags" });
+        controller.state.tagDraft = "新しいタグ";
+        await controller.saveTag();
+      } else if (operation === "image") {
+        api.setLocalImage.mockResolvedValue(changed);
+        await controller.openModal({ kind: "image", itemId: saved.items[0]!.id });
+        await controller.changeImage("local");
+      } else {
+        api.resetComparisons.mockResolvedValue(changed);
+        await controller.openModal({ kind: "reset-comparisons" });
+        await controller.resetComparisons();
+      }
+      expect(controller.state.active?.revision).toBe(changed.revision);
+      expect(controller.state.canUndoAnswer).toBe(false);
+      controller.closeModal();
+      await controller.undoAnswer();
+      expect(api.undoAnswer).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not transfer undo to another list or restore it after returning", async () => {
+    const { api, controller, saved } = await answeredComparison();
+    api.getList.mockImplementation(async (id) => (id === saved.id ? saved : list(2)));
+    await controller.selectList(2);
+    expect(controller.state.canUndoAnswer).toBe(false);
+    await controller.selectList(saved.id);
+    await controller.undoAnswer();
+    expect(api.undoAnswer).not.toHaveBeenCalled();
+  });
+
+  it.each(["string", "Error"] as const)(
+    "reloads an externally changed item and clears stale undo on a %s revision conflict",
+    async (representation) => {
+      const { api, controller, saved } = await answeredComparison();
+      const changed = { ...saved, revision: saved.revision + 1, items: saved.items.slice(1) };
+      const message = "リストが更新されています。最新の比較を読み直してください。";
+      api.undoAnswer.mockRejectedValueOnce(
+        representation === "string" ? message : new Error(message),
+      );
+      api.getList.mockResolvedValue(changed);
+      await controller.undoAnswer();
+      expect(controller.state.active).toEqual(changed);
+      expect(controller.state.pair).toBeNull();
+      expect(controller.state.canUndoAnswer).toBe(false);
+      expect(controller.state.error).toContain("リストが更新されています。");
+      await controller.undoAnswer();
+      expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("clears stale undo even if refreshing after a revision conflict fails", async () => {
+    const { api, controller, saved } = await answeredComparison();
+    api.undoAnswer.mockRejectedValueOnce(
+      "リストが更新されています。最新の比較を読み直してください。",
+    );
+    api.getList.mockRejectedValueOnce("読み直しに失敗。");
+    await controller.undoAnswer();
+    expect(controller.state.active).toEqual(saved);
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.canUndoAnswer).toBe(false);
+    expect(controller.state.error).toBe("読み直しに失敗。");
+    await controller.undoAnswer();
+    expect(api.undoAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a deleted list without retaining its undo receipt", async () => {
+    const { api, controller } = await answeredComparison();
+    api.undoAnswer.mockRejectedValueOnce("リストが見つかりません。");
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    api.getList.mockResolvedValue(list(2));
+    await controller.undoAnswer();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.pair).toBeNull();
+    expect(controller.state.canUndoAnswer).toBe(false);
+    expect(controller.state.error).toBe("リストが見つかりません。");
+  });
+
+  it("restores skipped-pair cooldowns from before the answer, including holds that had expired", async () => {
+    const { api, controller } = await skippingComparison();
+    await controller.skipComparison();
+    await controller.answer("equal");
+    const answeredPair = controller.state.pair;
+    await controller.answer("a_weak");
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+    await controller.undoAnswer();
+    expect(controller.state.pair?.a.id).toBe(answeredPair?.a.id);
+    expect(controller.state.pair?.b.id).toBe(answeredPair?.b.id);
+    await controller.skipComparison();
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([
+      [11, 12],
+      [11, 13],
+    ]);
+  });
+
+  it("removes skips made after the answer and restores its pre-answer holds from an all-held state", async () => {
+    const { api, controller } = await skippingComparison();
+    await controller.skipComparison();
+    const answeredPair = controller.state.pair;
+    await controller.answer("equal");
+    await controller.skipComparison();
+    await controller.skipComparison();
+    expect(controller.state.comparisonPaused).toBe(true);
+    expect(controller.state.canUndoAnswer).toBe(true);
+    await controller.undoAnswer();
+    expect(controller.state.comparisonPaused).toBe(false);
+    expect(controller.state.pair?.a.id).toBe(answeredPair?.a.id);
+    expect(controller.state.pair?.b.id).toBe(answeredPair?.b.id);
+    await controller.answer("b_weak");
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([[11, 12]]);
+    await controller.answer("equal");
+    expect(api.nextPair.mock.lastCall?.[1]).toEqual([]);
+  });
 });
