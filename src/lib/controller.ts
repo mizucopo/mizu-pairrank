@@ -645,11 +645,9 @@ export class AppController {
           .map((item) => item.id)
       : [];
     await this.perform(async () => {
-      const images = imageIds.length
-        ? await this.api
-            .reportImages(list.id, list.revision, imageIds)
-            .catch((error: unknown) => this.handleListError(list.id, error))
-        : {};
+      const images = await this.api
+        .reportImages(list.id, list.revision, imageIds)
+        .catch((error: unknown) => this.handleListError(list.id, error));
       const report = createReport(list, modal.view, tags, images);
       const bytes =
         format === "html" ? new TextEncoder().encode(reportHtml(report)) : await reportPdf(report);

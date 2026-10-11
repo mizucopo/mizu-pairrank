@@ -1,5 +1,6 @@
 import pdfMake from "pdfmake/build/pdfmake";
 import type { Content, TableCell, TDocumentDefinitions } from "pdfmake/interfaces";
+import { splitGraphemes } from "unicode-segmenter/grapheme";
 
 import emojiDataUrl from "../assets/NotoEmoji.ttf?inline";
 import emojiCoverage from "../assets/NotoEmoji.ttf.coverage.txt?raw";
@@ -32,7 +33,6 @@ function coverage(text: string): [number, number][] {
 
 const japaneseRanges = coverage(fontCoverage);
 const emojiRanges = coverage(emojiCoverage);
-const segmenter = new Intl.Segmenter("ja", { granularity: "grapheme" });
 
 function covered(code: number, ranges: readonly [number, number][]): boolean {
   let low = 0;
@@ -56,7 +56,7 @@ type TextRun = {
 
 function textRuns(text: string): TextRun[] {
   const runs: TextRun[] = [];
-  for (const { segment } of segmenter.segment(text)) {
+  for (const segment of splitGraphemes(text)) {
     const points = Array.from(segment, (character) => character.codePointAt(0)!);
     const layoutControl = (code: number): boolean => [9, 10, 13].includes(code);
     const emojiControl = (code: number): boolean => [0x200d, 0xfe0e, 0xfe0f].includes(code);
@@ -75,7 +75,7 @@ function textRuns(text: string): TextRun[] {
     // indivisible so surrogate pairs, combining marks, and ZWJ emoji survive.
     const noWrap = segment.length > 1 && segment !== "\r\n";
     const wordBreak = noWrap || segment === "\r\n" ? "normal" : "break-all";
-    const last = runs.at(-1);
+    const last = runs[runs.length - 1];
     if (!noWrap && last?.font === font && !last.noWrap && last.wordBreak === wordBreak) {
       last.text += segment;
     } else {

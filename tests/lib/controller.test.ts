@@ -588,7 +588,7 @@ describe("ranking and tier reports", () => {
     expect(html).not.toContain("除外する");
     expect(html).not.toContain("/private/images");
     expect(html).not.toContain("private.example");
-    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, []);
     expect(api.exportList).not.toHaveBeenCalled();
     expect(api.searchSettings).not.toHaveBeenCalled();
     expect(controller.state.active).toEqual(before);
@@ -639,7 +639,7 @@ describe("ranking and tier reports", () => {
     expect(html).not.toContain("source.example");
   });
 
-  it("does not request image data when opted-in matching items have no images", async () => {
+  it("validates the revision without requesting image IDs when matching items have no images", async () => {
     const api = backend();
     const controller = new AppController(api, vi.fn());
     await controller.initialize();
@@ -648,9 +648,55 @@ describe("ranking and tier reports", () => {
     controller.setReportFormat("html");
     controller.setExportIncludeImages(true);
     await controller.exportReport();
-    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, list().revision, []);
     expect(savedReportHtml(api)).toContain("項目1");
   });
+
+  it.each([
+    ["ranking", false],
+    ["ranking", true],
+    ["tier", false],
+    ["tier", true],
+  ] as const)(
+    "rejects an outdated image-free %s report with image opt-in %s and exports only after reload",
+    async (view, includeImages) => {
+      const initial = list();
+      const current = {
+        ...initial,
+        revision: initial.revision + 1,
+        items: [{ ...initial.items[1]!, name: "別窓で更新された項目" }],
+      };
+      const api = backend(initial);
+      const stale = "リストが更新されています。ランキングを読み直して再試行してください。";
+      api.reportImages.mockRejectedValueOnce(stale);
+      const controller = new AppController(api, vi.fn());
+      await controller.initialize();
+      await controller.navigate(view);
+      await controller.openModal({ kind: "export-report", view });
+      controller.setReportFormat("html");
+      controller.setExportIncludeImages(includeImages);
+
+      await controller.exportReport();
+      expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(1, initial.revision, []);
+      expect(api.saveReport).not.toHaveBeenCalled();
+      expect(controller.state.error).toBe(stale);
+      expect(controller.state.modal).toEqual({ kind: "export-report", view });
+      expect(controller.state.active).toEqual(initial);
+
+      api.getList.mockResolvedValueOnce(current);
+      await controller.selectList(1);
+      await controller.navigate(view);
+      await controller.openModal({ kind: "export-report", view });
+      controller.setReportFormat("html");
+      await controller.exportReport();
+      expect(api.reportImages).toHaveBeenLastCalledWith(1, current.revision, []);
+      expect(api.saveReport).toHaveBeenCalledOnce();
+      const html = savedReportHtml(api);
+      expect(html).toContain("別窓で更新された項目");
+      expect(html).not.toContain("項目1");
+      expect(controller.state.error).toBe("");
+    },
+  );
 
   it("keeps native save cancellation and failures retryable with the selected options", async () => {
     const initial = list();

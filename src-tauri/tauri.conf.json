@@ -30,7 +30,9 @@
     "active": true,
     "resources": {
       "../src/assets/NotoSansJP-OFL.txt": "licenses/NotoSansJP-OFL.txt",
-      "../src/assets/NotoEmoji-OFL.txt": "licenses/NotoEmoji-OFL.txt"
+      "../src/assets/NotoEmoji-OFL.txt": "licenses/NotoEmoji-OFL.txt",
+      "../src/assets/pdfmake-LICENSE.txt": "licenses/pdfmake-LICENSE.txt",
+      "../src/assets/unicode-segmenter-LICENSE.txt": "licenses/unicode-segmenter-LICENSE.txt"
     },
     "icon": [
       "icons/32x32.png",

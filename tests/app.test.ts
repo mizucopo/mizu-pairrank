@@ -416,7 +416,7 @@ describe("desktop app interaction", () => {
   });
 
   it("offers report export only in ranking and tier views and keeps ZIP transfer separate", async () => {
-    const { root, controller, api } = setup();
+    const { root, controller, api, state } = setup();
     await controller.initialize();
     expect(root.querySelector('[data-action="export-report"]')).toBeNull();
     expect(button(root, '[data-action="export-list"]')).toBeDefined();
@@ -447,7 +447,10 @@ describe("desktop app interaction", () => {
     await controller.navigate("settings");
     expect(root.querySelector('[data-action="export-report"]')).toBeNull();
     expect(api.exportList).not.toHaveBeenCalled();
-    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.reportImages.mock.calls).toEqual([
+      [state.id, state.revision, []],
+      [state.id, state.revision, []],
+    ]);
   });
 
   it.each(["close button", "Escape"] as const)(
@@ -565,7 +568,7 @@ describe("desktop app interaction", () => {
     expect(report.body.textContent).not.toContain("対象外の項目");
     expect([...report.querySelectorAll("tbody th")].map((cell) => cell.textContent)).toEqual(["1"]);
     expect(report.querySelector("script, img, [onerror], [onclick]")).toBeNull();
-    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(state.id, state.revision, []);
     expect(controller.state.selectedTagIds).toEqual([3, 4]);
   });
 
@@ -606,7 +609,7 @@ describe("desktop app interaction", () => {
     for (const excluded of ["最高評価", "片方のタグのみ", "最低評価"])
       expect(report.body.textContent).not.toContain(excluded);
     expect(report.querySelector("table")).toBeNull();
-    expect(api.reportImages).not.toHaveBeenCalled();
+    expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(state.id, state.revision, []);
   });
 
   it("exports a valid empty filtered report without including unmatched items", async () => {

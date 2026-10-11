@@ -401,10 +401,20 @@ jobs:
           $releaseDir = Join-Path (Join-Path $metadata.target_directory $env:RUST_TARGET) "release"
           $applications = @(Get-ChildItem -LiteralPath $releaseDir -Filter "*.exe" -File)
           if ($applications.Count -ne 1) { throw "Expected exactly one Windows application in $releaseDir." }
+          $distributionFiles = @(
+            $applications[0].FullName,
+            "src/assets/NotoSansJP-OFL.txt",
+            "src/assets/NotoEmoji-OFL.txt",
+            "src/assets/pdfmake-LICENSE.txt",
+            "src/assets/unicode-segmenter-LICENSE.txt"
+          )
+          foreach ($path in $distributionFiles) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing Windows distribution file: $path" }
+          }
           $artifactDir = Join-Path $env:RUNNER_TEMP "tauri-artifacts"
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
           $zipPath = Join-Path $artifactDir "$($env:ZIP_PREFIX)-$($env:ARTIFACT_PLATFORM).zip"
-          Compress-Archive -LiteralPath $applications[0].FullName -DestinationPath $zipPath
+          Compress-Archive -LiteralPath $distributionFiles -DestinationPath $zipPath
           "path=$zipPath" >> $env:GITHUB_OUTPUT
 
       - name: Create macOS distribution ZIP

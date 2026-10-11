@@ -24,7 +24,8 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",
-    "pdfmake": "0.3.11"
+    "pdfmake": "0.3.11",
+    "unicode-segmenter": "0.17.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.1",

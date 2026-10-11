@@ -282,7 +282,7 @@ describe("saved PDF output", () => {
       try {
         for (const view of ["ranking", "tier"] as const) {
           const pdf = await PDFDocument.load(await reportPdf(createReport(state, view, [10])));
-          const output = createPdf.mock.results.at(-1)!.value;
+          const output = createPdf.mock.results[createPdf.mock.results.length - 1]!.value;
           const stream = (await output.getStream()) as unknown as LayoutStream;
           const lines = stream["_pdfMakePages"].flatMap((page) =>
             page.items
@@ -401,5 +401,41 @@ describe("saved PDF output", () => {
     expect(htmlDocument(reportHtml(report)).querySelector(".name")?.textContent).toBe(
       state.items[0]!.name,
     );
+  });
+
+  it("generates Unicode PDFs without Intl.Segmenter or Array.prototype.at", async () => {
+    const state = list([item(1, 25, [10])]);
+    state.name = "互換性確認🍎";
+    state.tags[0]!.name = "分類e\u0301";
+    state.items[0]!.name = "日本語𠮷りんご🍎家族👩‍👩‍👧‍👦アクセントe\u0301";
+    const segmenterDescriptor = Object.getOwnPropertyDescriptor(Intl, "Segmenter")!;
+    const atDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, "at")!;
+    const documents: Uint8Array[] = [];
+    let missingApis = false;
+    vi.resetModules();
+    Reflect.deleteProperty(Intl, "Segmenter");
+    try {
+      // Vitest's module loader needs .at; remove it after loading the renderer.
+      const { renderPdf } = await import("../../src/lib/report-pdf.js");
+      Reflect.deleteProperty(Array.prototype, "at");
+      missingApis = !("Segmenter" in Intl) && !("at" in Array.prototype);
+      for (const view of ["ranking", "tier"] as const) {
+        documents.push(await renderPdf(createReport(state, view, [10])));
+      }
+    } finally {
+      Object.defineProperty(Intl, "Segmenter", segmenterDescriptor);
+      // oxlint-disable-next-line no-extend-native -- Restore the native method removed for this compatibility test.
+      Object.defineProperty(Array.prototype, "at", atDescriptor);
+      vi.resetModules();
+    }
+    expect(missingApis).toBe(true);
+    for (const bytes of documents) {
+      const pdf = await PDFDocument.load(bytes);
+      const text = pageTexts(pdf).join("");
+      expect(text).toContain(state.name);
+      expect(text).toContain(state.tags[0]!.name);
+      expect(text).toContain(state.items[0]!.name);
+      expect(text).not.toContain("\ufffd");
+    }
   });
 });
