@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountApp } from "../src/main.js";
 import type { AppController } from "../src/lib/controller.js";
 import type {
@@ -3162,6 +3163,12 @@ describe("undo answer controls", () => {
 });
 
 describe("OpenAI search interactions", () => {
+  function loadStyles(): void {
+    const style = document.createElement("style");
+    style.textContent = readFileSync("src/styles.css", "utf8");
+    document.body.append(style);
+  }
+
   function input(root: HTMLElement, selector: string, value: string): HTMLInputElement {
     const field = root.querySelector<HTMLInputElement>(selector);
     if (!field) throw new Error(`Missing input: ${selector}`);
@@ -3185,6 +3192,81 @@ describe("OpenAI search interactions", () => {
     form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     await settle(controller);
   }
+
+  it.each(["api", "chatgpt"] as const)(
+    "shows an unavailable cursor for an unsaved %s mode and recovers after saving or reverting",
+    async (savedMode) => {
+      loadStyles();
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-view="settings"]');
+      select(root, "#openai-auth-mode", savedMode);
+      await submit(root, controller, '[data-form="save-openai-settings"]');
+      const selector = '[data-action="refresh-openai-models"]';
+      const cursor = () => getComputedStyle(button(root, selector)).cursor;
+      expect(cursor()).toBe("pointer");
+
+      const changedMode = savedMode === "api" ? "chatgpt" : "api";
+      select(root, "#openai-auth-mode", changedMode);
+      expect(controller.state.busy).toBe(false);
+      expect(button(root, selector).disabled).toBe(true);
+      expect(cursor()).toBe("not-allowed");
+      button(root, selector).click();
+      expect(api.openAiModels).not.toHaveBeenCalled();
+
+      select(root, "#openai-auth-mode", savedMode);
+      expect(button(root, selector).disabled).toBe(false);
+      expect(cursor()).toBe("pointer");
+      select(root, "#openai-auth-mode", changedMode);
+      await submit(root, controller, '[data-form="save-openai-settings"]');
+      expect(button(root, selector).disabled).toBe(false);
+      expect(cursor()).toBe("pointer");
+      await click(root, controller, selector);
+      expect(api.openAiModels).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "shows a wait cursor only during model refresh, then permits return and retry after %s",
+    async (outcome) => {
+      loadStyles();
+      const { root, controller, api } = setup();
+      await controller.initialize();
+      await click(root, controller, '[data-view="settings"]');
+      let finish = () => {};
+      api.openAiModels.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            finish = () => {
+              if (outcome === "success") resolve(["listed-model"]);
+              else reject(new Error("model request failed"));
+            };
+          }),
+      );
+      const selector = '[data-action="refresh-openai-models"]';
+      button(root, selector).click();
+      expect(controller.state.busy).toBe(true);
+      expect(button(root, selector).disabled).toBe(true);
+      expect(getComputedStyle(button(root, selector)).cursor).toBe("wait");
+      button(root, selector).click();
+      expect(api.openAiModels).toHaveBeenCalledOnce();
+      finish();
+      await settle(controller);
+      expect(button(root, selector).disabled).toBe(false);
+      expect(getComputedStyle(button(root, selector)).cursor).toBe("pointer");
+      expect(root.textContent?.includes("model request failed")).toBe(outcome === "error");
+
+      await click(root, controller, '[data-action="select-list"][data-id="1"]');
+      await click(root, controller, '[data-view="settings"]');
+      api.openAiModels.mockResolvedValueOnce(["retry-model"]);
+      await click(root, controller, selector);
+      expect(api.openAiModels).toHaveBeenCalledTimes(2);
+      expect(root.querySelector<HTMLOptionElement>("#openai-models option")?.value).toBe(
+        "retry-model",
+      );
+      expect(getComputedStyle(button(root, selector)).cursor).toBe("pointer");
+    },
+  );
 
   it.each(["api", "chatgpt"] as const)(
     "edits and saves a manual model and %s mode with separate authentication controls",

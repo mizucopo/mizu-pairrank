@@ -42,6 +42,9 @@ button:disabled {
   opacity: 0.45;
   cursor: wait;
 }
+.workspace[aria-busy="false"] [data-action="refresh-openai-models"]:disabled {
+  cursor: not-allowed;
+}
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
