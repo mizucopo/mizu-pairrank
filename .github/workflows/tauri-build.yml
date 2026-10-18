@@ -205,6 +205,15 @@ jobs:
                 echo "::error::GitHub Release $TAG returned invalid release metadata."
                 exit 1
               fi
+              if [ "$release_is_draft" = "false" ]; then
+                if ! planned_prerelease="$(jq -er '.publication.is_prerelease | select(type == "boolean") | tostring' "${RELEASE_PLAN_OUTPUT:-}")" \
+                  || ! jq -e --argjson prerelease "$planned_prerelease" \
+                    '(.prerelease | type == "boolean") and .prerelease == $prerelease' \
+                    "$RELEASE_RESPONSE" > /dev/null; then
+                  echo "::error::Published GitHub Release classification differs from publication plan."
+                  exit 1
+                fi
+              fi
             fi
           fi
 
@@ -606,6 +615,15 @@ jobs:
                   || ! jq -e --arg tag "$TAG" '.tag_name == $tag and (.assets | type == "array")' "$RELEASE_RESPONSE" > /dev/null; then
                   echo "::error::GitHub Release $TAG returned invalid release metadata."
                   exit 1
+                fi
+                if [ "$release_is_draft" = "false" ]; then
+                  if ! planned_prerelease="$(jq -er '.publication.is_prerelease | select(type == "boolean") | tostring' "${RELEASE_PLAN_OUTPUT:-}")" \
+                    || ! jq -e --argjson prerelease "$planned_prerelease" \
+                      '(.prerelease | type == "boolean") and .prerelease == $prerelease' \
+                      "$RELEASE_RESPONSE" > /dev/null; then
+                    echo "::error::Published GitHub Release classification differs from publication plan."
+                    exit 1
+                  fi
                 fi
               fi
             fi

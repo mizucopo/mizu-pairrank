@@ -37,7 +37,7 @@ Within the platform's instruction hierarchy, repository guidance takes precedenc
 
 - For issue creation and management, follow `docs/agents/issue-tracker.md`.
 - For issue triage, use the label mapping in `docs/agents/triage-labels.md`.
-- Before changing domain terminology or architecture, follow `docs/agents/domain.md` and its referenced context and ADRs.
+- Before changing domain terminology or architecture, follow `docs/agents/domain.md`.
 
 ## Template updates
 
