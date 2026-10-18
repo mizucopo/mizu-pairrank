@@ -2,14 +2,20 @@
 """Number main once, then build and publish that exact commit in the same run."""
 
 import argparse
+import base64
+import hashlib
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
+import zipfile
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -186,6 +192,7 @@ def publication(policy, version, revision=None):
     )
     return {
         "release_tag": tag,
+        **({"rust": rust_config(spec["rust"])} if "rust" in spec else {}),
         "images": images,
         "release_paths": spec["release_paths"],
         "latest_image": spec.get("latest_image"),
@@ -512,7 +519,7 @@ class Git:
         return self.command("mktag", data=data.encode()).decode().strip()
 
 
-def read_version(git, tree, policy, allow_missing=False):
+def read_version(git, tree, policy, allow_missing=False, allow_legacy_prefix=False):
     specs = policy["version"]["sources"]
     require(specs, "No version sources declared")
     scheme = policy["version"]["scheme"]
@@ -531,6 +538,14 @@ def read_version(git, tree, policy, allow_missing=False):
             if not allow_missing:
                 raise
             continue
+        if (
+            allow_legacy_prefix
+            and policy["version"]["scheme"] == "semver"
+            and spec["path"] == "version"
+            and spec["format"] == "text"
+        ):
+            # Only the pre-adoption plain source used tag-form versions.
+            value = value.removeprefix("v")
         if allow_missing:
             # A new field may be absent; existing fields must still be valid.
             version_key(value, scheme)
@@ -810,23 +825,56 @@ def publication_at(git, commit, policy=None):
     return publication(policy, version, revision)
 
 
+class NoRegistryRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+def registry_open(req):
+    # Credentials and scoped tokens must stay on their fixed HTTPS endpoints.
+    return request.build_opener(NoRegistryRedirect()).open(req, timeout=30)
+
+
 def registry_json(url, headers=None, payload=None, missing=False):
     headers = dict(headers or {})
     data = canonical(payload) if payload is not None else None
     if data is not None:
         headers["Content-Type"] = "application/json"
     try:
-        with request.urlopen(
-            request.Request(url, data=data, headers=headers), timeout=30
+        with registry_open(
+            request.Request(url, data=data, headers=headers)
         ) as response:
             return json.load(response)
     except error.HTTPError as exc:
+        exc.close()
         if missing and exc.code == 404:
             return None
         raise PreparationError(
             f"Registry lookup failed: HTTP {exc.code} at {url}"
         ) from exc
-    except (error.URLError, ValueError) as exc:
+    except (error.URLError, ValueError, OSError) as exc:
+        raise PreparationError(f"Registry lookup failed at {url}") from exc
+
+
+def registry_head_digest(url, headers):
+    try:
+        with registry_open(
+            request.Request(url, headers=headers, method="HEAD")
+        ) as response:
+            require(
+                response.status == 200,
+                f"Registry lookup failed: HTTP {response.status} at {url}",
+            )
+            # Only HTTP 404 is absent; a missing digest must fail validation.
+            return response.headers.get("Docker-Content-Digest") or ""
+    except error.HTTPError as exc:
+        exc.close()
+        if exc.code == 404:
+            return None
+        raise PreparationError(
+            f"Registry lookup failed: HTTP {exc.code} at {url}"
+        ) from exc
+    except (error.URLError, ValueError, OSError) as exc:
         raise PreparationError(f"Registry lookup failed at {url}") from exc
 
 
@@ -858,8 +906,11 @@ def image_digest(image):
         require(len(rows) == 1, "ECR returned ambiguous image state")
         digests = [rows[0].get("imageDigest")]
     else:
-        headers = {}
+        headers, credentials = {}, {}
         if os.environ.get("DOCKERHUB_TOKEN"):
+            require(
+                os.environ.get("DOCKERHUB_USERNAME"), "DOCKERHUB_USERNAME is required"
+            )
             auth = registry_json(
                 "https://hub.docker.com/v2/auth/token",
                 payload={
@@ -867,28 +918,61 @@ def image_digest(image):
                     "secret": os.environ["DOCKERHUB_TOKEN"],
                 },
             )
-            token = auth.get("access_token")
+            token = auth.get("access_token") if isinstance(auth, dict) else None
             require(
                 isinstance(token, str) and token,
                 "Docker Hub did not return an access token",
             )
             headers["Authorization"] = "Bearer " + token
+            basic = (
+                f"{os.environ['DOCKERHUB_USERNAME']}:{os.environ['DOCKERHUB_TOKEN']}"
+            )
+            credentials["Authorization"] = (
+                "Basic " + base64.b64encode(basic.encode()).decode()
+            )
         root = f"https://hub.docker.com/v2/repositories/{image['repository']}/"
-        registry_json(
-            root, headers
+        require(
+            isinstance(registry_json(root, headers), dict),
+            "Docker Hub returned invalid repository metadata",
         )  # A private/unknown repository is not an absent tag.
-        data = registry_json(
-            root + "tags/" + parse.quote(image["tag"], safe="") + "/",
-            headers,
-            missing=True,
+        # Hub tag metadata may lag behind an image that the registry already serves.
+        auth = registry_json(
+            "https://auth.docker.io/token?"
+            + parse.urlencode(
+                {
+                    "service": "registry.docker.io",
+                    "scope": f"repository:{image['repository']}:pull",
+                }
+            ),
+            credentials,
         )
-        if data is None:
+        token = (
+            (auth.get("token") or auth.get("access_token"))
+            if isinstance(auth, dict)
+            else None
+        )
+        require(
+            isinstance(token, str) and token,
+            "Docker registry did not return an access token",
+        )
+        digest = registry_head_digest(
+            "https://registry-1.docker.io/v2/"
+            + parse.quote(image["repository"], safe="/")
+            + "/manifests/"
+            + parse.quote(image["tag"], safe=""),
+            {
+                "Authorization": "Bearer " + token,
+                "Accept": (
+                    "application/vnd.docker.distribution.manifest.v2+json, "
+                    "application/vnd.docker.distribution.manifest.list.v2+json, "
+                    "application/vnd.oci.image.manifest.v1+json, "
+                    "application/vnd.oci.image.index.v1+json"
+                ),
+            },
+        )
+        if digest is None:
             return None
-        digests = (
-            [data["digest"]]
-            if "digest" in data
-            else [row.get("digest") for row in data.get("images", [])]
-        )
+        digests = [digest]
     require(
         digests
         and all(
@@ -898,6 +982,25 @@ def image_digest(image):
         f"Registry returned no verifiable digest for {image['name']}",
     )
     return "|".join(sorted(set(digests)))
+
+
+def verify_published_image(image):
+    attempts, interval = 6, 5
+    for attempt in range(1, attempts + 1):
+        digest = image_digest(image)
+        if digest is not None:
+            return digest
+        if attempt < attempts:
+            print(
+                f"Published image is not visible ({attempt}/{attempts}); "
+                f"retrying in {interval} seconds",
+                file=sys.stderr,
+            )
+            time.sleep(interval)
+    raise PreparationError(
+        f"Published image is still missing after {attempts} attempts "
+        f"with a {interval}-second retry interval"
+    )
 
 
 def remote_collisions(gh, plan):
@@ -1073,7 +1176,13 @@ def prepare(git, gh, run_id, control_commit=None):
         )
         baseline = candidate["baseline"]
         base_version = (
-            read_version(git, baseline, policy, allow_missing=not last)
+            read_version(
+                git,
+                baseline,
+                policy,
+                allow_missing=not last,
+                allow_legacy_prefix=not last and baseline != candidate["introduction"],
+            )
             if baseline
             else None
         )
@@ -1155,15 +1264,21 @@ DOWNLOADS_START = "<!-- repo-template:downloads:start -->"
 DOWNLOADS_END = "<!-- repo-template:downloads:end -->"
 
 
-def checked_release_id(release, tag):
+def checked_release_id(release, plan):
     release_id = release.get("id")
     require(
         type(release_id) is int
         and release_id > 0
-        and release.get("tag_name") == tag
+        and release.get("tag_name") == plan["release_tag"]
         and type(release.get("draft")) is bool,
         "Invalid GitHub Release identity",
     )
+    if not release["draft"]:
+        require(
+            type(release.get("prerelease")) is bool
+            and release["prerelease"] == plan["is_prerelease"],
+            "Published GitHub Release classification differs from publication plan",
+        )
     return release_id
 
 
@@ -1172,7 +1287,7 @@ def create_release(gh, plan):
     matches = [r for r in gh.pages("/releases") if r["tag_name"] == tag]
     require(len(matches) <= 1, "Multiple GitHub Releases match the tag")
     if matches:
-        return checked_release_id(matches[0], tag)
+        return checked_release_id(matches[0], plan)
     require(
         gh.repo(f"/git/ref/tags/{parse.quote(tag, safe='')}", missing=True),
         "Git tag must exist before creating a GitHub Release",
@@ -1197,7 +1312,7 @@ def create_release(gh, plan):
             "make_latest": "false",
         },
     )
-    release_id = checked_release_id(release, tag)
+    release_id = checked_release_id(release, plan)
     require(
         release["draft"] == draft
         and type(release.get("prerelease")) is bool
@@ -1259,83 +1374,408 @@ def distribution_body(body, assets, images):
     return body + (newline * 2 if body and block else "") + block
 
 
-def rust_asset(git, gh, release, tag, assets):
-    root = Path(git.root)
-    package = tomllib.loads((root / "Cargo.toml").read_text())["package"]["name"]
+RUST_TARGETS = {
+    "x86_64-unknown-linux-gnu": (
+        "ubuntu-latest",
+        "linux-x86_64",
+        "tar.gz",
+        "Linux",
+        "x86_64",
+    ),
+    "x86_64-pc-windows-msvc": (
+        "windows-latest",
+        "windows-x86_64",
+        "zip",
+        "Windows",
+        "x86_64",
+    ),
+    "aarch64-pc-windows-msvc": (
+        "windows-11-arm",
+        "windows-arm64",
+        "zip",
+        "Windows",
+        "aarch64",
+    ),
+    "aarch64-apple-darwin": (
+        "macos-latest",
+        "macos-arm64",
+        "tar.gz",
+        "Darwin",
+        "aarch64",
+    ),
+}
+
+
+def rust_config(spec):
+    targets = spec.get("targets")
+    require(
+        isinstance(targets, list)
+        and targets
+        and all(isinstance(t, str) and t in RUST_TARGETS for t in targets)
+        and len(set(targets)) == len(targets),
+        "Rust distribution requires distinct supported targets",
+    )
+    for field in ("smoke_args", "stage_command"):
+        value = spec.get(field, ["--help"] if field == "smoke_args" else [])
+        require(
+            isinstance(value, list)
+            and all(isinstance(arg, str) and "\0" not in arg for arg in value),
+            f"Invalid Rust {field}",
+        )
+    return {
+        "targets": targets,
+        "smoke_args": spec.get("smoke_args", ["--help"]),
+        "stage_command": spec.get("stage_command", []),
+    }
+
+
+def rust_name(package, tag, target):
+    _, suffix, extension, _, _ = RUST_TARGETS[target]
+    # Keep SemVer metadata literal while preserving safe custom tag separators.
+    return f"{package}-{parse.quote(tag, safe='+')}-{suffix}.{extension}"
+
+
+def rust_package(git):
+    return tomllib.loads((Path(git.root) / "Cargo.toml").read_text(encoding="utf-8"))[
+        "package"
+    ]["name"]
+
+
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def rust_archive(archive, stage):
+    files = sorted(path for path in stage.rglob("*") if path.is_file())
+    require(
+        files and not any(path.is_symlink() for path in stage.rglob("*")),
+        "Rust staging must contain regular files without symlinks",
+    )
+    if archive.name.endswith(".zip"):
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for path in files:
+                bundle.write(path, path.relative_to(stage).as_posix())
+    else:
+        with tarfile.open(archive, "w:gz") as bundle:
+            for path in files:
+                bundle.add(path, arcname=path.relative_to(stage).as_posix())
+
+
+def rust_extract(archive, destination):
+    if archive.name.endswith(".zip"):
+        with zipfile.ZipFile(archive) as bundle:
+            names = bundle.namelist()
+            require(len(set(names)) == len(names), "Duplicate Rust archive members")
+            for name in names:
+                safe_path(name)
+            bundle.extractall(destination)
+    else:
+        with tarfile.open(archive) as bundle:
+            members = bundle.getmembers()
+            require(
+                len({m.name for m in members}) == len(members),
+                "Duplicate Rust archive members",
+            )
+            for member in members:
+                safe_path(member.name)
+                require(member.isfile(), "Rust archive contains a non-regular file")
+            bundle.extractall(destination, filter="data")
+            names = [m.name for m in members]
+    return names
+
+
+def rust_smoke(archive, binaries, args):
+    with tempfile.TemporaryDirectory() as directory:
+        extracted = Path(directory)
+        members = rust_extract(archive, extracted)
+        require(
+            all(name in members for name in binaries),
+            "Rust archive is missing executables",
+        )
+        for name in binaries:
+            try:
+                result = subprocess.run(
+                    [str(extracted / name), *args],
+                    cwd=extracted,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise PreparationError(
+                    f"Rust startup smoke failed: {name}: {exc}"
+                ) from exc
+            require(result.returncode == 0, f"Rust startup smoke failed: {name}")
+
+
+def build_rust_distribution(git, plan, release_sha, target, directory):
+    spec = rust_config(plan["rust"])
+    require(target in spec["targets"], "Rust target is not selected")
+    _, _, _, system, architecture = RUST_TARGETS[target]
+    machine = {"amd64": "x86_64", "arm64": "aarch64"}.get(
+        platform.machine().lower(), platform.machine().lower()
+    )
+    require(
+        platform.system() == system and machine == architecture,
+        "Rust distribution requires a native runner for build and startup smoke",
+    )
+    package = rust_package(git)
     metadata = json.loads(
         run("cargo", "metadata", "--no-deps", "--format-version=1", cwd=git.root)
     )
-    targets = next(p["targets"] for p in metadata["packages"] if p["name"] == package)
-    if not any("bin" in target["kind"] for target in targets):
-        return  # A library has no executable to distribute.
-    name = f"{package}-{parse.quote(tag, safe='')}-linux-x86_64.tar.gz"
-    if any(
-        a["name"] == name and a.get("state") == "uploaded" and a.get("size", 0) > 0
-        for a in assets
-    ):
-        return
-    build = run(
-        "cargo",
-        "build",
-        "--release",
-        "--locked",
-        "--package",
-        package,
-        "--bins",
-        "--target",
-        "x86_64-unknown-linux-gnu",
-        "--message-format=json",
-        cwd=git.root,
-    )
+    entry = next(p for p in metadata["packages"] if p["name"] == package)
+    targets = [t for t in entry["targets"] if "bin" in t["kind"]]
     binaries = []
-    for line in build.decode().splitlines():
-        artifact = json.loads(line)
-        if (
-            artifact.get("reason") == "compiler-artifact"
-            and "bin" in artifact["target"]["kind"]
-            and artifact.get("executable")
-        ):
-            binaries.append(root / artifact["executable"])
-    if not binaries:
-        return  # All executable targets may require disabled optional features.
-    require(release["draft"], "Published Rust distribution asset is missing")
-    with tempfile.TemporaryDirectory() as directory:
-        archive = Path(directory) / name
-        with tarfile.open(archive, "w:gz") as bundle:
-            for binary in binaries:
-                bundle.add(binary, arcname=binary.name)
-        incomplete = [asset for asset in assets if asset["name"] == name]
-        require(
-            all(type(a.get("id")) is int and a["id"] > 0 for a in incomplete),
-            "Invalid release asset ID",
-        )
-        upload_url = release.get("upload_url")
-        require(
-            isinstance(upload_url, str) and upload_url, "Invalid release upload URL"
-        )
-        upload_url = upload_url.split("{")[0]
-        for asset in incomplete:
-            gh.repo(f"/releases/assets/{asset['id']}", method="DELETE")
-        run(
-            "gh",
-            "api",
-            "--method",
-            "POST",
-            f"{upload_url}?name={parse.quote(name, safe='')}",
-            "-H",
-            "Content-Type: application/gzip",
-            "--input",
-            str(archive),
+    if targets:
+        # The old quality gate created an optional lock before the locked build.
+        if not (Path(git.root) / "Cargo.lock").exists():
+            run("cargo", "generate-lockfile", cwd=git.root)
+        build = run(
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            package,
+            "--bins",
+            "--target",
+            target,
+            "--message-format=json",
             cwd=git.root,
         )
-    uploaded = gh.pages(f"/releases/{release['id']}/assets")
+        artifacts = [json.loads(line) for line in build.decode().splitlines()]
+        binaries = [
+            Path(git.root) / a["executable"]
+            for a in artifacts
+            if a.get("reason") == "compiler-artifact"
+            and a.get("package_id") == entry["id"]
+            and "bin" in a["target"]["kind"]
+            and a.get("executable")
+        ]
+        suffix = ".exe" if system == "Windows" else ""
+        declared = {t["name"] + suffix for t in targets}
+        mandatory = {
+            t["name"] + suffix for t in targets if not t.get("required-features")
+        }
+        produced = {p.name for p in binaries}
+        # Cargo's package build, not workspace-wide metadata, decides optional bins.
+        require(
+            mandatory <= produced <= declared
+            and len(binaries) == len(produced)
+            and all(p.is_file() and p.stat().st_size > 0 for p in binaries),
+            "Cargo did not produce all selected Rust executables",
+        )
+    destination = Path(directory) / target
+    destination.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "release_sha": release_sha,
+        "release_tag": plan["release_tag"],
+        "target": target,
+        "package": package,
+        "binaries": [p.name for p in binaries],
+        "archive": None,
+        "sha256": None,
+        "smoke": "native",
+    }
+    if binaries:
+        archive = destination / rust_name(package, plan["release_tag"], target)
+        with tempfile.TemporaryDirectory() as stage_directory:
+            stage = Path(stage_directory)
+            for binary in binaries:
+                shutil.copy2(binary, stage / binary.name)
+            if spec["stage_command"]:
+                run(
+                    *spec["stage_command"],
+                    cwd=git.root,
+                    env={
+                        **os.environ,
+                        "RUST_RELEASE_STAGE_DIR": str(stage),
+                        "RUST_RELEASE_TARGET": target,
+                        "RUST_RELEASE_TAG": plan["release_tag"],
+                    },
+                )
+            rust_archive(archive, stage)
+        rust_smoke(archive, manifest["binaries"], spec["smoke_args"])
+        digest = file_sha256(archive)
+        (destination / (archive.name + ".sha256")).write_bytes(
+            f"{digest}  {archive.name}\n".encode()
+        )
+        manifest.update(archive=archive.name, sha256=digest)
+    (destination / "manifest.json").write_bytes(canonical(manifest))
+
+
+def rust_deliverables(git, plan, release_sha, directory):
+    package = rust_package(git)
+    deliverables = []
+    binary_names = None
+    for target in rust_config(plan["rust"])["targets"]:
+        root = Path(directory) / ("rust-release-" + target)
+        manifest = json.loads((root / "manifest.json").read_text())
+        require(
+            all(
+                manifest.get(key) == value
+                for key, value in {
+                    "release_sha": release_sha,
+                    "release_tag": plan["release_tag"],
+                    "target": target,
+                    "package": package,
+                    "smoke": "native",
+                }.items()
+            ),
+            "Rust artifact identity or native smoke differs from publication plan",
+        )
+        names = manifest.get("binaries")
+        require(
+            isinstance(names, list)
+            and all(isinstance(n, str) for n in names)
+            and len(set(names)) == len(names),
+            "Invalid Rust executable manifest",
+        )
+        for name in names:
+            safe_path(name)
+            require("/" not in name, "Invalid Rust executable name")
+            if "windows" in target:
+                require(
+                    name.endswith(".exe"), "Windows Rust executable must end in .exe"
+                )
+        normalized = (
+            {n.removesuffix(".exe") for n in names}
+            if "windows" in target
+            else set(names)
+        )
+        if binary_names is None:
+            binary_names = normalized
+        require(
+            normalized == binary_names, "Rust executable sets differ between targets"
+        )
+        if not names:
+            require(
+                manifest.get("archive") is None and manifest.get("sha256") is None,
+                "Library-only Rust artifact must not contain an archive",
+            )
+            continue
+        name = rust_name(package, plan["release_tag"], target)
+        require(
+            manifest.get("archive") == name,
+            "Rust archive name differs from publication plan",
+        )
+        archive = root / name
+        digest = file_sha256(archive)
+        require(
+            manifest.get("sha256") == digest,
+            "Rust archive checksum differs from manifest",
+        )
+        require(
+            (root / (name + ".sha256")).read_text(encoding="utf-8")
+            == f"{digest}  {name}\n",
+            "Rust checksum sidecar differs from archive",
+        )
+        with tempfile.TemporaryDirectory() as extracted_directory:
+            members = rust_extract(archive, Path(extracted_directory))
+            require(
+                all(n in members for n in names), "Rust archive is missing executables"
+            )
+        deliverables.append(archive)
+    return deliverables
+
+
+def completed_rust_asset(assets, name):
+    matches = [a for a in assets if a["name"] == name]
+    complete = [
+        a for a in matches if a.get("state") == "uploaded" and a.get("size", 0) > 0
+    ]
     require(
-        any(
-            a["name"] == name and a.get("state") == "uploaded" and a.get("size", 0) > 0
-            for a in uploaded
-        ),
-        "Rust distribution upload is incomplete",
+        len(complete) <= 1 and (not complete or len(matches) == 1),
+        f"Ambiguous Rust distribution asset: {name}",
     )
+    return complete[0] if complete else None
+
+
+def read_rust_asset(git, gh, asset):
+    require(
+        type(asset.get("id")) is int and asset["id"] > 0, "Invalid release asset ID"
+    )
+    return run(
+        "gh",
+        "api",
+        f"/repos/{gh.repository}/releases/assets/{asset['id']}",
+        "-H",
+        "Accept: application/octet-stream",
+        cwd=git.root,
+    )
+
+
+def rust_asset_checksum(git, gh, asset):
+    # A rerun must checksum the retained bytes, not a newly rebuilt archive.
+    digest = asset.get("digest", "")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        digest = "sha256:" + hashlib.sha256(read_rust_asset(git, gh, asset)).hexdigest()
+    return f"{digest.removeprefix('sha256:')}  {asset['name']}\n".encode()
+
+
+def upload_rust_asset(git, gh, release, assets, path):
+    complete = completed_rust_asset(assets, path.name)
+    if complete:
+        return complete
+    require(
+        release["draft"], f"Published Rust distribution asset is missing: {path.name}"
+    )
+    incomplete = [a for a in assets if a["name"] == path.name]
+    require(
+        all(type(a.get("id")) is int and a["id"] > 0 for a in incomplete),
+        "Invalid release asset ID",
+    )
+    upload_url = release.get("upload_url")
+    require(isinstance(upload_url, str) and upload_url, "Invalid release upload URL")
+    for asset in incomplete:
+        gh.repo(f"/releases/assets/{asset['id']}", method="DELETE")
+    content_type = "application/octet-stream"
+    if path.name.endswith(".zip"):
+        content_type = "application/zip"
+    elif path.name.endswith(".tar.gz"):
+        content_type = "application/gzip"
+    run(
+        "gh",
+        "api",
+        "--method",
+        "POST",
+        f"{upload_url.split('{')[0]}?name={parse.quote(path.name, safe='')}",
+        "-H",
+        "Content-Type: " + content_type,
+        "--input",
+        str(path),
+        cwd=git.root,
+    )
+    uploaded = completed_rust_asset(
+        gh.pages(f"/releases/{release['id']}/assets"), path.name
+    )
+    require(uploaded, f"Rust distribution upload is incomplete: {path.name}")
+    return uploaded
+
+
+def rust_asset(git, gh, release, plan, assets):
+    archives = rust_deliverables(
+        git, plan, git.text("rev-parse", "HEAD"), os.environ["RUST_RELEASE_DIR"]
+    )
+    # Check every target before any writes. Completed releases remain immutable.
+    if not release["draft"]:
+        for archive in archives:
+            for name in (archive.name, archive.name + ".sha256"):
+                require(
+                    completed_rust_asset(assets, name),
+                    f"Published Rust distribution asset is missing: {name}",
+                )
+    for archive in archives:
+        uploaded = upload_rust_asset(git, gh, release, assets, archive)
+        expected = rust_asset_checksum(git, gh, uploaded)
+        with tempfile.TemporaryDirectory() as directory:
+            checksum = Path(directory) / (archive.name + ".sha256")
+            checksum.write_bytes(expected)
+            sidecar = upload_rust_asset(git, gh, release, assets, checksum)
+        require(
+            read_rust_asset(git, gh, sidecar) == expected,
+            f"Published Rust checksum differs from archive: {archive.name}",
+        )
 
 
 def distribution(git, gh, plan):
@@ -1350,17 +1790,19 @@ def distribution(git, gh, plan):
         )
         release_id = int(retained_id)
         require(
-            not matches or checked_release_id(matches[0], tag) == release_id,
+            not matches or checked_release_id(matches[0], plan) == release_id,
             "Listed GitHub Release differs from retained ID",
         )
     else:
         require(len(matches) == 1, "Expected one GitHub Release for distribution")
-        release_id = checked_release_id(matches[0], tag)
+        release_id = checked_release_id(matches[0], plan)
     release = gh.repo(f"/releases/{release_id}")
-    require(checked_release_id(release, tag) == release_id, "GitHub Release ID differs")
+    require(
+        checked_release_id(release, plan) == release_id, "GitHub Release ID differs"
+    )
     assets = gh.pages(f"/releases/{release['id']}/assets")
     if os.environ.get("BUILD_RUST_BINARY") == "true":
-        rust_asset(git, gh, release, tag, assets)
+        rust_asset(git, gh, release, plan, assets)
         assets = gh.pages(f"/releases/{release['id']}/assets")
     for image in plan["images"]:
         require(
@@ -1368,7 +1810,9 @@ def distribution(git, gh, plan):
             f"Published image is missing: {image['name']}",
         )
     release = gh.repo(f"/releases/{release['id']}")
-    require(checked_release_id(release, tag) == release_id, "GitHub Release ID differs")
+    require(
+        checked_release_id(release, plan) == release_id, "GitHub Release ID differs"
+    )
     body = release.get("body") or ""
     updated = distribution_body(body, assets, plan["images"])
     payload = {}
@@ -1380,6 +1824,168 @@ def distribution(git, gh, plan):
         )
     if payload:
         gh.repo(f"/releases/{release['id']}", method="PATCH", payload=payload)
+
+
+IMAGE_OWNER_START = "<!-- repo-template:image-owners:v1\n"
+IMAGE_OWNER_END = "\nrepo-template:image-owners:end -->"
+
+
+def owner_release(gh, plan):
+    matches = [r for r in gh.pages("/releases") if r["tag_name"] == plan["release_tag"]]
+    require(len(matches) == 1, "Expected one completed image release")
+    release = matches[0]
+    checked_release_id(release, plan)
+    require(release["draft"] is False, "Image release is still a draft")
+    return release
+
+
+def image_owner_receipt(plan):
+    images = []
+    for image in plan["images"]:
+        digest = image_digest(image)
+        require(digest is not None, f"Published image is missing: {image['name']}")
+        images.append({**image, "digest": digest})
+    require(images, "Image ownership requires images")
+    return {
+        "schema": 1,
+        "release_sha": os.environ["RELEASE_SHA"],
+        "release_tag": plan["release_tag"],
+        "images": images,
+    }
+
+
+def retained_image_receipt(body):
+    starts, ends = body.count(IMAGE_OWNER_START), body.count(IMAGE_OWNER_END)
+    if not starts and not ends:
+        return None
+    require(starts == ends == 1, "Ambiguous image ownership receipt")
+    start = body.index(IMAGE_OWNER_START) + len(IMAGE_OWNER_START)
+    end = body.index(IMAGE_OWNER_END)
+    require(end > start, "Invalid image ownership receipt")
+    receipt = json.loads(body[start:end])
+    require(
+        isinstance(receipt, dict)
+        and type(receipt.get("schema")) is int
+        and receipt["schema"] == 1,
+        "Unknown image ownership receipt schema",
+    )
+    return receipt
+
+
+def restore_image_owner(git, gh, plan, tag):
+    require(tag in {i["tag"] for i in plan["images"]}, "Unknown image owner tag")
+    release = owner_release(gh, plan)
+    retained = retained_image_receipt(release.get("body") or "")
+    require(retained is not None, "Existing image has no completed ownership receipt")
+    require(retained == image_owner_receipt(plan), "Image ownership receipt differs")
+    run(
+        "bash",
+        str(Path(__file__).with_name("manage-docker-image-owner.sh")),
+        "record",
+        tag,
+        cwd=git.root,
+    )
+
+
+def completed_image_run(git, gh, plan):
+    record = record_at(git, os.environ["RELEASE_SHA"])
+    require(record is not None, "Missing release numbering record")
+    require(
+        os.environ.get("GITHUB_ACTIONS") == "true",
+        "Cleanup requires a serialized Actions job",
+    )
+    historical_run = os.environ.get("IMAGE_OWNER_COMPLETED_RUN_ID")
+    run_id = historical_run or os.environ["GITHUB_RUN_ID"]
+    require(record["Run"] == run_id, "Cleanup requires the original release run")
+    state = gh.repo(f"/actions/runs/{run_id}")
+    if state["status"] != "completed":
+        require(
+            not historical_run
+            and state["status"] == "in_progress"
+            and os.environ.get("GITHUB_JOB") == "cleanup-image-owners"
+            and str(state["run_attempt"]) == os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "Release run is not ready for image cleanup",
+        )
+    else:
+        require(state["conclusion"] == "success", "Release run did not succeed")
+    jobs = gh.pages(
+        f"/actions/runs/{run_id}/attempts/{state['run_attempt']}/jobs", key="jobs"
+    )
+    for name in ("release", "promote-latest"):
+        matches = [j for j in jobs if j["name"] == name]
+        allowed = {"success"}
+        if name == "promote-latest" and (
+            plan["is_prerelease"] or not plan["latest_image"]
+        ):
+            allowed.add("skipped")
+        require(
+            len(matches) == 1 and matches[0]["conclusion"] in allowed,
+            f"Release job is incomplete: {name}",
+        )
+
+
+def complete_image_owners(git, gh, plan):
+    completed_image_run(git, gh, plan)
+    release = owner_release(gh, plan)
+    receipt = image_owner_receipt(plan)
+    assets = gh.pages(f"/releases/{release['id']}/assets")
+    if plan.get("rust"):
+        directory = os.environ.get("RUST_RELEASE_DIR")
+        require(directory, "Verified Rust artifacts are required for image cleanup")
+        for archive in rust_deliverables(
+            git, plan, os.environ["RELEASE_SHA"], directory
+        ):
+            uploaded = completed_rust_asset(assets, archive.name)
+            sidecar = completed_rust_asset(assets, archive.name + ".sha256")
+            require(uploaded and sidecar, f"Missing Rust asset: {archive.name}")
+            expected = rust_asset_checksum(git, gh, uploaded)
+            require(
+                read_rust_asset(git, gh, sidecar) == expected,
+                f"Published Rust checksum differs from archive: {archive.name}",
+            )
+    body = release.get("body") or ""
+    require(
+        distribution_body(body, assets, plan["images"]) == body,
+        "Release distribution is incomplete",
+    )
+    if (
+        not plan["is_prerelease"]
+        and plan["latest_image"]
+        and latest(git, gh, os.environ["RELEASE_SHA"])
+    ):
+        require(
+            gh.repo("/releases/latest")["id"] == release["id"],
+            "GitHub Latest is incomplete",
+        )
+        image = next(i for i in receipt["images"] if i["name"] == plan["latest_image"])
+        require(
+            image_digest({**image, "tag": "latest"}) == image["digest"],
+            "Docker latest differs",
+        )
+    retained = retained_image_receipt(body)
+    require(retained is None or retained == receipt, "Image ownership receipt differs")
+    helper = str(Path(__file__).with_name("manage-docker-image-owner.sh"))
+    # Verify every owner before writing evidence or deleting any marker.
+    for image in plan["images"]:
+        run("bash", helper, "verify", image["tag"], cwd=git.root)
+    if retained is None:
+        body += (
+            "\n"
+            + IMAGE_OWNER_START
+            + canonical(receipt).decode()
+            + IMAGE_OWNER_END
+            + "\n"
+        )
+        gh.repo(f"/releases/{release['id']}", method="PATCH", payload={"body": body})
+    retained = gh.repo(f"/releases/{release['id']}")
+    checked_release_id(retained, plan)
+    require(
+        retained["draft"] is False
+        and retained_image_receipt(retained.get("body") or "") == receipt,
+        "Could not confirm the retained ownership receipt",
+    )
+    for image in plan["images"]:
+        run("bash", helper, "remove", image["tag"], cwd=git.root)
 
 
 def latest(git, gh, commit):
@@ -1413,12 +2019,18 @@ def main():
             "plan",
             "latest",
             "image-state",
+            "image-verify",
+            "image-owner-verify",
+            "image-owner-complete",
             "classification",
             "distribution",
+            "rust-matrix",
+            "rust-build",
             "create",
         ],
     )
     parser.add_argument("--root", default=".")
+    parser.add_argument("--image-tag")
     args = parser.parse_args()
     git, gh = Git(args.root), GitHub()
     if args.action == "classification":
@@ -1436,17 +2048,50 @@ def main():
             values = {"version": plan["generated_version"]}
         elif args.action == "create":
             values = {"release_id": create_release(gh, plan["publication"])}
+        elif args.action == "rust-matrix":
+            values = {
+                "rust_matrix": json.dumps(
+                    [
+                        {"target": target, "runner": RUST_TARGETS[target][0]}
+                        for target in rust_config(plan["publication"]["rust"])[
+                            "targets"
+                        ]
+                    ]
+                )
+            }
+        elif args.action == "rust-build":
+            target = os.environ["RUST_RELEASE_TARGET"]
+            run("rustup", "target", "add", target, cwd=git.root)
+            build_rust_distribution(
+                git,
+                plan["publication"],
+                os.environ["RELEASE_SHA"],
+                target,
+                os.environ["RUST_RELEASE_DIR"],
+            )
+            values = {}
+        elif args.action == "image-owner-verify":
+            restore_image_owner(git, gh, plan["publication"], args.image_tag)
+            values = {}
+        elif args.action == "image-owner-complete":
+            complete_image_owners(git, gh, plan["publication"])
+            values = {}
         elif args.action == "distribution":
             distribution(git, gh, plan["publication"])
             values = {}
-        elif args.action == "image-state":
+        elif args.action in {"image-state", "image-verify"}:
             require(
                 len(plan["publication"]["images"]) == 1,
-                "image-state requires one image",
+                f"{args.action} requires one image",
             )
             image = plan["publication"]["images"][0]
+            digest = (
+                verify_published_image(image)
+                if args.action == "image-verify"
+                else image_digest(image)
+            )
             values = {
-                "version_exists": str(image_digest(image) is not None).lower(),
+                "version_exists": str(digest is not None).lower(),
                 "image_tag": image["tag"],
             }
         else:
