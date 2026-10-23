@@ -31,17 +31,17 @@ Source: npm:@swc/helpers@0.5.23/LICENSE
 License/notice text: 3
 
 ==============================================================================
-@tauri-apps/api@2.12.2
+@tauri-apps/api@2.12.4
 Installed path: node_modules/@tauri-apps/api
 Declared license: Apache-2.0 OR MIT
 
-Source: npm:@tauri-apps/api@2.12.2/LICENSE-APACHE-2.0
+Source: npm:@tauri-apps/api@2.12.4/LICENSE-APACHE-2.0
 License/notice text: 4
 
-Source: npm:@tauri-apps/api@2.12.2/LICENSE-MIT
+Source: npm:@tauri-apps/api@2.12.4/LICENSE-MIT
 License/notice text: 5
 
-Source: npm:@tauri-apps/api@2.12.2/LICENSE.spdx
+Source: npm:@tauri-apps/api@2.12.4/LICENSE.spdx
 License/notice text: 6
 
 ==============================================================================
