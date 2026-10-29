@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createReport, matchingItems, reportHtml, reportPdf } from "../../src/lib/report.js";
 import type { Item, ListState } from "../../src/lib/types.js";
+import { withWebWorkers } from "../helpers/web-workers.js";
 
 function item(id: number, mu = 25, tagIds: number[] = []): Item {
   return {
@@ -320,7 +321,9 @@ describe("saved PDF output", () => {
   it("creates a readable PDF with embedded Japanese text and opted-in managed PNG data", async () => {
     const state = list([item(1)]);
     state.items[0]!.name = "かな漢字髙𠮷";
-    const bytes = await reportPdf(createReport(state, "ranking", [], { "1": png }));
+    const bytes = await withWebWorkers(() =>
+      reportPdf(createReport(state, "ranking", [], { "1": png })),
+    );
     expect(new TextDecoder().decode(bytes.slice(0, 5))).toBe("%PDF-");
     const pdf = await PDFDocument.load(bytes);
     expect(pdf.getPageCount()).toBe(1);
