@@ -1,4 +1,5 @@
 import { escapeHtml } from "./html.js";
+import { matchesSelectedTags } from "./tag-filter.js";
 import { tierRows } from "./tier.js";
 import type { TierRow } from "./tier.js";
 import type { Item, ListState, ReportView } from "./types.js";
@@ -34,7 +35,7 @@ export const tierPalette: Record<TierRow["label"], { background: string; color: 
 };
 
 export function matchingItems(items: readonly Item[], selectedTagIds: readonly number[]): Item[] {
-  return items.filter((item) => selectedTagIds.every((id) => item.tagIds.includes(id)));
+  return items.filter((item) => matchesSelectedTags(item.tagIds, selectedTagIds));
 }
 
 export function createReport(

@@ -1,6 +1,7 @@
 import { answers, configuredSearchProviders, tagNameMaxLength } from "./controller.js";
 import type { AppState, View } from "./controller.js";
 import { escapeHtml } from "./html.js";
+import { matchesSelectedTags } from "./tag-filter.js";
 import { tierRows } from "./tier.js";
 import type { Item, SearchProvider } from "./types.js";
 
@@ -102,10 +103,6 @@ function comparisonView(s: AppState, assetUrl: (path: string) => string): string
       "",
     )}<span class="versus" aria-hidden="true">or</span></div><div class="answers" role="group" aria-label="比較への回答">${answers.map((answer) => `<button class="answer ${answer.value}" data-answer="${answer.value}"${disabled(s)}>${answer.label}<kbd>${answer.key}</kbd></button>`).join("")}</div><p class="comparison-note">${s.busy ? "次の比較を選んでいます…" : "直感で選んで大丈夫。キーボードの1〜5でも回答できます。"}</p>${undoAnswerButton(s)}<div class="comparison-skip"><button class="secondary" data-action="skip-comparison"${disabled(s)}>情報が足りないのでスキップ</button><p class="muted small">評価せずに保留します。他の比較に${Math.max(1, (s.active?.items.length ?? 2) - 1)}回答すると再び候補になります。</p></div></section>${progress(s)}`;
 }
-function matchesSelectedTags(item: Item, s: AppState): boolean {
-  return s.selectedTagIds.every((id) => item.tagIds.includes(id));
-}
-
 function tagFilter(s: AppState): string {
   const tags = s.active?.tags ?? [];
   return `<div class="tag-filter"><p class="muted">選択したタグをすべて持つ項目を表示します。もう一度クリックすると解除できます。</p>${tags.length ? `<div class="tag-chips" role="group" aria-label="表示するタグ">${tags.map((tag) => `<button type="button" class="tag-chip" data-action="toggle-tag" data-id="${tag.id}" data-focus="filter-tag-${tag.id}" aria-pressed="${s.selectedTagIds.includes(tag.id)}"${disabled(s)}>${e(tag.name)}</button>`).join("")}</div>` : '<p class="muted">タグはまだありません。</p>'}</div>`;
@@ -114,7 +111,7 @@ function tagFilter(s: AppState): string {
 function rankingView(s: AppState, assetUrl: (path: string) => string): string {
   const list = s.active;
   if (!list) return "";
-  const visible = list.items.filter((item) => matchesSelectedTags(item, s));
+  const visible = list.items.filter((item) => matchesSelectedTags(item.tagIds, s.selectedTagIds));
   return `<section>${list.convergence.converged ? '<div class="converged-banner"><span>✓</span><div><h2>順位ほぼ確定</h2><p>好みの順番が落ち着きました。いつでも比較を続けられます。</p></div></div>' : ""}<div class="section-heading"><div><h2>あなたのランキング</h2><p class="muted">推定評価の高い順。評価が同じ場合は登録順です。</p></div><button class="secondary" data-action="export-report"${disabled(s)}>表を出力</button></div>${s.canUndoAnswer ? undoAnswerButton(s) : ""}${tagFilter(s)}${visible.length ? `<ol class="ranking-list">${visible.map((item, index) => `<li class="rank-row"><span class="rank-number${index < 3 ? " top" : ""}">${index + 1}</span>${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較</small></div><div class="rating-values"><span>評価 <strong>${number(item.rating.mu)}</strong></span><span>σ <strong>${number(item.rating.sigma)}</strong></span></div></li>`).join("")}</ol>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに順位が表示されます。</p></div>'}<p class="muted small">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></section>${progress(s)}`;
 }
 function tierView(s: AppState, assetUrl: (path: string) => string): string {
@@ -123,7 +120,7 @@ function tierView(s: AppState, assetUrl: (path: string) => string): string {
   const allRows = tierRows(list.items);
   const rows = allRows.map((row) => ({
     ...row,
-    entries: row.entries.filter(({ item }) => matchesSelectedTags(item, s)),
+    entries: row.entries.filter(({ item }) => matchesSelectedTags(item.tagIds, s.selectedTagIds)),
   }));
   const hasVisibleItems = rows.some((row) => row.entries.length > 0);
   return `<section><div class="section-heading"><div><h2>あなたの Tier 表</h2><p class="muted">リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。${list.items.length && allRows[3]?.entries.length === list.items.length ? "全項目が同じ評価のときは C に表示します。" : ""}</p></div><button class="secondary" data-action="export-report"${disabled(s)}>表を出力</button></div>${tagFilter(s)}${hasVisibleItems ? `<div class="tier-table" aria-label="Tier 表">${rows.map(({ label, entries }) => `<section class="tier-row" aria-labelledby="tier-${label}"><h3 id="tier-${label}" class="tier-label">${label}</h3>${entries.length ? `<ol class="tier-items" role="list" tabindex="0" data-focus="tier-${label}" aria-label="${label} Tier の項目">${entries.map(({ item }) => `<li class="tier-card">${picture(item, assetUrl)}<span class="tier-name">${e(item.name)}</span></li>`).join("")}</ol>` : '<p class="tier-empty">項目なし</p>'}</section>`).join("")}</div>` : s.selectedTagIds.length ? '<div class="empty compact"><p>選択したタグをすべて持つ項目はありません。</p></div>' : '<div class="empty compact"><p>項目を追加すると、ここに Tier 表が表示されます。</p></div>'}</section>${progress(s)}`;
