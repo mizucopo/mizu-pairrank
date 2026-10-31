@@ -584,6 +584,7 @@ describe("desktop app interaction", () => {
     await controller.navigate("ranking");
     await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
     await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="4"]');
+    const visibleNames = [...root.querySelectorAll(".rank-row h3")].map((node) => node.textContent);
     await click(root, controller, '[data-action="export-report"]');
     selectReportHtml(root);
     await click(root, controller, '[data-action="confirm-report-export"]');
@@ -592,6 +593,9 @@ describe("desktop app interaction", () => {
     expect(report.body.textContent).toContain(state.items[0]!.name);
     expect(report.body.textContent).toContain(hostile);
     expect(report.body.textContent).not.toContain("対象外の項目");
+    expect([...report.querySelectorAll("tbody td.name")].map((node) => node.textContent)).toEqual(
+      visibleNames,
+    );
     expect([...report.querySelectorAll("tbody th")].map((cell) => cell.textContent)).toEqual(["1"]);
     expect(report.querySelector("script, img, [onerror], [onclick]")).toBeNull();
     expect(api.reportImages).toHaveBeenCalledExactlyOnceWith(state.id, state.revision, []);
@@ -615,11 +619,21 @@ describe("desktop app interaction", () => {
     await controller.navigate("tier");
     await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="3"]');
     await click(root, controller, '.tag-filter [data-action="toggle-tag"][data-id="4"]');
+    const visibleTiers = [...root.querySelectorAll(".tier-row")].map((row) => [
+      row.querySelector(".tier-label")?.textContent,
+      [...row.querySelectorAll(".tier-name")].map((node) => node.textContent),
+    ]);
     await click(root, controller, '[data-action="export-report"]');
     selectReportHtml(root);
     await click(root, controller, '[data-action="confirm-report-export"]');
     const report = savedReportDocument(api);
     expect(report.querySelector("h2")?.textContent).toContain("Tier 表");
+    expect(
+      [...report.querySelectorAll(".tier")].map((row) => [
+        row.querySelector("h3")?.textContent,
+        [...row.querySelectorAll(".name")].map((node) => node.textContent),
+      ]),
+    ).toEqual(visibleTiers);
     expect([...report.querySelectorAll("section > h3")].map((label) => label.textContent)).toEqual([
       "S",
       "A",
