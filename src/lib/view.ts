@@ -166,6 +166,9 @@ function sourceHost(source: string): string {
     return source;
   }
 }
+function exportImageOption(s: AppState): string {
+  return `<label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>`;
+}
 function modalView(s: AppState): string {
   const modal = s.modal;
   if (!modal) return "";
@@ -175,10 +178,10 @@ function modalView(s: AppState): string {
   let body: string;
   if (modal.kind === "export-list") {
     title = "リストをエクスポート";
-    body = `<p>「${e(s.active?.name ?? "")}」のリスト名・項目名・タグを ZIP ファイルに保存します。</p><p class="muted">比較履歴・評価は含みません。</p><label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>${s.busy ? '<p role="status">エクスポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
+    body = `<p>「${e(s.active?.name ?? "")}」のリスト名・項目名・タグを ZIP ファイルに保存します。</p><p class="muted">比較履歴・評価は含みません。</p>${exportImageOption(s)}${s.busy ? '<p role="status">エクスポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
   } else if (modal.kind === "export-report") {
     title = `${modal.view === "ranking" ? "ランキング" : "Tier 表"}を出力`;
-    body = `<p>「${e(s.active?.name ?? "")}」の、現在のタグ絞り込みに一致する全項目を保存します。</p><label for="report-format">ファイル形式</label><select id="report-format" data-focus="report-format"${disabled(s)}><option value="pdf"${s.reportFormat === "pdf" ? " selected" : ""}>PDF</option><option value="html"${s.reportFormat === "html" ? " selected" : ""}>HTML</option></select><label class="export-image-option" for="export-include-images"><input id="export-include-images" type="checkbox" data-focus="export-include-images" aria-describedby="export-image-help"${s.exportIncludeImages ? " checked" : ""}${disabled(s)} />画像を含める</label><p id="export-image-help" class="muted small">画像は既定では含みません。再配布できる権利のある画像だけを含めてください。</p>${s.busy ? '<p role="status">表を作成・保存しています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-report-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
+    body = `<p>「${e(s.active?.name ?? "")}」の、現在のタグ絞り込みに一致する全項目を保存します。</p><label for="report-format">ファイル形式</label><select id="report-format" data-focus="report-format"${disabled(s)}><option value="pdf"${s.reportFormat === "pdf" ? " selected" : ""}>PDF</option><option value="html"${s.reportFormat === "html" ? " selected" : ""}>HTML</option></select>${exportImageOption(s)}${s.busy ? '<p role="status">表を作成・保存しています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-report-export"${disabled(s)}>保存先を選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;
   } else if (modal.kind === "import-list") {
     title = "リストをインポート";
     body = `<p>pairrank でエクスポートした ZIP ファイルから、リスト名・項目名・タグを取り込みます。画像が含まれる場合は画像も取り込みます。</p><p class="muted">新しいリストとして追加します。既存のリストは変更せず、比較は最初から始められます。</p>${s.busy ? '<p role="status">インポートしています…</p>' : ""}<div class="form-actions"><button type="button" data-action="confirm-import"${disabled(s)}>ファイルを選ぶ</button><button type="button" class="secondary" data-action="close-modal"${disabled(s)}>キャンセル</button></div>`;

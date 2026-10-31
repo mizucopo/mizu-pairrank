@@ -496,6 +496,42 @@ describe("desktop app interaction", () => {
     },
   );
 
+  it.each(["ZIP", "PDF", "HTML"] as const)(
+    "associates the %s image option with its label and warning and preserves focus when toggled",
+    async (format) => {
+      const { root, controller } = setup();
+      await controller.initialize();
+      if (format !== "ZIP") await controller.navigate("ranking");
+      await click(
+        root,
+        controller,
+        `[data-action="export-${format === "ZIP" ? "list" : "report"}"]`,
+      );
+      if (format === "HTML") selectReportHtml(root);
+      const checkbox = root.querySelector<HTMLInputElement>("#export-include-images");
+      if (!checkbox) throw new Error("Missing export image option");
+      expect(checkbox.checked).toBe(false);
+      expect(
+        root.querySelector<HTMLLabelElement>('label[for="export-include-images"]')?.control,
+      ).toBe(checkbox);
+      const helpId = checkbox.getAttribute("aria-describedby");
+      expect(helpId).toBeTruthy();
+      expect(root.querySelector(`#${helpId}`)?.textContent).toBe(
+        "画像は既定では含みません。再配布できる権利のある画像だけを含めてください。",
+      );
+      checkbox.focus();
+      for (const checked of [true, false]) {
+        const current = root.querySelector<HTMLInputElement>("#export-include-images")!;
+        current.checked = checked;
+        current.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(controller.state.exportIncludeImages).toBe(checked);
+        const rendered = root.querySelector<HTMLInputElement>("#export-include-images");
+        expect(rendered?.checked).toBe(checked);
+        expect(document.activeElement).toBe(rendered);
+      }
+    },
+  );
+
   it("keeps report options, escaped errors, and focus retryable after cancellation and failure", async () => {
     const { root, controller, api, state } = setup();
     await controller.initialize();
