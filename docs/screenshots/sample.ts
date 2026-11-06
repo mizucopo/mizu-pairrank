@@ -7,9 +7,36 @@ const names = [
   "いちごタルト",
   "チーズケーキ",
   "プリン",
-  "抹茶パフェ",
+  "抹茶アイス",
   "アップルパイ",
   "チョコアイス",
+];
+const images = [
+  {
+    path: "/docs/screenshots/assets/strawberry-tart.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Strawberry_tart,_June_2025_UK.jpg",
+  },
+  {
+    path: "/docs/screenshots/assets/cheesecake.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:New_york_cheesecake_with_strawberries.jpg",
+  },
+  {
+    path: "/docs/screenshots/assets/pudding.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Putchin_Pudding_001.jpg",
+  },
+  {
+    path: "/docs/screenshots/assets/matcha-ice-cream.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Handmade_Matcha_ice_cream_-_Rawlab.jpg",
+  },
+  {
+    path: "/docs/screenshots/assets/apple-pie.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Fruit_Pie.jpg",
+  },
+  {
+    path: "/docs/screenshots/assets/chocolate-ice-cream.jpg",
+    sourceUrl:
+      "https://commons.wikimedia.org/wiki/File:Dark_chocolate_chip_ice_cream_cone_-_August_2025_-_Sarah_Stierch_(cropped).jpg",
+  },
 ];
 const list: ListState = {
   id: 1,
@@ -20,7 +47,7 @@ const list: ListState = {
     id: index + 1,
     listId: 1,
     name,
-    image: null,
+    image: images[index]!,
     rating: { mu: 34 - index * 3, sigma: 3.5 },
     comparisonCount: 4,
     tagIds: [index < 2 || index === 4 ? 1 : 2],
