@@ -26,15 +26,15 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
-    "pdfmake": "0.3.12",
+    "pdfmake": "0.3.13",
     "unicode-segmenter": "0.17.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.4",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/pdfmake": "0.3.3",
     "happy-dom": "^21.0.4",
-    "oxlint": "^1.89.0",
+    "oxlint": "^1.90.0",
     "oxlint-tsgolint": "^7.0.2005",
     "pdf-lib": "1.17.1",
     "prettier": "^3.9.10",

@@ -279,12 +279,19 @@ describe("saved PDF output", () => {
       state.name = title;
       state.tags[0]!.name = tag;
       state.items[0]!.name = name;
-      const createPdf = vi.spyOn(pdfMake, "createPdf");
+      const originalCreatePdf = pdfMake.createPdf.bind(pdfMake);
+      let layoutStream: Promise<unknown> | undefined;
+      const createPdf = vi.spyOn(pdfMake, "createPdf").mockImplementation((...args) => {
+        const output = originalCreatePdf(...args);
+        // Capture layout before getBuffer consumes the stream. pdfmake 0.3.13
+        // rejects getStream after the PDF has been serialized.
+        layoutStream = output.getStream();
+        return output;
+      });
       try {
         for (const view of ["ranking", "tier"] as const) {
           const pdf = await PDFDocument.load(await reportPdf(createReport(state, view, [10])));
-          const output = createPdf.mock.results[createPdf.mock.results.length - 1]!.value;
-          const stream = (await output.getStream()) as unknown as LayoutStream;
+          const stream = (await layoutStream) as LayoutStream;
           const lines = stream["_pdfMakePages"].flatMap((page) =>
             page.items
               .filter(({ type }) => type === "line")
