@@ -1,3 +1,4 @@
+import { getLocale, t } from "./i18n.js";
 import { escapeHtml } from "./html.js";
 import { matchesSelectedTags } from "./tag-filter.js";
 import { tierRows } from "./tier.js";
@@ -89,44 +90,44 @@ function picture(entry: ReportEntry): string {
 }
 
 function rankingHtml(report: Report): string {
-  return `<table class="ranking"><caption>あなたのランキング</caption><colgroup><col class="rank" /><col class="image" /><col /><col class="rating" /><col class="rating" /><col class="count" /></colgroup><thead><tr><th scope="col">順位</th><th scope="col">画像</th><th scope="col">項目</th><th scope="col">評価</th><th scope="col">σ</th><th scope="col">比較</th></tr></thead><tbody>${report.entries
+  return `<table class="ranking"><caption>${e(t("あなたのランキング"))}</caption><colgroup><col class="rank" /><col class="image" /><col /><col class="rating" /><col class="rating" /><col class="count" /></colgroup><thead><tr><th scope="col">${e(t("順位"))}</th><th scope="col">${e(t("画像"))}</th><th scope="col">${e(t("項目"))}</th><th scope="col">${e(t("評価"))}</th><th scope="col">σ</th><th scope="col">${e(t("比較"))}</th></tr></thead><tbody>${report.entries
     .map(
       (entry) =>
-        `<tr><th scope="row">${entry.rank}</th><td>${picture(entry)}</td><td class="name">${e(entry.name)}</td><td>${fixed(entry.mu)}</td><td>${fixed(entry.sigma)}</td><td>${entry.comparisonCount} 回</td></tr>`,
+        `<tr><th scope="row">${entry.rank}</th><td>${picture(entry)}</td><td class="name">${e(entry.name)}</td><td>${fixed(entry.mu)}</td><td>${fixed(entry.sigma)}</td><td>${e(t("{count} 回", { count: entry.comparisonCount }))}</td></tr>`,
     )
     .join(
       "",
-    )}</tbody></table><p class="note">推定評価の高い順。評価が同じ場合は登録順です。タグ別の順位は表示項目で振り直しています。</p>`;
+    )}</tbody></table><p class="note">${e(t("推定評価の高い順。評価が同じ場合は登録順です。タグ別の順位は表示項目で振り直しています。"))}</p>`;
 }
 
 function tierHtml(report: Report): string {
-  return `<h2>あなたの Tier 表</h2><div class="tiers">${report.tiers
+  return `<h2>${e(t("あなたの Tier 表"))}</h2><div class="tiers">${report.tiers
     .map(
       ({ label, entries }) =>
         `<section class="tier"><h3 style="background:${tierPalette[label].background};color:${tierPalette[label].color}">${label}</h3>${
           entries.length
             ? `<ol class="tier-items">${entries.map((entry) => `<li>${picture(entry)}<span class="name">${e(entry.name)}</span></li>`).join("")}</ol>`
-            : '<p class="tier-empty">項目なし</p>'
+            : `<p class="tier-empty">${e(t("項目なし"))}</p>`
         }</section>`,
     )
     .join(
       "",
-    )}</div><p class="note">リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。全項目が同じ評価のときは C に表示します。</p>`;
+    )}</div><p class="note">${e(t("リスト全体の評価の最高値から最低値までを5等分。各 Tier は左ほど上位です。全項目が同じ評価のときは C に表示します。"))}</p>`;
 }
 
 export function reportHtml(report: Report): string {
-  const title = report.view === "ranking" ? "ランキング" : "Tier 表";
+  const title = t(report.view === "ranking" ? "ランキング" : "Tier 表");
   const tags = report.selectedTagNames.length
-    ? `<p class="tags">選択したタグ: ${report.selectedTagNames.map(e).join(" / ")}（すべて一致）</p>`
+    ? `<p class="tags">${e(t("選択したタグ: {tags}（すべて一致）", { tags: report.selectedTagNames.join(" / ") }))}</p>`
     : "";
   let content: string;
   if (!report.matchingCount) {
-    content = `<h2>あなたの${title}</h2><p class="empty">${report.selectedTagNames.length ? "選択したタグをすべて持つ項目はありません。" : "項目はありません。"}</p>`;
+    content = `<h2>${e(t(report.view === "ranking" ? "あなたのランキング" : "あなたの Tier 表"))}</h2><p class="empty">${e(t(report.selectedTagNames.length ? "選択したタグをすべて持つ項目はありません。" : "項目はありません。"))}</p>`;
   } else {
     content = report.view === "ranking" ? rankingHtml(report) : tierHtml(report);
   }
   return `<!doctype html>
-<html lang="ja">
+<html lang="${getLocale()}">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -136,7 +137,7 @@ export function reportHtml(report: Report): string {
 *{box-sizing:border-box}body{margin:0;background:#faf9f5;color:#283126;font:14px/1.6 system-ui,sans-serif}main{max-width:1100px;margin:0 auto;padding:32px}h1{font-size:28px;line-height:1.4;margin:0 0 8px;overflow-wrap:anywhere;white-space:pre-wrap}h2,caption{font-size:20px;font-weight:600;text-align:left;margin:24px 0 12px}.summary,.tags,.note,.tier-empty{color:#67705f}.tags,.name{overflow-wrap:anywhere;white-space:pre-wrap}.note{font-size:12px}table{width:100%;border-collapse:collapse;table-layout:fixed;background:#fff}th,td{padding:10px 8px;border-bottom:1px solid #e0e4db;text-align:left;vertical-align:middle}thead th{background:#eef1e9}.rank{width:52px}.image{width:72px}.rating{width:70px}.count{width:76px}.item-image{display:block;width:52px;height:52px;object-fit:contain;background:#f0f1ed;border-radius:6px}.placeholder{display:grid;place-items:center;color:#899181}.tier{display:grid;grid-template-columns:58px minmax(0,1fr);border:1px solid #e0e4db;background:white}.tier+.tier{border-top:0}.tier h3{margin:0;padding:16px 4px;text-align:center;display:grid;place-items:center;font-size:20px}.tier-items{margin:0;padding:12px;list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(115px,1fr));gap:12px}.tier-items li{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;min-width:0}.tier-empty{padding:12px}.empty{padding:20px;background:white}@media(max-width:600px){main{padding:16px}.rank{width:40px}.image{width:52px}.rating{width:54px}.count{width:52px}th,td{padding:6px 4px;font-size:12px}.item-image{width:40px;height:40px}}@media print{body{background:white}main{max-width:none;padding:0}thead{display:table-header-group}.tier-items li{break-inside:avoid}img{break-inside:avoid}}
 </style>
 </head>
-<body><main><header><h1>${e(report.title)}</h1><p class="summary">${report.itemCount} 項目 · ${report.comparisonCount} 回の比較</p>${tags}<p class="summary">表示: ${report.matchingCount} 項目</p></header>${content}<p class="note">評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。</p></main></body>
+<body><main><header><h1>${e(report.title)}</h1><p class="summary">${e(t("{count} 項目 · {comparisons} 回の比較", { count: report.itemCount, comparisons: report.comparisonCount }))}</p>${tags}<p class="summary">${e(t("表示: {count} 項目", { count: report.matchingCount }))}</p></header>${content}<p class="note">${e(t("評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。"))}</p></main></body>
 </html>`;
 }
 

@@ -1,3 +1,5 @@
+import { localizeBackendError } from "./backend-i18n.js";
+import { t } from "./i18n.js";
 import type {
   AppApi,
   ImageCandidate,
@@ -199,7 +201,7 @@ export class AppController {
     try {
       await action();
     } catch (error) {
-      this.state.error = errorMessage(error);
+      this.state.error = localizeBackendError(t(errorMessage(error)));
     } finally {
       this.state.busy = false;
       this.changed();
@@ -238,7 +240,7 @@ export class AppController {
       }
     }
     if (this.state.lists.length > 0) {
-      this.state.notice = "リストが変更されました。リストを選択するか、新しく作成してください。";
+      this.state.notice = t("リストが変更されました。リストを選択するか、新しく作成してください。");
     }
     return null;
   }
@@ -362,14 +364,14 @@ export class AppController {
         if (run.stopping) break;
         const outcome = await this.api.autoRegisterImage(list.id, itemId, provider);
         if (outcome !== "registered" && outcome !== "skipped" && outcome !== "unavailable")
-          throw new Error("画像登録の結果を確認できませんでした。");
+          throw new Error(t("画像登録の結果を確認できませんでした。"));
         run.done += 1;
         if (outcome === "registered") run.registered += 1;
         else run.skipped += 1;
         this.changed();
       }
     } catch (error) {
-      this.state.error = errorMessage(error);
+      this.state.error = localizeBackendError(t(errorMessage(error)));
     } finally {
       run.stopped = run.stopping && run.done < run.total;
       run.running = false;
@@ -381,12 +383,21 @@ export class AppController {
       } catch (error) {
         this.state.error = [
           this.state.error,
-          `リストを再取得できませんでした: ${errorMessage(error)}`,
+          t("リストを再取得できませんでした: {error}", {
+            error: localizeBackendError(t(errorMessage(error))),
+          }),
         ]
           .filter(Boolean)
           .join(" ");
       }
-      this.state.notice = `画像の一括登録${run.stopped ? "を停止" : this.state.error ? "が中断" : "が完了"}しました。${run.done} / ${run.total} 件を処理し、${run.registered} 件を登録、${run.skipped} 件を見送りました。`;
+      this.state.notice = t(
+        run.stopped
+          ? "画像の一括登録を停止しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。"
+          : this.state.error
+            ? "画像の一括登録が中断しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。"
+            : "画像の一括登録が完了しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。",
+        { done: run.done, total: run.total, registered: run.registered, skipped: run.skipped },
+      );
       this.state.busy = false;
       this.changed();
     }
@@ -609,9 +620,9 @@ export class AppController {
       return;
     }
     await this.perform(async () => {
-      if (!name) throw new Error("タグ名を入力してください。");
+      if (!name) throw new Error(t("タグ名を入力してください。"));
       if (Array.from(name).length > tagNameMaxLength)
-        throw new Error(`タグ名は${tagNameMaxLength}文字以内にしてください。`);
+        throw new Error(t("タグ名は{max}文字以内にしてください。", { max: tagNameMaxLength }));
       let result: ListState;
       if (editingId === null) {
         result = await this.api.createTag(list.id, name, modal.itemId).catch((error: unknown) => {
@@ -750,10 +761,15 @@ export class AppController {
       const bytes =
         format === "html" ? new TextEncoder().encode(reportHtml(report)) : await reportPdf(report);
       if (bytes.length > 50 * 1024 * 1024)
-        throw new Error("出力する表は 50 MiB 以内にしてください。画像を含めずに再試行できます。");
+        throw new Error(
+          t("出力する表は 50 MiB 以内にしてください。画像を含めずに再試行できます。"),
+        );
       if (!(await this.api.saveReport(format, bytes, modal.view))) return;
       this.state.modal = null;
-      this.state.notice = `${modal.view === "ranking" ? "ランキング" : "Tier 表"}を ${format.toUpperCase()} で出力しました。`;
+      this.state.notice = t("{view}を {format} で出力しました。", {
+        view: t(modal.view === "ranking" ? "ランキング" : "Tier 表"),
+        format: format.toUpperCase(),
+      });
     });
   }
 
@@ -767,7 +783,7 @@ export class AppController {
         .catch((error: unknown) => this.handleListError(list.id, error));
       if (!saved) return;
       this.state.modal = null;
-      this.state.notice = "リストをエクスポートしました。";
+      this.state.notice = t("リストをエクスポートしました。");
     });
   }
 
@@ -781,14 +797,19 @@ export class AppController {
       this.state.drafts.items = "";
       this.state.drafts.query = "";
       this.state.view = "items";
-      this.state.notice = "新しいリストとしてインポートしました。";
+      this.state.notice = t("新しいリストとしてインポートしました。");
       this.acceptCommittedList(imported);
       try {
         await this.refreshListSummaries(imported.id);
       } catch (error) {
-        throw new Error(`インポート後のリスト一覧を更新できませんでした: ${errorMessage(error)}`, {
-          cause: error,
-        });
+        throw new Error(
+          t("インポート後のリスト一覧を更新できませんでした: {error}", {
+            error: localizeBackendError(t(errorMessage(error))),
+          }),
+          {
+            cause: error,
+          },
+        );
       }
     });
   }
@@ -811,7 +832,7 @@ export class AppController {
       return;
     }
     await this.perform(async () => {
-      if (!name) throw new Error("名前を入力してください。");
+      if (!name) throw new Error(t("名前を入力してください。"));
       let result: ListState;
       if (modal.kind === "create-list") {
         result = await this.api.createList(name);
@@ -866,13 +887,13 @@ export class AppController {
       .filter(Boolean);
     if (!list) return;
     await this.perform(async () => {
-      if (names.length === 0) throw new Error("項目名を入力してください。");
+      if (names.length === 0) throw new Error(t("項目名を入力してください。"));
       const result = await this.api
         .addItems(list.id, names)
         .catch((error: unknown) => this.handleListError(list.id, error));
       this.state.drafts.items = "";
       await this.acceptList(result);
-      this.state.notice = `${names.length}件の項目を追加しました。`;
+      this.state.notice = t("{count}件の項目を追加しました。", { count: names.length });
     });
   }
 
@@ -887,7 +908,7 @@ export class AppController {
       this.acceptCommittedList(reset);
       this.state.modal = null;
       this.state.view = "ranking";
-      this.state.notice = "比較をリセットしました。「比較する」からやり直せます。";
+      this.state.notice = t("比較をリセットしました。「比較する」からやり直せます。");
     });
   }
 
@@ -924,7 +945,7 @@ export class AppController {
         this.state.view = pair || this.state.comparisonPaused ? "compare" : "items";
         return;
       }
-      throw new Error(comparisonRetryMessage);
+      throw new Error(t(comparisonRetryMessage));
     });
   }
 
@@ -951,13 +972,13 @@ export class AppController {
         .catch((error: unknown) => {
           if (errorMessage(error) === staleComparisonMessage) {
             this.state.pair = null;
-            throw new Error(comparisonRetryMessage, { cause: error });
+            throw new Error(t(comparisonRetryMessage), { cause: error });
           }
           return this.handleListError(pair.listId, error);
         });
       if (next && next.revision !== pair.revision) {
         this.state.pair = null;
-        throw new Error(comparisonRetryMessage);
+        throw new Error(t(comparisonRetryMessage));
       }
       this.skippedPairs = skipped;
       this.state.pair = next;
@@ -1040,7 +1061,7 @@ export class AppController {
         if (errorMessage(error) === staleComparisonMessage) {
           this.clearUndoAnswer();
           this.state.pair = null;
-          throw new Error(comparisonRetryMessage, { cause: error });
+          throw new Error(t(comparisonRetryMessage), { cause: error });
         }
         return this.handleListError(pair.listId, error);
       }
@@ -1050,7 +1071,7 @@ export class AppController {
       this.state.canUndoAnswer = true;
       if (result.convergence.converged) {
         this.state.view = "ranking";
-        this.state.notice = "順位ほぼ確定。比較を続けることもできます。";
+        this.state.notice = t("順位ほぼ確定。比較を続けることもできます。");
       }
       await this.refreshListSummaries(result.id);
       if (!result.convergence.converged) {
@@ -1061,8 +1082,8 @@ export class AppController {
             result.revision,
           )
           .catch((error: unknown) => this.handleListError(result.id, error));
-        if (next && next.revision !== result.revision) throw new Error(comparisonRetryMessage);
-        if (!next && !this.skippedPairs.length) throw new Error(comparisonRetryMessage);
+        if (next && next.revision !== result.revision) throw new Error(t(comparisonRetryMessage));
+        if (!next && !this.skippedPairs.length) throw new Error(t(comparisonRetryMessage));
         this.state.pair = next;
         this.state.comparisonPaused = !next;
       }
@@ -1096,10 +1117,10 @@ export class AppController {
       this.skippedPairs = answer.skippedPairs;
       const a = restored.items.find((item) => item.id === answer.pair.a.id);
       const b = restored.items.find((item) => item.id === answer.pair.b.id);
-      if (!a || !b) throw new Error(comparisonRetryMessage);
+      if (!a || !b) throw new Error(t(comparisonRetryMessage));
       this.state.pair = { listId: restored.id, revision: restored.revision, a, b };
       this.state.view = "compare";
-      this.state.notice = "直前の回答を取り消しました。同じペアにもう一度回答できます。";
+      this.state.notice = t("直前の回答を取り消しました。同じペアにもう一度回答できます。");
       await this.refreshListSummaries(restored.id);
     });
   }
@@ -1108,15 +1129,15 @@ export class AppController {
     const query = this.state.drafts.query.trim();
     if (this.state.busy || this.state.modal?.kind !== "image") return;
     if (!query) {
-      this.state.error = "検索語は1〜400文字、50語以内で入力してください。";
+      this.state.error = t("検索語は1〜400文字、50語以内で入力してください。");
       this.changed();
       return;
     }
     if (!this.availableBulkProviders().includes(this.state.provider)) {
       this.state.error =
         this.state.provider === "openai"
-          ? "保存済みの接続状態を確認するか、検索設定で取得方法と認証を設定してください。"
-          : "保存済みキーを確認するか、検索設定でAPIキーを登録してください。";
+          ? t("保存済みの接続状態を確認するか、検索設定で取得方法と認証を設定してください。")
+          : t("保存済みキーを確認するか、検索設定でAPIキーを登録してください。");
       this.changed();
       return;
     }
@@ -1155,7 +1176,7 @@ export class AppController {
       if (this.readRequest === request) accept(result);
     } catch (error) {
       if (this.readRequest === request) {
-        this.state.error = errorMessage(error);
+        this.state.error = localizeBackendError(t(errorMessage(error)));
       }
     } finally {
       // A dismissed read must not update a new screen or release a later operation.
@@ -1189,10 +1210,10 @@ export class AppController {
     const field = `${provider}Key` as const;
     const key = remove ? "" : this.state.drafts[field].trim();
     await this.perform(async () => {
-      if (!remove && !key) throw new Error("APIキーの形式が正しくありません。");
+      if (!remove && !key) throw new Error(t("APIキーの形式が正しくありません。"));
       await this.api.setApiKey(provider, key);
       this.state.drafts[field] = "";
-      this.state.notice = remove ? "APIキーを削除しました。" : "APIキーを保存しました。";
+      this.state.notice = remove ? t("APIキーを削除しました。") : t("APIキーを保存しました。");
       const acknowledgesSearch =
         provider !== "openai" || this.state.settings?.openaiAuthMode !== "chatgpt";
       const configured = configuredField[provider];
@@ -1219,7 +1240,7 @@ export class AppController {
     const model = this.state.drafts.openaiModel.trim();
     const authMode = this.state.openaiAuthMode;
     await this.perform(async () => {
-      if (!model) throw new Error("OpenAIのモデルIDを入力してください。");
+      if (!model) throw new Error(t("OpenAIのモデルIDを入力してください。"));
       await this.api.saveOpenAiSettings(model, authMode);
       const previous = this.state.settings;
       const settings = {
@@ -1238,7 +1259,7 @@ export class AppController {
       }
       this.state.settings = settings;
       this.state.drafts.openaiModel = model;
-      this.state.notice = "OpenAIの取得方法とモデルIDを保存しました。次の検索に適用されます。";
+      this.state.notice = t("OpenAIの取得方法とモデルIDを保存しました。次の検索に適用されます。");
     });
   }
 
@@ -1283,7 +1304,9 @@ export class AppController {
           return await this.readSettings(() => this.api.openAiModels());
         } catch (error) {
           throw new Error(
-            `モデル一覧を取得できませんでした: ${errorMessage(error)} モデルIDは直接入力して保存できます。`,
+            t("モデル一覧を取得できませんでした: {error} モデルIDは直接入力して保存できます。", {
+              error: localizeBackendError(t(errorMessage(error))),
+            }),
             { cause: error },
           );
         }
@@ -1302,10 +1325,10 @@ export class AppController {
       try {
         await this.api.connectChatGpt(newAccount);
       } catch (error) {
-        failure = errorMessage(error);
+        failure = localizeBackendError(t(errorMessage(error)));
       }
       await this.confirmChatGptStatus(failure);
-      this.state.notice = "ChatGPTの接続状態を更新しました。";
+      this.state.notice = t("ChatGPTの接続状態を更新しました。");
     });
   }
 
@@ -1323,10 +1346,10 @@ export class AppController {
       try {
         await this.api.selectChatGptProfile(profileId);
       } catch (error) {
-        failure = errorMessage(error);
+        failure = localizeBackendError(t(errorMessage(error)));
       }
       await this.confirmChatGptStatus(failure);
-      this.state.notice = "保存済みのChatGPTアカウントを選択しました。";
+      this.state.notice = t("保存済みのChatGPTアカウントを選択しました。");
     });
   }
 
@@ -1338,7 +1361,11 @@ export class AppController {
       if (settings.errors?.openai !== undefined) {
         failure = [
           failure,
-          `接続状態を再確認できませんでした: ${settings.errors.openai || "資格情報を読み取れませんでした。"}`,
+          t("接続状態を再確認できませんでした: {error}", {
+            error: localizeBackendError(
+              t(settings.errors.openai || "資格情報を読み取れませんでした。"),
+            ),
+          }),
         ]
           .filter(Boolean)
           .join(" ");
@@ -1354,7 +1381,12 @@ export class AppController {
       this.state.checkedProviders = this.state.checkedProviders.filter(
         (provider) => provider !== "openai",
       );
-      failure = [failure, `接続状態を再確認できませんでした: ${message}`].filter(Boolean).join(" ");
+      failure = [
+        failure,
+        t("接続状態を再確認できませんでした: {error}", { error: localizeBackendError(t(message)) }),
+      ]
+        .filter(Boolean)
+        .join(" ");
     }
     if (failure !== null) throw new Error(failure);
   }
@@ -1367,7 +1399,7 @@ export class AppController {
       try {
         await this.api.disconnectChatGpt();
       } catch (error) {
-        failure = errorMessage(error);
+        failure = localizeBackendError(t(errorMessage(error)));
       }
       if (this.state.settings) {
         const activeProfile = this.state.settings.chatgptActiveProfile;
@@ -1394,12 +1426,17 @@ export class AppController {
             (provider) => provider !== "openai",
           );
         }
-        failure = [failure, `接続状態を再確認できませんでした: ${errorMessage(error)}`]
+        failure = [
+          failure,
+          t("接続状態を再確認できませんでした: {error}", {
+            error: localizeBackendError(t(errorMessage(error))),
+          }),
+        ]
           .filter(Boolean)
           .join(" ");
       }
       if (failure !== null) throw new Error(failure);
-      this.state.notice = "ChatGPTとの接続を解除しました。";
+      this.state.notice = t("ChatGPTとの接続を解除しました。");
     });
   }
 

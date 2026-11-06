@@ -1,5 +1,13 @@
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import { api } from "./lib/api.js";
+import {
+  getLanguagePreference,
+  getLocale,
+  initializeLanguage,
+  isLanguagePreference,
+  setLanguagePreference,
+  t,
+} from "./lib/i18n.js";
 import { AppController, answers } from "./lib/controller.js";
 import type { AppState, Modal } from "./lib/controller.js";
 import type { AppApi, SearchProvider } from "./lib/types.js";
@@ -24,6 +32,7 @@ export function mountApp(
   backend: AppApi,
   assetUrl = convertFileSrc,
 ): AppController {
+  initializeLanguage();
   root.tabIndex = -1;
   const controller = new AppController(backend, render);
   type ButtonFocus = {
@@ -98,6 +107,7 @@ export function mountApp(
     await controller.openModal(modal);
   }
   function render(): void {
+    document.documentElement.lang = getLocale();
     const lists = root.querySelector<HTMLElement>(".lists");
     const listScroll = { top: lists?.scrollTop ?? 0, left: lists?.scrollLeft ?? 0 };
     const tierScroll = new Map(
@@ -120,6 +130,7 @@ export function mountApp(
       pendingFieldFocus = {
         key: focusKey,
         listId: [
+          "app-language",
           "braveKey",
           "ollamaKey",
           "openaiKey",
@@ -146,6 +157,8 @@ export function mountApp(
           : "asset",
       ),
     );
+    const languageSelect = root.querySelector<HTMLSelectElement>("#app-language");
+    if (languageSelect) languageSelect.value = getLanguagePreference();
     renderedListId = controller.state.active?.id ?? null;
     renderedModal = controller.state.modal;
     const dialog = root.querySelector("dialog");
@@ -230,7 +243,15 @@ export function mountApp(
   });
   root.addEventListener("change", (event) => {
     const target = event.target;
-    if (target instanceof HTMLInputElement && target.id === "items-missing-images-only") {
+    if (target instanceof HTMLSelectElement && target.id === "app-language") {
+      if (controller.state.busy || !isLanguagePreference(target.value)) return;
+      const saved = setLanguagePreference(target.value);
+      controller.state.error = saved
+        ? ""
+        : t("言語設定を保存できませんでした。この起動中のみ適用されます。");
+      controller.state.notice = "";
+      render();
+    } else if (target instanceof HTMLInputElement && target.id === "items-missing-images-only") {
       controller.setItemFilters(controller.state.itemNameQuery, target.checked);
     } else if (target instanceof HTMLSelectElement && target.id === "search-provider") {
       if (controller.state.busy) return;
@@ -514,12 +535,13 @@ export function mountApp(
   render();
   return controller;
 }
+initializeLanguage();
+document.documentElement.lang = getLocale();
 const root = document.querySelector<HTMLElement>("#app");
 if (root) {
   if (isTauri()) {
     const controller = mountApp(root, api);
     void controller.initialize();
   } else
-    root.innerHTML =
-      '<main class="startup"><h1>pairrank</h1><p>デスクトップアプリで起動してください。</p><code>npm run tauri dev</code></main>';
+    root.innerHTML = `<main class="startup"><h1>pairrank</h1><p>${t("デスクトップアプリで起動してください。")}</p><code>npm run tauri dev</code></main>`;
 }

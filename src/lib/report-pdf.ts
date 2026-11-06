@@ -1,3 +1,4 @@
+import { t } from "./i18n.js";
 import pdfMake from "pdfmake/build/pdfmake";
 import type { Content, TableCell, TDocumentDefinitions } from "pdfmake/interfaces";
 import { splitGraphemes } from "unicode-segmenter/grapheme";
@@ -67,7 +68,9 @@ function textRuns(text: string): TextRun[] {
       font = emojiName;
     } else {
       throw new Error(
-        `PDFで表示できない文字があります: ${segment}。HTML形式でエクスポートしてください。`,
+        t("PDFで表示できない文字があります: {character}。HTML形式でエクスポートしてください。", {
+          character: segment,
+        }),
       );
     }
     // pdfmake's break-all and emergency wrapping split UTF-16 code units.
@@ -98,13 +101,13 @@ function image(entry: ReportEntry): Content {
 
 function ranking(report: Report): Content[] {
   return [
-    { text: "あなたのランキング", style: "heading" },
+    { text: t("あなたのランキング"), style: "heading" },
     {
       table: {
         headerRows: 1,
         widths: [26, 46, "*", 42, 35, 39],
         body: [
-          ["順位", "画像", "項目", "評価", "σ", "比較"].map((text) => ({
+          [t("順位"), t("画像"), t("項目"), t("評価"), "σ", t("比較")].map((text) => ({
             text,
             fillColor: "#eef1e9",
           })),
@@ -114,14 +117,16 @@ function ranking(report: Report): Content[] {
             { text: textRuns(entry.name) },
             { text: entry.mu.toFixed(2) },
             { text: entry.sigma.toFixed(2) },
-            { text: `${entry.comparisonCount} 回` },
+            { text: t("{count} 回", { count: entry.comparisonCount }) },
           ]),
         ],
       },
       layout: "lightHorizontalLines",
     },
     {
-      text: "推定評価の高い順。評価が同じ場合は登録順です。タグ別の順位は表示項目で振り直しています。",
+      text: t(
+        "推定評価の高い順。評価が同じ場合は登録順です。タグ別の順位は表示項目で振り直しています。",
+      ),
       style: "note",
     },
   ];
@@ -142,7 +147,7 @@ function tiers(report: Report): Content[] {
     if (!tier.entries.length) {
       body.push([
         label(),
-        { text: "項目なし", colSpan: cardsPerRow, color: "#67705f" },
+        { text: t("項目なし"), colSpan: cardsPerRow, color: "#67705f" },
         {},
         {},
         {},
@@ -181,10 +186,12 @@ function tiers(report: Report): Content[] {
     });
   }
   return [
-    { text: "あなたの Tier 表", style: "heading" },
+    { text: t("あなたの Tier 表"), style: "heading" },
     ...tables,
     {
-      text: "リスト全体の評価の最高値から最低値までを5等分。全項目が同じ評価のときは C に表示します。",
+      text: t(
+        "リスト全体の評価の最高値から最低値までを5等分。全項目が同じ評価のときは C に表示します。",
+      ),
       style: "note",
     },
   ];
@@ -193,16 +200,24 @@ function tiers(report: Report): Content[] {
 export async function renderPdf(report: Report): Promise<Uint8Array> {
   const content: Content[] = [
     { text: textRuns(report.title), fontSize: 20, margin: [0, 0, 0, 8] },
-    { text: `${report.itemCount} 項目 · ${report.comparisonCount} 回の比較`, color: "#67705f" },
+    {
+      text: t("{count} 項目 · {comparisons} 回の比較", {
+        count: report.itemCount,
+        comparisons: report.comparisonCount,
+      }),
+      color: "#67705f",
+    },
   ];
   if (report.selectedTagNames.length) {
     content.push({
-      text: textRuns(`選択したタグ: ${report.selectedTagNames.join(" / ")}（すべて一致）`),
+      text: textRuns(
+        t("選択したタグ: {tags}（すべて一致）", { tags: report.selectedTagNames.join(" / ") }),
+      ),
       margin: [0, 4, 0, 0],
     });
   }
   content.push({
-    text: `表示: ${report.matchingCount} 項目`,
+    text: t("表示: {count} 項目", { count: report.matchingCount }),
     margin: [0, 4, 0, 8],
     color: "#67705f",
   });
@@ -211,17 +226,19 @@ export async function renderPdf(report: Report): Promise<Uint8Array> {
   } else {
     content.push({
       text: report.selectedTagNames.length
-        ? "選択したタグをすべて持つ項目はありません。"
-        : "項目はありません。",
+        ? t("選択したタグをすべて持つ項目はありません。")
+        : t("項目はありません。"),
       margin: [0, 12, 0, 12],
     });
   }
   content.push({
-    text: "評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。",
+    text: t("評価と「順位ほぼ確定」の判定は、タグの表示に関係なくリスト全体で行います。"),
     style: "note",
   });
   const definition: TDocumentDefinitions = {
-    info: { title: `${report.title} — ${report.view === "ranking" ? "ランキング" : "Tier 表"}` },
+    info: {
+      title: `${report.title} — ${report.view === "ranking" ? t("ランキング") : t("Tier 表")}`,
+    },
     pageSize: "A4",
     pageMargins: [32, 32, 32, 38],
     defaultStyle: { font: fontName, fontSize: 10, color: "#283126" },

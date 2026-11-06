@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountApp } from "../src/main.js";
+import { initializeLanguage, languageStorageKey } from "../src/lib/i18n.js";
 import type { AppController } from "../src/lib/controller.js";
 import type {
   AppApi,
@@ -160,6 +161,8 @@ async function click(
 }
 
 afterEach(() => {
+  localStorage.clear();
+  initializeLanguage();
   document.body.replaceChildren();
 });
 
@@ -2063,7 +2066,7 @@ describe("desktop app interaction", () => {
       await controller.initialize();
       await controller.navigate("settings");
       await click(root, controller, '[data-action="check-search-settings"]');
-      const cards = [...root.querySelectorAll(".settings-card")];
+      const cards = [...root.querySelectorAll(".settings-grid .settings-card")];
       expect(cards[unreadable === "brave" ? 0 : 1]?.textContent).toContain("確認できません");
       const errorMessage = readError || "資格情報ストアから読み取れませんでした。";
       expect(cards[unreadable === "brave" ? 0 : 1]?.textContent).toContain(errorMessage);
@@ -3809,5 +3812,62 @@ describe("item display filters", () => {
     expect(controller.state.itemNameQuery).toBe("");
     expect(controller.state.itemsMissingImagesOnly).toBe(false);
     expect(names(root)).toHaveLength(2);
+  });
+});
+
+describe("application language", () => {
+  it("switches immediately, preserves data and drafts, retains focus, and persists on remount", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    controller.state.drafts.items = "入力中の名前";
+    await click(root, controller, '[data-view="settings"]');
+    const select = root.querySelector<HTMLSelectElement>("#app-language");
+    expect(select).not.toBeNull();
+    select!.focus();
+    select!.value = "en";
+    select!.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.documentElement.lang).toBe("en");
+    expect(root.querySelector("#app-language")).toBe(document.activeElement);
+    expect(localStorage.getItem(languageStorageKey)).toBe("en");
+    expect(controller.state.drafts.items).toBe("入力中の名前");
+    expect(controller.state.active).toEqual(state);
+    expect(api.renameList).not.toHaveBeenCalled();
+    await click(root, controller, '[data-action="select-list"]');
+    expect(root.textContent).toContain("好きな果物");
+    expect(root.textContent).toContain("りんご");
+    expect(root.textContent).not.toContain("比べたいものを追加");
+    root.remove();
+    const remounted = setup();
+    await remounted.controller.initialize();
+    expect(document.documentElement.lang).toBe("en");
+    await click(remounted.root, remounted.controller, '[data-view="settings"]');
+    const language = remounted.root.querySelector<HTMLSelectElement>("#app-language")!;
+    expect(language.value).toBe("en");
+    language.value = "ja";
+    language.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(document.documentElement.lang).toBe("ja");
+    expect(remounted.root.textContent).toContain("マイリスト");
+  });
+
+  it("leaves item-filter state and item mutations unchanged in English", async () => {
+    localStorage.setItem(languageStorageKey, "en");
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    const query = root.querySelector<HTMLInputElement>("#item-name-query")!;
+    query.value = "りんご";
+    query.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    expect(controller.state.itemNameQuery).toBe("りんご");
+    expect(root.querySelectorAll(".item-row")).toHaveLength(1);
+    await click(root, controller, '[data-action="rename-item"][data-id="10"]');
+    const name = root.querySelector<HTMLInputElement>('[data-draft="name"]')!;
+    name.value = "Apple <script>";
+    name.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    root
+      .querySelector<HTMLFormElement>('[data-form="save-name"]')!
+      .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle(controller);
+    expect(api.renameItem).toHaveBeenCalledWith(1, 10, "Apple <script>");
+    expect(controller.state.itemNameQuery).toBe("りんご");
+    expect(root.querySelector("script")).toBeNull();
   });
 });

@@ -265,7 +265,7 @@ async fn export_list(app: AppHandle, list_id: i64, include_images: bool) -> Resu
         picker
             .dialog()
             .file()
-            .add_filter("pairrank リスト", &["zip"])
+            .add_filter("pairrank リスト / Lists", &["zip"])
             .set_file_name("list.pairrank.zip")
             .blocking_save_file()
             .map(|file| file.into_path().map_err(|error| error.to_string()))
@@ -305,8 +305,8 @@ async fn save_report(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result
     tokio::task::spawn_blocking(move || {
         let extension = format.extension();
         let label = match format {
-            ReportFormat::Html => "HTML レポート",
-            ReportFormat::Pdf => "PDF レポート",
+            ReportFormat::Html => "HTML レポート / Report",
+            ReportFormat::Pdf => "PDF レポート / Report",
         };
         let Some(file) = app
             .dialog()
@@ -332,7 +332,7 @@ async fn import_list(app: AppHandle) -> Result<Option<ListState>, String> {
         picker
             .dialog()
             .file()
-            .add_filter("pairrank リスト", &["zip"])
+            .add_filter("pairrank リスト / Lists", &["zip"])
             .blocking_pick_file()
             .map(|file| file.into_path().map_err(|error| error.to_string()))
             .transpose()
@@ -643,7 +643,7 @@ async fn set_local_image(
             let Some(file) = dialog_app
                 .dialog()
                 .file()
-                .add_filter("画像", &["png", "jpg", "jpeg", "webp"])
+                .add_filter("画像 / Images", &["png", "jpg", "jpeg", "webp"])
                 .blocking_pick_file()
             else {
                 return Ok(None);
