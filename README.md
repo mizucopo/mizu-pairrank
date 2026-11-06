@@ -9,8 +9,8 @@
 
 [GitHub Releases](https://github.com/mizucopo/mizu-pairrank/releases) から、お使いのパソコンに合う ZIP をダウンロードして展開してください。
 
-- **Windows**: 通常は `windows-x64.zip`、ARM搭載PCは `windows-arm64.zip` を選び、展開したフォルダー内のアプリ（`.exe`）を起動します。
-- **macOS（Apple Silicon）**: `macos-arm64.zip` を選び、展開したアプリ（`.app`）を「アプリケーション」フォルダーに移して起動します。
+- **Windows**: 通常は `-windows-x64.zip` で終わる ZIP、ARM搭載PCは `-windows-arm64.zip` で終わる ZIP を選び、展開したフォルダー内のアプリ（`.exe`）を起動します。
+- **macOS（Apple Silicon）**: `-macos-arm64.zip` で終わる ZIP を選び、展開したアプリ（`.app`）を「アプリケーション」フォルダーに移して起動します。
 
 画像検索の設定は任意です。画像なしでも、手元の画像を登録しても使えます。
 
