@@ -19,8 +19,9 @@ mod windows;
 const VFS_NAME: &CStr = c"pairrank-directory";
 const LOCAL_PREFIX: &str = "/__pairrank_vfs/";
 const UNC_PREFIX: &str = "//pairrank-vfs/";
+// Native OS-call/ABI audit for this bundled build: docs/storage.md.
 const SQLITE_SOURCE: &str =
-    "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24";
+    "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76";
 
 struct Namespace {
     identity: same_file::Handle,
@@ -232,10 +233,17 @@ pub(crate) fn initialize() -> Result<(), String> {
             // SAFETY: SQLite's initialization and VFS registry APIs are process-wide;
             // this block runs once and publishes our VFS only after all checks/hooks.
             unsafe {
-                if ffi::sqlite3_initialize() != ffi::SQLITE_OK
-                    || CStr::from_ptr(ffi::sqlite3_sourceid()).to_bytes()
-                        != SQLITE_SOURCE.as_bytes()
-                    || ffi::sqlite3_threadsafe() == 0
+                if ffi::sqlite3_initialize() != ffi::SQLITE_OK {
+                    return Err(storage_error("SQLite initialization failed"));
+                }
+                let source = CStr::from_ptr(ffi::sqlite3_sourceid());
+                if source.to_bytes() != SQLITE_SOURCE.as_bytes() {
+                    return Err(storage_error(format!(
+                        "unsupported bundled SQLite source ID: expected {SQLITE_SOURCE}, found {}; audit native VFS compatibility using docs/storage.md",
+                        source.to_string_lossy()
+                    )));
+                }
+                if ffi::sqlite3_threadsafe() == 0
                     || ffi::sqlite3_compileoption_used(c"ENABLE_8_3_NAMES".as_ptr()) != 0
                     || ffi::sqlite3_compileoption_used(c"OMIT_WAL".as_ptr()) != 0
                 {
@@ -345,6 +353,13 @@ unsafe extern "C" fn open_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_sqlite_supports_native_storage() {
+        initialize().expect(
+            "audit bundled SQLite and native VFS hooks using docs/storage.md before accepting an update",
+        );
+    }
 
     #[test]
     fn reserved_names_fail_closed_and_expire_after_native_close() {

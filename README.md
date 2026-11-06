@@ -93,3 +93,5 @@ npm run check
 ```
 
 TypeScript 7・type-aware Oxlint・Prettier・Vitest・Viteビルドと、Rustのfmt・Clippy・テストを実行します。画像検索のテストはモックを利用し、実APIキーやOSの資格情報ストアにはアクセスしません。
+
+Rust依存の更新時も、テスト専用APIの互換性を含めて `npm run check` で確認し、PRのTauri Quality Checksと全OSのStorage Checksが成功したことを確認してください。特に0.xのminor更新ではAPI変更があり得るため、変更履歴と利用箇所を確認します。SQLトレースを使うテストは、登録・解除とエラー処理を `src-tauri/src/database.rs` の `set_profile_trace` に集約しています。

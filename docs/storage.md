@@ -30,6 +30,16 @@ Tauriの `document_dir()` で取得するOSのドキュメント内の `mizu-pai
 
 更新後は、差し替え先の内容・権限の保持、journal / WAL回復、複数接続・別プロセスのロックと接続終了を含む全テストをLinux・macOS ARM64・Windows x64 / ARM64で実行する。通常の回復とロックを維持し、hot journalを一律に拒否・削除しない。
 
+### SQLite 3.54.1の互換性確認
+
+PR #139の `rusqlite 0.40.2 → 0.41.1` / `libsqlite3-sys 0.38.2 → 0.39.1` では、同梱amalgamationがSQLite 3.53.2から3.54.1へ変わる。両クレートに含まれる `sqlite3/sqlite3.c` の `os_unix.c` / `os_win.c` と `build.rs` を比較し、次を確認した。
+
+- Unixの `open` / `close` / `stat` / `fstat` / `access` / `unlink` / `openDirectory` と任意の `lstat` / `fchmod` は、フック名・ABIを維持している。DB・journal・WAL・SHM・親ディレクトリの呼び出し経路も変わらない。変更は既存記述子のmmap領域再利用、一時ディレクトリの環境変数の読み取り、Linuxの匿名一時ファイルへの `O_TMPFILE` 利用であり、管理外の一時ファイルは従来どおり元のOS呼び出しへ渡す。
+- Windowsの `CreateFileW` / `DeleteFileW` / `GetFileAttributesW` / `GetFileAttributesExW` / `CloseHandle` は、フック名・ABIとDB・副ファイルの操作を維持している。システムコール表のインデックス変更は名前による検索に影響しない。追加のリモートボリューム判定は、ローカルの管理名ではドライブ文字がないためOS呼び出しに進まず、UNCの管理名では既存のUNC判定で完結する。
+- bundledビルドでの `SQLITE_ENABLE_MEMORY_MANAGEMENT` の削除は、利用しているVFS・ロック・WAL設定に影響せず、アプリも該当するメモリ解放APIを利用していない。
+
+このためOSアダプターの変更は不要と判断し、期待source IDを `2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76` に更新した。`bundled_sqlite_supports_native_storage` で同梱ビルドと必須フックの初期化を確認する。将来の更新でsource IDが変わった場合も自動追従せず、上記の調査と各OSの全テストを再実施する。
+
 ## 管理画像
 
 新規画像の `ImageAsset.path` はASCIIのUUIDファイル名とし、Rust側で保存先の `PathBuf` と結合する。専用の `pairrank-image` protocolで管理画像を配信し、Unixの保存先が非UTF-8でも表示・削除できる。既存DBの絶対UTF-8パスは書き換えず、従来のasset protocolによる表示と管理ディレクトリ内に限定した削除を維持する。

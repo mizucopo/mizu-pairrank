@@ -1242,6 +1242,47 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<(), 
 mod tests {
     use super::*;
 
+    fn set_profile_trace(
+        connection: &mut Connection,
+        callback: Option<fn(rusqlite::trace::TraceEvent<'_>)>,
+    ) {
+        let mask = if callback.is_some() {
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE
+        } else {
+            rusqlite::trace::TraceEventCodes::empty()
+        };
+        connection
+            .trace_v2(mask, callback)
+            .expect("must configure the test SQL trace");
+    }
+
+    #[test]
+    fn profile_trace_can_be_disabled_and_registered_again() {
+        thread_local! {
+            static PROFILE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        fn count_profile(event: rusqlite::trace::TraceEvent<'_>) {
+            if matches!(event, rusqlite::trace::TraceEvent::Profile(_, _)) {
+                PROFILE_COUNT.with(|count| count.set(count.get() + 1));
+            }
+        }
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        PROFILE_COUNT.set(0);
+        set_profile_trace(&mut connection, Some(count_profile));
+        connection.execute_batch("SELECT 1;").unwrap();
+        assert_eq!(PROFILE_COUNT.get(), 1);
+
+        set_profile_trace(&mut connection, None);
+        connection.execute_batch("SELECT 2;").unwrap();
+        assert_eq!(PROFILE_COUNT.get(), 1);
+
+        set_profile_trace(&mut connection, Some(count_profile));
+        connection.execute_batch("SELECT 3;").unwrap();
+        assert_eq!(PROFILE_COUNT.get(), 2);
+        set_profile_trace(&mut connection, None);
+    }
+
     const FUTURE_SCHEMA_SQL: &str = "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('saved by future app');";
 
     fn upgrade_to_future_schema(connection: &mut Connection) -> Result<(), String> {
@@ -1586,14 +1627,9 @@ mod tests {
             assert!(pending.borrow().is_none());
             *pending.borrow_mut() = Some(Box::new(action));
         });
-        database.connection.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
-            Some(after_version),
-        );
+        set_profile_trace(&mut database.connection, Some(after_version));
         let result = operation(database);
-        database
-            .connection
-            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        set_profile_trace(&mut database.connection, None);
         AFTER_SCHEMA_READ.with(|pending| pending.borrow_mut().take());
         result
     }
@@ -2510,12 +2546,9 @@ mod tests {
                 }));
             }));
         });
-        first.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
-            Some(after_version),
-        );
+        set_profile_trace(&mut first, Some(after_version));
         let migrated = migrate(&mut first, MIGRATIONS);
-        first.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        set_profile_trace(&mut first, None);
         MIGRATE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
         assert_eq!(*result.borrow(), Some(Ok(())));
         migrated.unwrap();
@@ -2566,12 +2599,9 @@ mod tests {
                 *completed.borrow_mut() = Some(migrate(&mut second, &migrations));
             }));
         });
-        first.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
-            Some(after_version),
-        );
+        set_profile_trace(&mut first, Some(after_version));
         let migrated = migrate(&mut first, MIGRATIONS);
-        first.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        set_profile_trace(&mut first, None);
         UPGRADE_AFTER_VERSION.with(|pending| pending.borrow_mut().take());
         assert_eq!(*result.borrow(), Some(Ok(())));
         assert!(migrated.unwrap_err().contains("バージョン 3"));
@@ -4040,7 +4070,7 @@ mod tests {
     }
 
     struct ConcurrentReadWrite<'a> {
-        connection: &'a Connection,
+        reader: &'a mut Database,
         result: std::rc::Rc<std::cell::RefCell<Option<Result<(), String>>>>,
     }
 
@@ -4056,14 +4086,13 @@ mod tests {
 
     impl Drop for ConcurrentReadWrite<'_> {
         fn drop(&mut self) {
-            self.connection
-                .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            set_profile_trace(&mut self.reader.connection, None);
             WRITE_AFTER_SELECT.with(|pending| pending.borrow_mut().take());
         }
     }
 
     fn write_after_first_select(
-        reader: &Database,
+        reader: &mut Database,
         write: impl FnOnce() -> Result<(), String> + 'static,
     ) -> ConcurrentReadWrite<'_> {
         fn after_select(event: rusqlite::trace::TraceEvent<'_>) {
@@ -4084,14 +4113,8 @@ mod tests {
                 *completed.borrow_mut() = Some(write());
             }));
         });
-        reader.connection.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
-            Some(after_select),
-        );
-        ConcurrentReadWrite {
-            connection: &reader.connection,
-            result,
-        }
+        set_profile_trace(&mut reader.connection, Some(after_select));
+        ConcurrentReadWrite { reader, result }
     }
 
     #[test]
@@ -4107,13 +4130,13 @@ mod tests {
         let mut writer = Database::open(&path).unwrap();
         let (list_id, revision) = (before.id, before.revision);
         let (a, b) = (before.items[0].id, before.items[1].id);
-        let concurrent = write_after_first_select(&reader, move || {
+        let concurrent = write_after_first_select(&mut reader, move || {
             writer
                 .answer(list_id, a, b, Preference::AWeak, revision)
                 .map(|_| ())
         });
 
-        let observed = reader.comparison_state(list_id).unwrap();
+        let observed = concurrent.reader.comparison_state(list_id).unwrap();
         concurrent.assert_committed();
         drop(concurrent);
         assert_eq!(
@@ -4142,10 +4165,10 @@ mod tests {
             .pragma_update(None, "journal_mode", "WAL")
             .unwrap();
         let writer = Database::open(&path).unwrap();
-        let concurrent = write_after_first_select(&reader, move || {
+        let concurrent = write_after_first_select(&mut reader, move || {
             writer.connection.execute_batch("BEGIN IMMEDIATE; UPDATE lists SET model_version = 99, name = 'Changed'; UPDATE items SET name = 'Changed'; COMMIT;").map_err(db_error)
         });
-        let observed = reader.get_list(before.id).unwrap();
+        let observed = concurrent.reader.get_list(before.id).unwrap();
         concurrent.assert_committed();
         drop(concurrent);
         assert_eq!(
@@ -4173,10 +4196,10 @@ mod tests {
             .pragma_update(None, "journal_mode", "WAL")
             .unwrap();
         let mut writer = Database::open(&path).unwrap();
-        let concurrent = write_after_first_select(&reader, move || {
+        let concurrent = write_after_first_select(&mut reader, move || {
             writer.delete_list(second.id).map(|change| change.value)
         });
-        let observed = reader.list_summaries();
+        let observed = concurrent.reader.list_summaries();
         concurrent.assert_committed();
         drop(concurrent);
         assert_eq!(serde_json::to_value(observed.unwrap()).unwrap(), before);
