@@ -215,12 +215,24 @@ export function mountApp(
       controller.state.tagDraft = target.value;
       return;
     }
+    if (target.id === "item-name-query") {
+      if (!(event instanceof InputEvent && event.isComposing))
+        controller.setItemFilters(target.value, controller.state.itemsMissingImagesOnly);
+      return;
+    }
     const field = target.dataset.draft;
     if (draftField(field)) controller.state.drafts[field] = target.value;
   });
+  root.addEventListener("compositionend", (event) => {
+    const target = event.target;
+    if (target instanceof HTMLInputElement && target.id === "item-name-query")
+      controller.setItemFilters(target.value, controller.state.itemsMissingImagesOnly);
+  });
   root.addEventListener("change", (event) => {
     const target = event.target;
-    if (target instanceof HTMLSelectElement && target.id === "search-provider") {
+    if (target instanceof HTMLInputElement && target.id === "items-missing-images-only") {
+      controller.setItemFilters(controller.state.itemNameQuery, target.checked);
+    } else if (target instanceof HTMLSelectElement && target.id === "search-provider") {
       if (controller.state.busy) return;
       const provider = searchProvider(target.value);
       if (!provider) return;
@@ -310,6 +322,9 @@ export function mountApp(
     const id = Number(button.dataset.id);
     const provider = searchProvider(button.dataset.provider);
     switch (button.dataset.action) {
+      case "clear-item-filters":
+        controller.setItemFilters("", false);
+        break;
       case "toggle-tag":
         controller.toggleTag(id);
         break;

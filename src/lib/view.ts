@@ -61,23 +61,30 @@ function itemsView(s: AppState, assetUrl: (path: string) => string): string {
   if (!list) return "";
   const missing = list.items.filter((item) => !item.image).length;
   const bulkDisabled = s.busy || !missing;
-  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div>${
+  const query = s.itemNameQuery.trim().toLocaleLowerCase();
+  const visible = list.items.filter(
+    (item) =>
+      item.name.toLocaleLowerCase().includes(query) && (!s.itemsMissingImagesOnly || !item.image),
+  );
+  return `<section><div class="section-heading"><div><h2>比べたいものを追加</h2><p class="muted">1行に1項目。画像は追加後に選べます。</p></div></div><form data-form="add-items" class="add-items"><label class="sr-only" for="item-names">項目名（改行で複数登録）</label><textarea id="item-names" data-draft="items" data-focus="items" rows="3" placeholder="気になるもの、お気に入りのもの…" required${disabled(s)}>${e(s.drafts.items)}</textarea><div><span class="muted">画像なしでも比較できます</span><button type="submit"${disabled(s)}>項目を追加</button></div></form><div class="section-heading"><div><h2>登録した項目 <span class="count">${list.items.length}</span></h2><p class="muted">画像未登録 ${missing} 件</p></div><div class="item-heading-actions"><button class="secondary" data-action="bulk-images"${bulkDisabled ? " disabled" : ""}>未登録画像を一括登録</button>${list.items.length >= 2 ? `<button class="secondary" data-view="compare"${disabled(s)}>比較を始める →</button>` : ""}</div></div><div class="item-filters"><label for="item-name-query">項目名で検索<input type="search" id="item-name-query" data-focus="item-name-query" value="${e(s.itemNameQuery)}" placeholder="名前の一部を入力"${disabled(s)} /></label><label class="item-filter-checkbox"><input type="checkbox" id="items-missing-images-only" data-focus="items-missing-images-only"${s.itemsMissingImagesOnly ? " checked" : ""}${disabled(s)} />画像未登録だけ表示</label><button type="button" class="secondary" data-action="clear-item-filters"${disabled(s)}>条件を解除</button><p class="muted" role="status">${visible.length} / ${list.items.length} 件表示</p></div>${
     list.items.length === 0
       ? '<div class="empty compact"><span class="empty-symbol">＋</span><h3>最初の2項目を追加しましょう</h3><p>どちらが好きかを答えると、少しずつ順位が見えてきます。</p></div>'
-      : `<div class="item-list">${[...list.items]
-          .sort((a, b) => a.id - b.id)
-          .map(
-            (item) =>
-              `<article class="item-row">${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較 ${item.comparisonCount === 0 ? '· <span class="new-badge">未評価</span>' : ""}</small>${
-                item.tagIds.length
-                  ? `<div class="tag-chips">${list.tags
-                      .filter((tag) => item.tagIds.includes(tag.id))
-                      .map((tag) => `<span class="tag-chip">${e(tag.name)}</span>`)
-                      .join("")}</div>`
-                  : ""
-              }</div><div class="item-actions"><button class="secondary small" data-action="image" data-id="${item.id}"${disabled(s)}>画像</button><button class="text-button small" data-action="tags" data-id="${item.id}" aria-label="${e(item.name)} のタグ"${disabled(s)}>タグ</button><button class="text-button small" data-action="rename-item" data-id="${item.id}"${disabled(s)}>名前</button><button class="text-button small danger-text" data-action="delete-item" data-id="${item.id}"${disabled(s)}>削除</button></div></article>`,
-          )
-          .join("")}</div>`
+      : visible.length === 0
+        ? '<div class="empty compact"><p>条件に一致する項目はありません。検索条件を変更してください。</p></div>'
+        : `<div class="item-list">${[...visible]
+            .sort((a, b) => a.id - b.id)
+            .map(
+              (item) =>
+                `<article class="item-row">${picture(item, assetUrl)}<div class="item-description"><h3>${e(item.name)}</h3><small>${item.comparisonCount} 回比較 ${item.comparisonCount === 0 ? '· <span class="new-badge">未評価</span>' : ""}</small>${
+                  item.tagIds.length
+                    ? `<div class="tag-chips">${list.tags
+                        .filter((tag) => item.tagIds.includes(tag.id))
+                        .map((tag) => `<span class="tag-chip">${e(tag.name)}</span>`)
+                        .join("")}</div>`
+                    : ""
+                }</div><div class="item-actions"><button class="secondary small" data-action="image" data-id="${item.id}"${disabled(s)}>画像</button><button class="text-button small" data-action="tags" data-id="${item.id}" aria-label="${e(item.name)} のタグ"${disabled(s)}>タグ</button><button class="text-button small" data-action="rename-item" data-id="${item.id}"${disabled(s)}>名前</button><button class="text-button small danger-text" data-action="delete-item" data-id="${item.id}"${disabled(s)}>削除</button></div></article>`,
+            )
+            .join("")}</div>`
   }</section><section class="tag-management"><div class="section-heading"><div><h2>タグ管理 <span class="count">${list.tags.length}</span></h2><p class="muted">タグはこのリストの項目に付けられます。項目には複数のタグを付けられます。</p></div><button class="secondary" data-action="manage-tags"${disabled(s)}>タグを管理</button></div>${list.tags.length ? `<div class="tag-summary">${list.tags.map((tag) => `<span class="tag-chip">${e(tag.name)} <small>${list.items.filter((item) => item.tagIds.includes(tag.id)).length} 件</small></span>`).join("")}</div>` : '<p class="muted">タグはまだありません。</p>'}</section>`;
 }
 function undoAnswerButton(s: AppState): string {
