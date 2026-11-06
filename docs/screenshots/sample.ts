@@ -18,7 +18,7 @@ const images = [
   },
   {
     path: "/docs/screenshots/assets/cheesecake.jpg",
-    sourceUrl: "https://commons.wikimedia.org/wiki/File:New_york_cheesecake_with_strawberries.jpg",
+    sourceUrl: "https://commons.wikimedia.org/wiki/File:Cheesecake001.jpg",
   },
   {
     path: "/docs/screenshots/assets/pudding.jpg",
