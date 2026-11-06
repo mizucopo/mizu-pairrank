@@ -3673,3 +3673,141 @@ describe("saved ChatGPT account interactions", () => {
     expect(api.connectChatGpt).not.toHaveBeenCalled();
   });
 });
+
+describe("item display filters", () => {
+  function query(root: HTMLElement, value: string): HTMLInputElement {
+    const input = root.querySelector<HTMLInputElement>("#item-name-query")!;
+    input.focus();
+    input.value = value;
+    input.setSelectionRange(value.length, value.length);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return root.querySelector<HTMLInputElement>("#item-name-query")!;
+  }
+  function missingOnly(root: HTMLElement): void {
+    const input = root.querySelector<HTMLInputElement>("#items-missing-images-only")!;
+    input.checked = true;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  function names(root: HTMLElement): string[] {
+    return [...root.querySelectorAll(".item-row h3")].map((node) => node.textContent!);
+  }
+
+  it("combines filters, preserves registration order, distinguishes empty results, and clears", async () => {
+    const { root, controller, state, api } = setup();
+    state.items[0]!.name = "Apple <red>";
+    state.items[1]!.name = "Apple green";
+    const imageState = withLocalImage(state);
+    imageState.items.reverse();
+    api.getList.mockResolvedValue(imageState);
+    await controller.initialize();
+    expect(names(root)).toEqual(["Apple <red>", "Apple green"]);
+    query(root, " APPLE ");
+    expect(names(root)).toHaveLength(2);
+    missingOnly(root);
+    expect(names(root)).toEqual(["Apple green"]);
+    query(root, "red");
+    expect(names(root)).toEqual([]);
+    expect(root.textContent).toContain("条件に一致する項目はありません");
+    expect(root.textContent).not.toContain("最初の2項目を追加しましょう");
+    query(root, "");
+    expect(names(root)).toEqual(["Apple green"]);
+    await click(root, controller, '[data-action="clear-item-filters"]');
+    expect(names(root)).toEqual(["Apple <red>", "Apple green"]);
+    imageState.items = [];
+    await controller.selectList(1);
+    expect(root.textContent).toContain("最初の2項目を追加しましょう");
+  });
+
+  it("keeps the search focused and caret positioned without replacing IME composition", async () => {
+    const { root, controller } = setup();
+    await controller.initialize();
+    const input = query(root, "り");
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(1);
+    input.value = "りん";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true }));
+    expect(root.querySelector("#item-name-query")).toBe(input);
+    expect(controller.state.itemNameQuery).toBe("り");
+    input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    expect(controller.state.itemNameQuery).toBe("りん");
+    expect(names(root)).toEqual(["りんご"]);
+    expect(document.activeElement).toBe(root.querySelector("#item-name-query"));
+    expect(root.querySelector<HTMLInputElement>("#item-name-query")!.selectionStart).toBe(2);
+  });
+
+  it("uses actual item IDs for rename, image registration, and deletion and reapplies filters", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    query(root, "かん");
+    await click(root, controller, '[data-action="rename-item"]');
+    expect(controller.state.modal).toEqual({ kind: "rename-item", itemId: 11 });
+    controller.state.drafts.name = "バナナ";
+    const renamed = {
+      ...state,
+      items: state.items.map((item) => (item.id === 11 ? { ...item, name: "バナナ" } : item)),
+    };
+    api.renameItem.mockResolvedValue(renamed);
+    await controller.saveName();
+    expect(api.renameItem).toHaveBeenCalledWith(1, 11, "バナナ");
+    expect(names(root)).toEqual([]);
+    query(root, "バナナ");
+    missingOnly(root);
+    const imaged = {
+      ...renamed,
+      items: renamed.items.map((item) =>
+        item.id === 11 ? { ...item, image: { path: "missing-file.png", sourceUrl: null } } : item,
+      ),
+    };
+    api.setLocalImage.mockResolvedValue(imaged);
+    await click(root, controller, '[data-action="image"]');
+    await click(root, controller, '[data-action="local-image"]');
+    expect(api.setLocalImage).toHaveBeenCalledWith(1, 11);
+    expect(names(root)).toEqual([]);
+    await click(root, controller, '[data-action="clear-item-filters"]');
+    query(root, "バナナ");
+    api.deleteItem.mockResolvedValue({ ...renamed, items: [renamed.items[0]!] });
+    await click(root, controller, '[data-action="delete-item"]');
+    await click(root, controller, '[data-action="confirm-delete"]');
+    expect(api.deleteItem).toHaveBeenCalledWith(1, 11);
+    expect(names(root)).toEqual([]);
+  });
+
+  it("leaves bulk image targets, comparison, ranking and list data intact and resets on list change", async () => {
+    const { root, controller, api, state } = setup();
+    await controller.initialize();
+    query(root, "りん");
+    missingOnly(root);
+    await click(root, controller, '[data-action="bulk-images"]');
+    expect(root.querySelector("dialog")!.textContent).toContain("画像未登録 2 件");
+    await click(root, controller, '[data-action="close-modal"]');
+    api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    await controller.navigate("settings");
+    await controller.checkSearchSettings();
+    await controller.navigate("items");
+    await click(root, controller, '[data-action="bulk-images"]');
+    await click(root, controller, '[data-action="start-bulk-images"]');
+    expect(api.autoRegisterImage.mock.calls).toEqual([
+      [1, 10, "brave"],
+      [1, 11, "brave"],
+    ]);
+    await click(root, controller, '[data-action="close-modal"]');
+    await controller.navigate("compare");
+    expect(api.nextPair).toHaveBeenCalled();
+    expect(root.querySelectorAll(".pair-card")).toHaveLength(2);
+    await controller.navigate("ranking");
+    expect(root.querySelectorAll(".rank-row")).toHaveLength(2);
+    expect(controller.state.active!.items).toHaveLength(2);
+    await controller.navigate("items");
+    expect(names(root)).toEqual(["りんご"]);
+    api.getList.mockResolvedValue({ ...state, id: 2 });
+    await controller.selectList(2);
+    expect(controller.state.itemNameQuery).toBe("");
+    expect(controller.state.itemsMissingImagesOnly).toBe(false);
+    expect(names(root)).toHaveLength(2);
+  });
+});

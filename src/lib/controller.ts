@@ -47,6 +47,8 @@ export type AppState = {
   canUndoAnswer: boolean;
   view: View;
   selectedTagIds: number[];
+  itemNameQuery: string;
+  itemsMissingImagesOnly: boolean;
   busy: boolean;
   initialized: boolean;
   fatal: boolean;
@@ -139,6 +141,8 @@ export class AppController {
     canUndoAnswer: false,
     view: "items",
     selectedTagIds: [],
+    itemNameQuery: "",
+    itemsMissingImagesOnly: false,
     busy: false,
     initialized: false,
     fatal: false,
@@ -217,6 +221,8 @@ export class AppController {
 
   private async loadFirstAvailableList(): Promise<ListState | null> {
     this.state.selectedTagIds = [];
+    this.state.itemNameQuery = "";
+    this.state.itemsMissingImagesOnly = false;
     this.state.lists = await this.api.listSummaries();
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const first = this.state.lists[0];
@@ -249,6 +255,13 @@ export class AppController {
       this.state.modal = null;
       this.state.view = list.convergence.converged ? "ranking" : "items";
     });
+  }
+
+  setItemFilters(query: string, missingOnly: boolean): void {
+    if (this.state.busy) return;
+    this.state.itemNameQuery = query;
+    this.state.itemsMissingImagesOnly = missingOnly;
+    this.changed();
   }
 
   toggleTag(tagId: number): void {
@@ -539,6 +552,10 @@ export class AppController {
       previous?.id !== list.id
         ? []
         : this.state.selectedTagIds.filter((id) => list.tags.some((tag) => tag.id === id));
+    if (previous?.id !== list.id) {
+      this.state.itemNameQuery = "";
+      this.state.itemsMissingImagesOnly = false;
+    }
     this.state.active = list;
     this.state.pair = null;
     this.state.comparisonPaused = false;
