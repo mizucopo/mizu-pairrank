@@ -4,6 +4,18 @@
 
 ## リリース分類
 
+`.github/release.json` の `version.scheme` に従って公開を判断します。
+
+### upstream-revision
+
+新しい squash-merged PR が main にあれば、分類ラベルなしで現在の main 全体を採番・公開します。待機中の複数 PR を一度の公開にまとめる場合もあります。上流 version・Dockerfile・設定の変更も、文書のみ・テストのみの変更も対象です。`publication.release_paths` の差分や分類ラベルでは公開を抑止しません。PR 本文には変更内容と検証結果を記載し、分類理由は不要です。通常 PR と Dependabot は同じ扱いです。
+
+上流 version を保持し、同じ上流 version では revision を進め、新しい上流 version では r0 から始めます。過去にラベルなしで取り込まれた未公開変更も、次の公開の現在の main 全体に含まれます。新しいマージ済み PR がなければ、新しい番号は作りません。
+
+### SemVer・Chrome
+
+以下の分類ラベルによる運用は SemVer・Chrome 方式に適用します。
+
 分類は PR 全体の実際の変更から判断します。タイトル・commit message・依存ライブラリの version だけで判断せず、利用者への影響、互換性、公開 API・CLI・設定・データ形式・運用を確認します。複数の影響がある場合は、最も大きい影響に対応する分類を選びます。
 
 | ラベル          | 判断基準                                                                                 |
