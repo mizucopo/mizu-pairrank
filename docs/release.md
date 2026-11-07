@@ -2,7 +2,7 @@
 
 ## 設定
 
-- squash merge を使う。分類基準、公開の選択と投稿者・メンテナーの手順は [CONTRIBUTING.md](../CONTRIBUTING.md#リリース分類) に従う。通常のテスト・lint は公開の選択にかかわらず実行する。
+- squash merge を使う。方式別公開方針、分類基準と投稿者・メンテナーの手順は [CONTRIBUTING.md](../CONTRIBUTING.md#リリース分類) に従う。通常のテスト・lint は公開の選択にかかわらず実行する。
 - 手動公開では main branch を指定する。main 以外の branch・tag を指定すると、checkout・認証設定・採番の前に失敗し、main を指定する案内を表示する。
 - 標準 GITHUB_TOKEN に contents:write と pull-requests:read を許す。main とタグへの直接 push を許す repository 設定を使う。force push は不要。PR 必須等の設定で拒否される場合は設定を確認し、workflow 側で保護を回避しない。
 - Docker Hub は DOCKERHUB_TOKEN、ECR は AWS_ROLE_ARN と OIDC の権限を設定する。採番時にも公開先を照会するため、image の照会権限が必要。
@@ -10,9 +10,9 @@
 
 ## 通常の流れ
 
-PR 品質 CI → squash merge → 最新のマージ済み PR の分類で最新 main を採番 → 採番 commit とタグの atomic push → 同じ Actions run 内でビルド・検証・公開。
+PR 品質 CI → squash merge → 方式に応じて最新 main を採番 → 採番 commit とタグの atomic push → 同じ Actions run 内でビルド・検証・公開。
 
-公開 workflow 全体は release-main の concurrency group に入り、queue:max、cancel-in-progress:false で直列化する。実行定義・script・設定が待機中に変わった場合は、その変更の新しい run に任せる。開始時点の最新 main の履歴を新しい順に確認し、前回採番以後で最後にマージされた PR 一つの分類だけを使う。main 上の commit と PR のマージイベントの対応で選び、作成日時・PR 番号・run の待機順をマージ順の代用にしない。未マージ PR、別 branch へのマージ、採番 commit は分類対象にしない。
+公開 workflow 全体は release-main の concurrency group に入り、queue:max、cancel-in-progress:false で直列化する。実行定義・script・設定が待機中に変わった場合は、その変更の新しい run に任せる。開始時点の最新 main の履歴を新しい順に確認し、前回採番以後で最後にマージされた PR 一つを選ぶ。SemVer・Chrome はその PR の分類だけを使い、upstream-revision は分類ラベルを参照せず公開する。main 上の commit と PR のマージイベントの対応で選び、作成日時・PR 番号・run の待機順をマージ順の代用にしない。未マージ PR、別 branch へのマージ、採番 commit は新しい公開の対象 PR にしない。
 
 公開の可否は [CONTRIBUTING.md](../CONTRIBUTING.md#リリース分類) の方針に従う。マージイベントの証拠が取得できない場合は、古い PR の分類へ戻らず停止する。公開対象は現在の main 全体とする。
 
@@ -22,7 +22,7 @@ PR 品質 CI → squash merge → 最新のマージ済み PR の分類で最新
 
 記録された base は、別 PR や直接 push による main 更新より古いことがあるため、base 以後の総 commit 数だけでは判定しない。base 以前の関連 commit と過去 PR の取り込み方を再検証したり、過去 PR の分類を集計したりしない。一つの commit だけを取り込む rebase と squash はこの証拠では区別できず、一つの main commit として受け入れる。GitHub のマージ方法は squash を選ぶ。
 
-初回は新公開設定を導入した commit の親以後を対象とする。新規 repository の root commit だけでは公開しない。最初のラベル付き PR のマージ後、設定した初期 version とその分類を使って採番する。設定導入前の過去 PR を再分類しない。main への通常変更は squash-merged PR で行う。
+初回は新公開設定を導入した commit の親以後を対象とする。新規 repository の root commit だけでは公開しない。SemVer・Chrome は最初のラベル付き PR のマージ後、設定した初期 version とその分類を使って採番する。upstream-revision は最初の新しい squash-merged PR からラベルなしで採番する。設定導入前の過去 PR を再分類しない。main への通常変更は squash-merged PR で行う。
 
 旧テンプレートの plain `version` が `v1.2.5` のような値の場合、Copier update の PR で現在の値を厳格な SemVer（`1.2.5`）に直す。SemVer 方式の初回採番だけ、設定導入 commit の親にある text 形式の `version` の先頭の小文字 `v` を一つ除き、残りを厳格に検証して基準にする。ラベルなし導入後の最初の公開でも同じ基準を使う。JSON/TOML、他の path・番号方式、設定導入後の値と採番済み履歴には適用せず、不正値や複数 source の不整合は停止する。過去の version・tag・image・Release は変更しない。
 
@@ -32,7 +32,7 @@ SemVer の core を増やす場合、その core の prerelease も明示でき�
 
 Git tag、draft を含む Release、設定した image tag の未使用を確認する。衝突は次の番号へ進むが、認証・通信・照会の失敗を未作成と扱わない。latest は衝突対象にしない。version/manifest と既存 lockfile の version 項目だけを更新する。
 
-採番 commit は元の main を親とし、番号、タグ、分類対象の PR 一つ、元の SHA、run ID を trailer に記録する。main とタグを一度に push する。競合したら最新 main のマージ済み PR を選び直し、最大三回まで再計算する。保護設定や認証の拒否では停止する。
+採番 commit は元の main を親とし、番号、タグ、対象の PR 一つ、元の SHA、run ID を trailer に記録する。main とタグを一度に push する。競合したら最新 main のマージ済み PR を選び直し、最大三回まで再計算する。保護設定や認証の拒否では停止する。
 
 後続 job は採番 commit の SHA を checkout する。GITHUB_SHA は元イベントの SHA のままなので、公開対象には使わない。タグ作成による別 workflow の起動を待たず、同じ run の後続 job で完結させる。
 
@@ -53,6 +53,16 @@ Docker Hub の共通 image 照会は、repository-level の権限・可視性確
 既存の `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` がある場合は Hub 用 JWT と Registry 用の `repository:<name>:pull` scope token を別々に取得する。PAT は固定 HTTPS の認証先だけへ渡し、各 bearer は対応する API だけへ送る。設定済み認証の失敗から匿名へ fallback せず、HTTP redirect も拒否する。資格情報がない公開 repository は匿名の Registry token で確認できる。Docker / OCI の manifest と index を受け入れ、digest の欠落・不正値は失敗にする。HEAD は image や layer を download しない。
 
 採番時の未使用判定と公開前の `image-state` は単発照会のまま維持する。確認中に image を再 build/push・上書きしない。部分公開後は元 run を再実行し、同じ commit/tag の所有権を検証した既存 image と完成済み native assets を再利用して、不足工程だけを続ける。公開直後の不在は反映遅延の可能性があるが、再試行成功だけで原因を断定しない。
+
+## upstream-revision への更新
+
+upstream-revision は文書のみ・テストのみを含む、新しい squash-merged PR があれば現在の main 全体を公開する。分類ラベルを要求せず、`publication.release_paths` の差分でも公開を抑止しない。既存の `release_paths` は公開入力の宣言として保持できる。上流 version の採番規則、同じ上流 version の revision 更新、衝突検査、squash 確認と Latest 保護は変わらない。
+
+既存の upstream-revision 利用先は、repo-template の変更が main に取り込まれた後、clean な非 main branch で `copier update --trust --defaults --vcs-ref HEAD` を行う。共通 `release.py`、分類 workflow、CONTRIBUTING.md、PR テンプレート、公開手順の差分・競合を確認し、製品の品質 gate を実行する。version.scheme、version source、revision、公開先と tag 形式は製品の既存設定を保持する。共通 script の独自改変や入力一覧の拡張は、この公開方針の移行条件ではない。
+
+n8n-extended のようにラベルなしで未公開の上流更新が main に残っていても、version や revision を元に戻さない。更新 PR の squash merge 後は最新 main 全体を採番するため、その未公開変更を含む。旧 run の再実行は旧 workflow を使うため、この移行の代わりにはならない。採番済みの同一 run の再実行は差分や新しい PR に関係なく元の commit/tag を再利用し、部分公開の不足工程だけを復旧する。
+
+更新 PR の作成と検証、マージ、実公開、既存 run の再実行はそれぞれの作業範囲に従う。テンプレートの未マージ変更を利用先 main へ直接適用しない。
 
 ## Docker 所有記録の完了後整理
 
@@ -138,7 +148,7 @@ copier update --trust --defaults --vcs-ref HEAD \
 | 状態                               | 操作                                                                                                                                                                     |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 指定した分類の不正・設定・権限不足 | 示された PR ラベル・設定を修正して元 run を再実行                                                                                                                        |
-| squash の検証失敗                  | 取り込み履歴・PR base・API を確認。複数 commit の rebase や merge commit の後は、新しい squash PR で必要な修正を取り込み、その最新 PR の分類で現在の main 全体を公開する |
+| squash の検証失敗                  | 取り込み履歴・PR base・API を確認。複数 commit の rebase や merge commit の後は、新しい squash PR で必要な修正を取り込み、方式別公開方針に従い現在の main 全体を公開する |
 | main 更新による競合                | 自動で再計算。三回とも競合したら元 run を再実行                                                                                                                          |
 | push 応答が不明                    | remote の採番記録とタグを確認し、既に成功していれば同じ commit を再利用                                                                                                  |
 | build・検証失敗                    | 原因を確認。元 run の再実行は同じ番号・ソース。製品修正は新 PR・新番号                                                                                                   |

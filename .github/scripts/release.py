@@ -1134,9 +1134,14 @@ def preparation_input(git, gh, run_id, control_commit=None):
             break
     if pr is None:
         return None
-    level = classification(pr)
-    if level is None:
-        return None
+    # Upstream numbering preserves the project-provided version; a new merged
+    # PR always publishes, including docs-only changes. Labels are irrelevant.
+    if policy_at(git, main)["version"]["scheme"] == "upstream-revision":
+        level = None
+    else:
+        level = classification(pr)
+        if level is None:
+            return None
     return {
         "main": main,
         "last": last,
@@ -2034,6 +2039,8 @@ def main():
     args = parser.parse_args()
     git, gh = Git(args.root), GitHub()
     if args.action == "classification":
+        if policy_at(git, "HEAD")["version"]["scheme"] == "upstream-revision":
+            return
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         classification(gh.repo(f"/pulls/{event['number']}"))
         return

@@ -4,7 +4,7 @@
 
 Before starting work, read these files relative to the repository root:
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and release-classification policy.
+- [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and scheme-specific publication policy.
 - `.codex/project.md`
 - `.codex/languages/typescript.md`
 - `.codex/languages/rust.md`
