@@ -1,3 +1,8 @@
+import {
+  runBulkImageRegistration,
+  stopBulkImageRegistration,
+  type BulkImageRun,
+} from "./bulk-image-registration.js";
 import { localizeBackendError } from "./backend-i18n.js";
 import { t } from "./i18n.js";
 import type {
@@ -16,6 +21,8 @@ import type {
 } from "./types.js";
 import { createReport, matchingItems, reportHtml, reportPdf } from "./report.js";
 
+export type { BulkImageRun } from "./bulk-image-registration.js";
+
 export type View = "items" | "compare" | "ranking" | "tier" | "settings";
 type ReadKind = "image" | "settings";
 export type Modal =
@@ -32,15 +39,6 @@ export type Modal =
   | { kind: "image"; itemId: number }
   | { kind: "bulk-image" }
   | null;
-export type BulkImageRun = {
-  total: number;
-  done: number;
-  registered: number;
-  skipped: number;
-  stopping: boolean;
-  stopped: boolean;
-  running: boolean;
-};
 export type AppState = {
   lists: ListSummary[];
   active: ListState | null;
@@ -326,10 +324,7 @@ export class AppController {
   }
 
   stopBulkImages(): void {
-    const run = this.state.bulkRun;
-    if (!run?.running || run.stopping) return;
-    run.stopping = true;
-    this.changed();
+    stopBulkImageRegistration(this.state, this.changed);
   }
 
   async runBulkImages(): Promise<void> {
@@ -345,62 +340,16 @@ export class AppController {
       return;
     const itemIds = list.items.filter((item) => !item.image).map((item) => item.id);
     if (!itemIds.length) return;
-    const run: BulkImageRun = {
-      total: itemIds.length,
-      done: 0,
-      registered: 0,
-      skipped: 0,
-      stopping: false,
-      stopped: false,
-      running: true,
-    };
-    this.state.bulkRun = run;
-    this.state.busy = true;
-    this.state.error = "";
-    this.state.notice = "";
-    this.changed();
-    try {
-      for (const itemId of itemIds) {
-        if (run.stopping) break;
-        const outcome = await this.api.autoRegisterImage(list.id, itemId, provider);
-        if (outcome !== "registered" && outcome !== "skipped" && outcome !== "unavailable")
-          throw new Error(t("画像登録の結果を確認できませんでした。"));
-        run.done += 1;
-        if (outcome === "registered") run.registered += 1;
-        else run.skipped += 1;
-        this.changed();
-      }
-    } catch (error) {
-      this.state.error = localizeBackendError(t(errorMessage(error)));
-    } finally {
-      run.stopped = run.stopping && run.done < run.total;
-      run.running = false;
-      try {
+    await runBulkImageRegistration(this.state, itemIds, {
+      registerImage: (itemId) => this.api.autoRegisterImage(list.id, itemId, provider),
+      refreshList: async () => {
         const latest = await this.api
           .getList(list.id)
           .catch((error: unknown) => this.handleListError(list.id, error));
         await this.acceptList(latest);
-      } catch (error) {
-        this.state.error = [
-          this.state.error,
-          t("リストを再取得できませんでした: {error}", {
-            error: localizeBackendError(t(errorMessage(error))),
-          }),
-        ]
-          .filter(Boolean)
-          .join(" ");
-      }
-      this.state.notice = t(
-        run.stopped
-          ? "画像の一括登録を停止しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。"
-          : this.state.error
-            ? "画像の一括登録が中断しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。"
-            : "画像の一括登録が完了しました。{done} / {total} 件を処理し、{registered} 件を登録、{skipped} 件を見送りました。",
-        { done: run.done, total: run.total, registered: run.registered, skipped: run.skipped },
-      );
-      this.state.busy = false;
-      this.changed();
-    }
+      },
+      changed: this.changed,
+    });
   }
 
   private async readSettings<T>(load: () => Promise<T>): Promise<T | null> {

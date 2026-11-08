@@ -4762,3 +4762,161 @@ describe("OpenAI settings read recovery", () => {
     expect(controller.state.drafts.query).toBe("項目1");
   });
 });
+
+describe("bulk image registration lifecycle", () => {
+  async function setupBulk(initial = list()) {
+    const api = backend(initial);
+    api.searchSettings.mockResolvedValue({
+      ...openAiSettings,
+      braveConfigured: true,
+      ollamaConfigured: false,
+      defaultProvider: "brave",
+    });
+    const changed = vi.fn();
+    const controller = new AppController(api, changed);
+    await controller.initialize();
+    controller.openBulkImages();
+    await controller.checkSearchSettings();
+    api.getList.mockClear();
+    return { api, controller, changed };
+  }
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => (resolve = done));
+    return { promise, resolve };
+  }
+
+  it("runs sequentially with the original item order and provider, publishing each count", async () => {
+    const { api, controller, changed } = await setupBulk();
+    const first = deferred<"registered">();
+    const second = deferred<"unavailable">();
+    api.autoRegisterImage.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const running = controller.runBulkImages();
+    expect(api.autoRegisterImage.mock.calls).toEqual([[1, 11, "brave"]]);
+    expect(controller.state.bulkRun).toMatchObject({ done: 0, total: 2, running: true });
+    controller.state.bulkProvider = "ollama";
+    controller.state.active!.items.reverse();
+    changed.mockClear();
+    first.resolve("registered");
+    await vi.waitFor(() => expect(api.autoRegisterImage).toHaveBeenCalledTimes(2));
+    expect(api.autoRegisterImage.mock.calls).toEqual([
+      [1, 11, "brave"],
+      [1, 12, "brave"],
+    ]);
+    expect(controller.state.bulkRun).toMatchObject({ done: 1, registered: 1, skipped: 0 });
+    expect(changed).toHaveBeenCalledOnce();
+    expect(api.getList).not.toHaveBeenCalled();
+    second.resolve("unavailable");
+    await running;
+    expect(controller.state.bulkRun).toMatchObject({ done: 2, registered: 1, skipped: 1 });
+    expect(api.getList).toHaveBeenCalledExactlyOnceWith(1);
+    expect(controller.state.notice).toBe(
+      "画像の一括登録が完了しました。2 / 2 件を処理し、1 件を登録、1 件を見送りました。",
+    );
+  });
+
+  it("preserves partial counts and both registration and reload errors", async () => {
+    const { api, controller } = await setupBulk();
+    api.autoRegisterImage
+      .mockResolvedValueOnce("registered")
+      .mockRejectedValueOnce(new Error("registration failed"));
+    api.getList.mockRejectedValueOnce(new Error("reload failed"));
+    await controller.runBulkImages();
+    expect(controller.state.bulkRun).toMatchObject({
+      total: 2,
+      done: 1,
+      registered: 1,
+      skipped: 0,
+      running: false,
+      stopped: false,
+    });
+    expect(controller.state.error).toBe(
+      "registration failed リストを再取得できませんでした: reload failed",
+    );
+    expect(controller.state.notice).toContain("中断しました。1 / 2 件を処理");
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it("does not count an unknown response and reloads without starting the next item", async () => {
+    const { api, controller } = await setupBulk();
+    // Native responses are checked at runtime even though the API type is narrower.
+    api.autoRegisterImage.mockResolvedValueOnce("unknown" as "registered");
+    await controller.runBulkImages();
+    expect(api.autoRegisterImage).toHaveBeenCalledOnce();
+    expect(controller.state.bulkRun).toMatchObject({ done: 0, registered: 0, skipped: 0 });
+    expect(controller.state.error).toBe("画像登録の結果を確認できませんでした。");
+    expect(api.getList).toHaveBeenCalledExactlyOnceWith(1);
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it("treats repeated stop during the final item as completion", async () => {
+    const initial = list();
+    initial.items[1]!.image = { path: "existing.png", sourceUrl: null };
+    const { api, controller, changed } = await setupBulk(initial);
+    const result = deferred<"registered">();
+    api.autoRegisterImage.mockReturnValueOnce(result.promise);
+    const running = controller.runBulkImages();
+    changed.mockClear();
+    controller.stopBulkImages();
+    controller.stopBulkImages();
+    expect(changed).toHaveBeenCalledOnce();
+    result.resolve("registered");
+    await running;
+    expect(controller.state.bulkRun).toMatchObject({ done: 1, stopping: true, stopped: false });
+    expect(controller.state.notice).toContain("完了しました。1 / 1 件を処理");
+    changed.mockClear();
+    controller.stopBulkImages();
+    expect(changed).not.toHaveBeenCalled();
+  });
+
+  it("keeps operations blocked until the final list reload settles", async () => {
+    const { api, controller, changed } = await setupBulk();
+    const reload = deferred<ListState>();
+    api.getList.mockReturnValueOnce(reload.promise);
+    const running = controller.runBulkImages();
+    await vi.waitFor(() => expect(api.getList).toHaveBeenCalledOnce());
+    expect(controller.state.bulkRun?.running).toBe(false);
+    expect(controller.state.busy).toBe(true);
+    changed.mockClear();
+    controller.stopBulkImages();
+    controller.closeModal();
+    await controller.navigate("ranking");
+    await controller.runBulkImages();
+    expect(changed).not.toHaveBeenCalled();
+    expect(controller.state.modal).toEqual({ kind: "bulk-image" });
+    expect(controller.state.view).toBe("items");
+    expect(api.autoRegisterImage).toHaveBeenCalledTimes(2);
+    reload.resolve(list());
+    await running;
+    expect(controller.state.busy).toBe(false);
+    expect(changed).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the refreshed active list when its summary refresh fails", async () => {
+    const { api, controller } = await setupBulk();
+    const latest = list();
+    latest.revision += 1;
+    latest.items[0]!.image = { path: "registered.png", sourceUrl: null };
+    api.getList.mockResolvedValueOnce(latest);
+    api.listSummaries.mockRejectedValueOnce(new Error("summaries failed"));
+    await controller.runBulkImages();
+    expect(controller.state.active).toEqual(latest);
+    expect(controller.state.error).toBe("リストを再取得できませんでした: summaries failed");
+    expect(controller.state.notice).toContain("中断しました。2 / 2 件を処理");
+    expect(controller.state.busy).toBe(false);
+  });
+
+  it("recovers a deleted list and retains the bulk result and reload error", async () => {
+    const { api, controller } = await setupBulk();
+    api.getList.mockRejectedValueOnce(new Error("リストが見つかりません。"));
+    api.listSummaries.mockResolvedValue([summary(list(2))]);
+    await controller.runBulkImages();
+    expect(controller.state.active?.id).toBe(2);
+    expect(controller.state.modal).toBeNull();
+    expect(controller.state.bulkRun).toMatchObject({ done: 2, skipped: 2, running: false });
+    expect(controller.state.error).toContain("リストを再取得できませんでした:");
+    expect(controller.state.notice).toContain("中断しました。2 / 2 件を処理");
+    expect(controller.state.busy).toBe(false);
+  });
+});
