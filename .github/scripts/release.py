@@ -2042,7 +2042,12 @@ def main():
         if policy_at(git, "HEAD")["version"]["scheme"] == "upstream-revision":
             return
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-        classification(gh.repo(f"/pulls/{event['number']}"))
+        if event["pull_request"]["state"] != "open":
+            return
+        pr = gh.repo(f"/pulls/{event['number']}")
+        # A queued open-PR event can outlive the PR it was meant to validate.
+        if pr["state"] == "open":
+            classification(pr)
         return
     require(os.environ.get("GITHUB_REF") == "refs/heads/main", "Release requires main")
     if args.action in {"intent", "prepare"}:
