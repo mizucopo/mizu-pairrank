@@ -1,0 +1,36 @@
+name: Security Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "37 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: Rust dependency vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require committed lockfile
+        run: git ls-files --error-unmatch Cargo.lock && test -s Cargo.lock
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: cargo install cargo-audit --version 0.22.2 --locked --root "$RUNNER_TEMP/security-tools"
+      - name: Audit Rust dependencies
+        run: '"$RUNNER_TEMP/security-tools/bin/cargo-audit" audit --file Cargo.lock --no-yanked'
