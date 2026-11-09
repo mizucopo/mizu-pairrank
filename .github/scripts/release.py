@@ -9,7 +9,9 @@ import os
 import platform
 import re
 import shutil
-import subprocess
+
+# Release commands use argument lists, never a shell.
+import subprocess  # nosec B404
 import sys
 import tarfile
 import tempfile
@@ -47,7 +49,10 @@ def canonical(value):
 
 
 def run(*args, data=None, env=None, cwd=None):
-    result = subprocess.run(args, input=data, capture_output=True, cwd=cwd, env=env)
+    # Executables and argv come from reviewed release code or its validated policy.
+    result = subprocess.run(  # nosec B603
+        args, input=data, capture_output=True, cwd=cwd, env=env
+    )
     require(
         result.returncode == 0,
         f"{args[0]} failed: {result.stderr.decode(errors='replace')[:1000]}",
@@ -581,6 +586,14 @@ class GitHub:
             if path == "/graphql"
             else self.root + path
         )
+        endpoint = parse.urlsplit(url)
+        require(
+            endpoint.scheme == "https"
+            and bool(endpoint.hostname)
+            and endpoint.username is None
+            and endpoint.password is None,
+            "GitHub API endpoint must be an HTTPS URL without credentials",
+        )
         headers = {
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
             "Accept": "application/vnd.github+json",
@@ -590,7 +603,8 @@ class GitHub:
         data = canonical(payload) if payload is not None else None
         req = request.Request(url, headers=headers, data=data, method=method)
         try:
-            with request.urlopen(req, timeout=30) as response:
+            # The configured GitHub API URL is validated as HTTPS above.
+            with request.urlopen(req, timeout=30) as response:  # nosec B310
                 body = response.read()
         except error.HTTPError as exc:
             if missing and exc.code == 404:
@@ -880,7 +894,8 @@ def registry_head_digest(url, headers):
 
 def image_digest(image):
     if image.get("registry", "dockerhub") == "ecr":
-        result = subprocess.run(
+        # AWS CLI is runner-installed; argv is explicit and no shell is invoked.
+        result = subprocess.run(  # nosec B603, B607
             [
                 "aws",
                 "ecr",
@@ -1474,7 +1489,8 @@ def rust_extract(archive, destination):
             require(len(set(names)) == len(names), "Duplicate Rust archive members")
             for name in names:
                 safe_path(name)
-            bundle.extractall(destination)
+            # ZIP member paths were checked for absolute paths and traversal above.
+            bundle.extractall(destination)  # nosec B202
     else:
         with tarfile.open(archive) as bundle:
             members = bundle.getmembers()
@@ -1500,7 +1516,8 @@ def rust_smoke(archive, binaries, args):
         )
         for name in binaries:
             try:
-                result = subprocess.run(
+                # Intentionally smoke-test the verified, extracted release binary.
+                result = subprocess.run(  # nosec B603
                     [str(extracted / name), *args],
                     cwd=extracted,
                     capture_output=True,
