@@ -1342,7 +1342,7 @@ def create_release(gh, plan):
     return release_id
 
 
-def distribution_body(body, assets, images):
+def distribution_body(body, assets, images, *, draft_tag=None):
     lines = []
     downloads = [
         asset
@@ -1353,7 +1353,19 @@ def distribution_body(body, assets, images):
         lines = ["## Downloads", ""]
         for asset in downloads:
             name = asset["name"].replace("[", r"\[").replace("]", r"\]")
-            lines.append(f"- [{name}](<{asset['browser_download_url']}>)")
+            url = asset["browser_download_url"]
+            if draft_tag is not None:
+                endpoint = parse.urlsplit(url)
+                draft_path = re.fullmatch(
+                    r"(.*/releases/download/)untagged-[^/]+(/[^/]+)", endpoint.path
+                )
+                if draft_path:
+                    # GitHub replaces the draft tag when this release is published.
+                    path = (
+                        draft_path[1] + parse.quote(draft_tag, safe="") + draft_path[2]
+                    )
+                    url = parse.urlunsplit(endpoint._replace(path=path))
+            lines.append(f"- [{name}](<{url}>)")
     if images:
         lines += ["", "## Docker Images", ""]
         for image in images:
@@ -1822,6 +1834,7 @@ def distribution(git, gh, plan):
     require(
         checked_release_id(release, plan) == release_id, "GitHub Release ID differs"
     )
+    draft_tag = tag if release["draft"] else None
     assets = gh.pages(f"/releases/{release['id']}/assets")
     if os.environ.get("BUILD_RUST_BINARY") == "true":
         rust_asset(git, gh, release, plan, assets)
@@ -1836,7 +1849,7 @@ def distribution(git, gh, plan):
         checked_release_id(release, plan) == release_id, "GitHub Release ID differs"
     )
     body = release.get("body") or ""
-    updated = distribution_body(body, assets, plan["images"])
+    updated = distribution_body(body, assets, plan["images"], draft_tag=draft_tag)
     payload = {}
     if updated != body:
         payload["body"] = updated
