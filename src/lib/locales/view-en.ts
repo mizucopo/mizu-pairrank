@@ -1,4 +1,8 @@
 export const viewEn: Record<string, string> = {
+  接続を確認: "Check connection",
+  "検索するには、まず「接続を確認」を押してください。":
+    "Before searching, select “Check connection”.",
+  "検索設定でキーや接続を設定してください。": "Set up your key or connection in search settings.",
   " / {count} 回": " / {count} answers",
   "/ 1位": "/ 1 place",
   "1行に1項目。画像は追加後に選べます。":

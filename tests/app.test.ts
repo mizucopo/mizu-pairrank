@@ -226,7 +226,10 @@ describe("desktop app interaction", () => {
     expect(api.searchSettings).not.toHaveBeenCalled();
     expect(root.querySelector("dialog")?.textContent).toContain("APIキーを安全に保存・読み出す");
     expect(root.querySelector("dialog")?.textContent).toContain("macOS");
-    expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+    expect(root.querySelector('[data-form="search-images"] button[type="submit"]')).toBeNull();
+    expect(
+      button(root, '[data-form="search-images"] [data-action="check-search-settings"]').disabled,
+    ).toBe(false);
     expect(button(root, '[data-action="local-image"]').disabled).toBe(false);
   });
 
@@ -418,7 +421,10 @@ describe("desktop app interaction", () => {
       expect(controller.state.settings).toBeNull();
       expect(root.querySelector("dialog")?.textContent).toContain("みかん");
       expect(root.querySelector('dialog [role="alert"]')).toBeNull();
-      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+      expect(root.querySelector('[data-form="search-images"] button[type="submit"]')).toBeNull();
+      expect(
+        button(root, '[data-form="search-images"] [data-action="check-search-settings"]').disabled,
+      ).toBe(true);
       finishCurrent();
       await currentRead;
       expect(controller.state.settings?.braveConfigured).toBe(true);
@@ -2081,7 +2087,10 @@ describe("desktop app interaction", () => {
       if (!provider) throw new Error("Missing provider selector");
       provider.value = unreadable;
       provider.dispatchEvent(new Event("change", { bubbles: true }));
-      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+      expect(root.querySelector('[data-form="search-images"] button[type="submit"]')).toBeNull();
+      expect(
+        button(root, '[data-form="search-images"] [data-action="check-search-settings"]').disabled,
+      ).toBe(false);
       expect(root.querySelector("dialog")?.textContent).toContain(errorMessage);
     },
   );
@@ -2135,7 +2144,10 @@ describe("desktop app interaction", () => {
       if (!(select instanceof HTMLSelectElement)) throw new Error("Missing search provider");
       select.value = provider === "brave" ? "ollama" : "brave";
       select.dispatchEvent(new Event("change", { bubbles: true }));
-      expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+      expect(root.querySelector('[data-form="search-images"] button[type="submit"]')).toBeNull();
+      expect(
+        button(root, '[data-form="search-images"] [data-action="check-search-settings"]').disabled,
+      ).toBe(false);
     },
   );
 
@@ -2221,7 +2233,10 @@ describe("desktop app interaction", () => {
     api.removeImage.mockResolvedValueOnce({ ...state, revision: state.revision + 2 });
     await controller.initialize();
     await click(root, controller, '[data-action="image"][data-id="10"]');
-    expect(button(root, '[data-form="search-images"] button[type="submit"]').disabled).toBe(true);
+    expect(root.querySelector('[data-form="search-images"] button[type="submit"]')).toBeNull();
+    expect(
+      button(root, '[data-form="search-images"] [data-action="check-search-settings"]').disabled,
+    ).toBe(false);
     expect(button(root, '[data-action="local-image"]').disabled).toBe(false);
     expect(button(root, '[data-action="no-image"]').disabled).toBe(true);
     await click(root, controller, '[data-action="local-image"]');
@@ -3906,5 +3921,159 @@ describe("application language", () => {
     expect(api.renameItem).toHaveBeenCalledWith(1, 10, "Apple <script>");
     expect(controller.state.itemNameQuery).toBe("りんご");
     expect(root.querySelector("script")).toBeNull();
+  });
+});
+
+describe("image search connection guidance", () => {
+  function loadStyles(): void {
+    const style = document.createElement("style");
+    style.textContent = readFileSync("src/styles.css", "utf8");
+    document.body.append(style);
+  }
+  const check = '[data-form="search-images"] [data-action="check-search-settings"]';
+  const search = '[data-form="search-images"] button[type="submit"]';
+
+  it.each(["brave", "ollama", "openai"] as const)(
+    "guides an unchecked %s connection to an explicit check, then search",
+    async (provider) => {
+      loadStyles();
+      const { root, controller, api } = setup();
+      const settings = {
+        ...openAiSettings,
+        braveConfigured: provider === "brave",
+        ollamaConfigured: provider === "ollama",
+        openaiConfigured: provider === "openai",
+        defaultProvider: provider,
+      };
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      const select = root.querySelector<HTMLSelectElement>("#search-provider")!;
+      select.value = provider;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      expect(api.searchSettings).not.toHaveBeenCalled();
+      expect(api.searchImages).not.toHaveBeenCalled();
+      expect(button(root, check).disabled).toBe(false);
+      expect(getComputedStyle(button(root, check)).cursor).toBe("pointer");
+      expect(root.querySelector("#image-search-status")?.textContent).toContain("接続を確認");
+      expect(getComputedStyle(button(root, '[data-action="no-image"]')).cursor).toBe("not-allowed");
+      let finish!: () => void;
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = () => resolve(settings);
+          }),
+      );
+      button(root, check).focus();
+      button(root, check).click();
+      expect(controller.state.busy).toBe(true);
+      expect(button(root, check).disabled).toBe(true);
+      expect(getComputedStyle(button(root, check)).cursor).toBe("wait");
+      button(root, check).click();
+      expect(api.searchSettings).toHaveBeenCalledOnce();
+      finish();
+      await settle(controller);
+      expect(root.querySelector(check)).toBeNull();
+      expect(button(root, search).disabled).toBe(false);
+      expect(document.activeElement).toBe(button(root, search));
+      expect(getComputedStyle(button(root, search)).cursor).toBe("pointer");
+      expect(api.searchImages).not.toHaveBeenCalled();
+      let finishSearch!: () => void;
+      api.searchImages.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishSearch = () => resolve([]);
+          }),
+      );
+      button(root, search).click();
+      expect(getComputedStyle(button(root, search)).cursor).toBe("wait");
+      button(root, search).click();
+      expect(api.searchImages).toHaveBeenCalledExactlyOnceWith(provider, "りんご");
+      finishSearch();
+      await settle(controller);
+      expect(getComputedStyle(button(root, search)).cursor).toBe("pointer");
+    },
+  );
+
+  it("shows setup instructions and an unavailable cursor after confirming an unset key", async () => {
+    loadStyles();
+    const { root, controller, api } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, check);
+    expect(button(root, search).disabled).toBe(true);
+    expect(getComputedStyle(button(root, search)).cursor).toBe("not-allowed");
+    expect(root.querySelector("#image-search-status")?.textContent).toContain(
+      "検索設定でキーや接続を設定",
+    );
+    expect(api.searchImages).not.toHaveBeenCalled();
+    await click(root, controller, 'dialog [data-view="settings"]');
+    expect(controller.state.view).toBe("settings");
+    await click(root, controller, '[data-action="resume-image-search"]');
+    expect(button(root, search).disabled).toBe(true);
+    expect(getComputedStyle(button(root, search)).cursor).toBe("not-allowed");
+  });
+
+  it("keeps a failed connection check actionable and permits an explicit retry", async () => {
+    loadStyles();
+    const { root, controller, api } = setup();
+    api.searchSettings.mockRejectedValueOnce(new Error("access denied"));
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    await click(root, controller, check);
+    expect(controller.state.busy).toBe(false);
+    expect(root.querySelector("#image-search-status")?.textContent).toContain("access denied");
+    expect(button(root, check).disabled).toBe(false);
+    expect(getComputedStyle(button(root, check)).cursor).toBe("pointer");
+    await click(root, controller, check);
+    expect(api.searchSettings).toHaveBeenCalledTimes(2);
+    expect(getComputedStyle(button(root, search)).cursor).toBe("not-allowed");
+    expect(api.searchImages).not.toHaveBeenCalled();
+  });
+
+  it.each(["close button", "Escape"] as const)(
+    "cancels the connection check with %s and ignores its late result after reopening",
+    async (dismissal) => {
+      loadStyles();
+      const { root, controller, api } = setup();
+      let finish!: () => void;
+      api.searchSettings.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = () =>
+              resolve({
+                ...openAiSettings,
+                braveConfigured: true,
+                ollamaConfigured: false,
+                defaultProvider: "brave",
+              });
+          }),
+      );
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      button(root, check).click();
+      if (dismissal === "close button")
+        await click(root, controller, '[data-action="close-modal"]');
+      else root.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
+      expect(root.querySelector("dialog")).toBeNull();
+      await click(root, controller, '[data-action="image"][data-id="11"]');
+      finish();
+      await vi.waitFor(() =>
+        expect(api.searchSettings.mock.settledResults[0]?.type).toBe("fulfilled"),
+      );
+      expect(controller.state.settings).toBeNull();
+      expect(controller.state.busy).toBe(false);
+      expect(getComputedStyle(button(root, check)).cursor).toBe("pointer");
+      expect(root.querySelector("dialog")?.textContent).toContain("みかん");
+      expect(api.searchImages).not.toHaveBeenCalled();
+    },
+  );
+
+  it("localizes the unchecked connection action and instructions in English", async () => {
+    localStorage.setItem(languageStorageKey, "en");
+    const { root, controller } = setup();
+    await controller.initialize();
+    await click(root, controller, '[data-action="image"][data-id="10"]');
+    expect(button(root, check).textContent).toBe("Check connection");
+    expect(root.querySelector("#image-search-status")?.textContent).toContain("Before searching");
   });
 });

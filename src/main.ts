@@ -54,6 +54,8 @@ export function mountApp(
   let dialogWasOpen = false;
   let restoreModalFocus = false;
   function buttonKey(button: HTMLButtonElement): string {
+    // Keep focus when one logical control changes action after an async read.
+    if (button.dataset.focus) return JSON.stringify(["focus", button.dataset.focus]);
     const { action, view, answer, id, provider } = button.dataset;
     return JSON.stringify([
       action,
