@@ -64,6 +64,10 @@ const templates: readonly [RegExp, string][] = [
     "Could not retrieve image search results from OpenAI model ‘$1’. Choose another model that supports image search.",
   ],
   [
+    /^OpenAIのモデル「([^\r\n]*)」は検索結果を返しましたが、画像が含まれていませんでした。検索語やモデルの画像検索への対応状況を確認してください。$/,
+    "OpenAI model ‘$1’ returned search results without images. Check the query and the model's image-search support.",
+  ],
+  [
     /^OpenAIのモデル「([^\r\n]*)」が画像検索の結果を返しませんでした。モデルへのアクセス権を確認するか、別のモデルを指定してください。$/,
     "OpenAI model ‘$1’ returned no image search results. Check model access or choose another model.",
   ],

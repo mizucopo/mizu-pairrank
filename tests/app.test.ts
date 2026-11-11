@@ -2349,6 +2349,56 @@ describe("desktop app interaction", () => {
     },
   );
 
+  it.each([
+    "検索結果は取得できましたが、表示できる画像を読み込めませんでした。通信状態を確認するか、検索語を変えて再試行してください。",
+    "OpenAIの画像検索結果に利用できる画像URL・出典URLがありませんでした。検索語を変えて再試行してください。",
+    "OpenAIのモデル「gpt-6-luna」は検索結果を返しましたが、画像が含まれていませんでした。検索語やモデルの画像検索への対応状況を確認してください。",
+  ])(
+    "does not show stale zero matches while retrying or after retrieval failure: %s",
+    async (message) => {
+      const { root, controller, api } = setup();
+      api.searchSettings.mockResolvedValue({
+        ...openAiSettings,
+        braveConfigured: false,
+        ollamaConfigured: false,
+        openaiConfigured: true,
+        openaiAuthMode: "chatgpt",
+        chatgptConnected: true,
+        chatgptSharing: true,
+        defaultProvider: "openai",
+      });
+      let rejectSearch!: (error: Error) => void;
+      api.searchImages
+        .mockResolvedValueOnce([])
+        .mockImplementationOnce(
+          () =>
+            new Promise((_, reject) => {
+              rejectSearch = reject;
+            }),
+        )
+        .mockResolvedValueOnce([]);
+      await controller.initialize();
+      await click(root, controller, '[data-action="image"][data-id="10"]');
+      await click(root, controller, '[data-action="check-search-settings"]');
+      await controller.searchImages();
+      expect(root.querySelector("dialog .empty")?.textContent).toContain(
+        "画像が見つかりませんでした",
+      );
+      const pending = controller.searchImages();
+      expect(root.querySelector("dialog .empty")).toBeNull();
+      rejectSearch(new Error(message));
+      await pending;
+      expect(root.querySelector('dialog [role="alert"]')?.textContent).toBe(message);
+      expect(root.querySelector("dialog .empty")).toBeNull();
+      expect(controller.state.provider).toBe("openai");
+      await controller.searchImages();
+      expect(root.querySelector('dialog [role="alert"]')).toBeNull();
+      expect(root.querySelector("dialog .empty")?.textContent).toContain(
+        "画像が見つかりませんでした",
+      );
+    },
+  );
+
   it("preserves old candidates and the item after switching provider and a search failure", async () => {
     const { root, controller, api, state } = setup();
     api.searchSettings.mockResolvedValue({
