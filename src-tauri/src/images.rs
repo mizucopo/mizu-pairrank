@@ -1435,9 +1435,7 @@ async fn prepare_candidate(
             Ok(thumbnail) => thumbnail,
             // A broken or inaccessible thumbnail does not make the original unusable.
             // Try only this result's original URL, using the same validation and limits.
-            Err(_) => {
-                prepare_preview(&transport, decode_gate, buffer_permit, &image_url).await?
-            }
+            Err(_) => prepare_preview(&transport, decode_gate, buffer_permit, &image_url).await?,
         }
     } else {
         prepare_preview(&transport, decode_gate, buffer_permit, &image_url).await?
@@ -3920,12 +3918,23 @@ mod tests {
             assert_eq!(candidates[0].source_url, source_url);
             assert_eq!(candidates[0].title, "original survives");
             let bytes = base64::engine::general_purpose::STANDARD
-                .decode(candidates[0].preview_url.strip_prefix("data:image/png;base64,").unwrap())
+                .decode(
+                    candidates[0]
+                        .preview_url
+                        .strip_prefix("data:image/png;base64,")
+                        .unwrap(),
+                )
                 .unwrap();
             let decoded = image::load_from_memory(&bytes).unwrap();
             assert_eq!((decoded.width(), decoded.height()), (320, 160));
-            assert_eq!(*transport.fetches.lock().unwrap(), vec![thumbnail_url, image_url]);
-            assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
+            assert_eq!(
+                *transport.fetches.lock().unwrap(),
+                vec![thumbnail_url, image_url]
+            );
+            assert_eq!(
+                service.buffer_slots.available_permits(),
+                MAX_BUFFERED_IMAGES
+            );
             assert!(transport.searches.lock().unwrap().is_empty());
         }
     }
@@ -3935,22 +3944,42 @@ mod tests {
         let image_url = "https://images.example.test/original.png";
         let thumbnail_url = "https://images.example.test/thumbnail.png";
         for (thumbnail, resources, expected_url, succeeds) in [
-            (Some(thumbnail_url), vec![resource(thumbnail_url, png(4, 3))], thumbnail_url, true),
-            (Some(image_url), vec![resource(image_url, png(4, 3))], image_url, true),
+            (
+                Some(thumbnail_url),
+                vec![resource(thumbnail_url, png(4, 3))],
+                thumbnail_url,
+                true,
+            ),
+            (
+                Some(image_url),
+                vec![resource(image_url, png(4, 3))],
+                image_url,
+                true,
+            ),
             (Some(image_url), vec![], image_url, false),
             (None, vec![], image_url, false),
-            (Some("http://127.0.0.1/private.png"), vec![resource(image_url, png(4, 3))], image_url, true),
+            (
+                Some("http://127.0.0.1/private.png"),
+                vec![resource(image_url, png(4, 3))],
+                image_url,
+                true,
+            ),
         ] {
             let (_directory, service, transport) = service(Ok(Vec::new()), resources);
-            let candidates = service.prepare_candidates(vec![CandidateSeed {
-                title: "image".to_owned(),
-                source_url: "https://example.test/source".to_owned(),
-                image_url: Some(image_url.to_owned()),
-                thumbnail_url: thumbnail.map(str::to_owned),
-            }]).await;
+            let candidates = service
+                .prepare_candidates(vec![CandidateSeed {
+                    title: "image".to_owned(),
+                    source_url: "https://example.test/source".to_owned(),
+                    image_url: Some(image_url.to_owned()),
+                    thumbnail_url: thumbnail.map(str::to_owned),
+                }])
+                .await;
             assert_eq!(candidates.is_ok(), succeeds);
             assert_eq!(*transport.fetches.lock().unwrap(), vec![expected_url]);
-            assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
+            assert_eq!(
+                service.buffer_slots.available_permits(),
+                MAX_BUFFERED_IMAGES
+            );
         }
     }
 
@@ -3959,19 +3988,28 @@ mod tests {
         let image_url = "https://images.example.test/original.png";
         let thumbnail_url = "https://images.example.test/thumbnail.png";
         let (_directory, service, transport) = service(Ok(Vec::new()), vec![]);
-        let error = service.prepare_candidates(vec![CandidateSeed {
-            title: "image".to_owned(),
-            source_url: "https://example.test/source".to_owned(),
-            image_url: Some(image_url.to_owned()),
-            thumbnail_url: Some(thumbnail_url.to_owned()),
-        }]).await.unwrap_err();
+        let error = service
+            .prepare_candidates(vec![CandidateSeed {
+                title: "image".to_owned(),
+                source_url: "https://example.test/source".to_owned(),
+                image_url: Some(image_url.to_owned()),
+                thumbnail_url: Some(thumbnail_url.to_owned()),
+            }])
+            .await
+            .unwrap_err();
         assert!(error.contains("検索結果は取得できました"));
         assert!(error.contains("画像を読み込めませんでした"));
         assert!(!error.contains("mock"));
         assert!(!error.contains(image_url));
-        assert_eq!(*transport.fetches.lock().unwrap(), vec![thumbnail_url, image_url]);
+        assert_eq!(
+            *transport.fetches.lock().unwrap(),
+            vec![thumbnail_url, image_url]
+        );
         assert!(service.prepare_candidates(vec![]).await.unwrap().is_empty());
-        assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
+        assert_eq!(
+            service.buffer_slots.available_permits(),
+            MAX_BUFFERED_IMAGES
+        );
     }
 
     #[test]

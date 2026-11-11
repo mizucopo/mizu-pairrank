@@ -1515,17 +1515,26 @@ mod tests {
             let mut unsafe_image = image_result();
             unsafe_image["image_url"] = json!("http://127.0.0.1/private.png");
             let mut missing_source = image_result();
-            missing_source.as_object_mut().unwrap().remove("source_website_url");
+            missing_source
+                .as_object_mut()
+                .unwrap()
+                .remove("source_website_url");
             for (results, expected) in [
-                (vec![json!({"type": "text_result", "url": "https://example.test/text"})], "画像が含まれていません"),
+                (
+                    vec![json!({"type": "text_result", "url": "https://example.test/text"})],
+                    "画像が含まれていません",
+                ),
                 (vec![unsafe_image], "利用できる画像URL・出典URL"),
                 (vec![missing_source], "利用できる画像URL・出典URL"),
             ] {
                 let credentials = credentials(mode);
-                let (client, transport) = client(credentials.clone(), vec![response(
-                    200,
-                    event("response.completed", completed_images(results)),
-                )]);
+                let (client, transport) = client(
+                    credentials.clone(),
+                    vec![response(
+                        200,
+                        event("response.completed", completed_images(results)),
+                    )],
+                );
                 let error = client.search("cats").await.err().unwrap();
                 assert!(error.contains(expected), "{error}");
                 assert!(!error.contains("127.0.0.1"));
@@ -1534,10 +1543,13 @@ mod tests {
                 assert_eq!(transport.requests.lock().unwrap().len(), 1);
                 assert!(credentials.writes.lock().unwrap().is_empty());
             }
-            let (client, transport) = client(credentials(mode), vec![response(
-                200,
-                event("response.completed", completed_images(vec![])),
-            )]);
+            let (client, transport) = client(
+                credentials(mode),
+                vec![response(
+                    200,
+                    event("response.completed", completed_images(vec![])),
+                )],
+            );
             assert!(client.search("cats").await.unwrap().is_empty());
             assert_eq!(transport.requests.lock().unwrap().len(), 1);
         }
