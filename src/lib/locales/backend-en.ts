@@ -134,6 +134,10 @@ export const backendEn: Record<string, string> = {
   "OpenAIの検索設定を保存できませんでした。": "Could not save OpenAI search settings.",
   "検索語は1〜400文字、50語以内で入力してください。":
     "Enter a search query of 1–400 characters and no more than 50 words.",
+  "検索結果は取得できましたが、表示できる画像を読み込めませんでした。通信状態を確認するか、検索語を変えて再試行してください。":
+    "Search results were returned, but no image previews could be loaded. Check your connection or change the query and try again.",
+  "OpenAIの画像検索結果に利用できる画像URL・出典URLがありませんでした。検索語を変えて再試行してください。":
+    "OpenAI image search returned no usable image and source URLs. Change the query and try again.",
   "画像候補の取得がタイムアウトしました。検索語を変えて再試行してください。":
     "Loading image candidates timed out. Change the search query and try again.",
   "画像検索がタイムアウトしました。時間をおいて再試行してください。":

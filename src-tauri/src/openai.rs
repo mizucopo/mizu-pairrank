@@ -641,6 +641,8 @@ pub(crate) fn image_results(response: &Value, model: &str) -> Result<Vec<Candida
         .and_then(Value::as_array)
         .ok_or_else(|| "OpenAIの検索結果の形式が不正です。".to_owned())?;
     let mut found_search = false;
+    let mut found_results = false;
+    let mut found_images = false;
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for item in output
@@ -655,10 +657,12 @@ pub(crate) fn image_results(response: &Value, model: &str) -> Result<Vec<Candida
         let results = item.get("results").and_then(Value::as_array)
             .ok_or_else(|| format!("OpenAIのモデル「{model}」から画像検索の結果を取得できませんでした。画像検索に対応する別のモデルを指定してください。"))?;
         found_search = true;
+        found_results |= !results.is_empty();
         for result in results
             .iter()
             .filter(|result| result.get("type").and_then(Value::as_str) == Some("image_result"))
         {
+            found_images = true;
             let Some(image_url) = result
                 .get("image_url")
                 .and_then(Value::as_str)
@@ -701,6 +705,17 @@ pub(crate) fn image_results(response: &Value, model: &str) -> Result<Vec<Candida
     if !found_search {
         return Err(format!(
             "OpenAIのモデル「{model}」が画像検索の結果を返しませんでした。モデルへのアクセス権を確認するか、別のモデルを指定してください。"
+        ));
+    }
+    if candidates.is_empty() && found_results {
+        if found_images {
+            return Err(
+                "OpenAIの画像検索結果に利用できる画像URL・出典URLがありませんでした。検索語を変えて再試行してください。"
+                    .to_owned(),
+            );
+        }
+        return Err(format!(
+            "OpenAIのモデル「{model}」は検索結果を返しましたが、画像が含まれていませんでした。検索語やモデルの画像検索への対応状況を確認してください。"
         ));
     }
     Ok(candidates)
@@ -1492,6 +1507,40 @@ mod tests {
             .is_err()
         );
         assert!(image_results(&json!({"output": [{"type": "web_search_call", "status": "in_progress", "results": [image_result()]}]}), "selected").is_err());
+    }
+
+    #[tokio::test]
+    async fn nonempty_results_without_usable_images_are_not_reported_as_zero_matches() {
+        for mode in [OpenAiAuthMode::Api, OpenAiAuthMode::Chatgpt] {
+            let mut unsafe_image = image_result();
+            unsafe_image["image_url"] = json!("http://127.0.0.1/private.png");
+            let mut missing_source = image_result();
+            missing_source.as_object_mut().unwrap().remove("source_website_url");
+            for (results, expected) in [
+                (vec![json!({"type": "text_result", "url": "https://example.test/text"})], "画像が含まれていません"),
+                (vec![unsafe_image], "利用できる画像URL・出典URL"),
+                (vec![missing_source], "利用できる画像URL・出典URL"),
+            ] {
+                let credentials = credentials(mode);
+                let (client, transport) = client(credentials.clone(), vec![response(
+                    200,
+                    event("response.completed", completed_images(results)),
+                )]);
+                let error = client.search("cats").await.err().unwrap();
+                assert!(error.contains(expected), "{error}");
+                assert!(!error.contains("127.0.0.1"));
+                assert!(!error.contains(API_SECRET));
+                assert!(!error.contains(CHATGPT_SECRET));
+                assert_eq!(transport.requests.lock().unwrap().len(), 1);
+                assert!(credentials.writes.lock().unwrap().is_empty());
+            }
+            let (client, transport) = client(credentials(mode), vec![response(
+                200,
+                event("response.completed", completed_images(vec![])),
+            )]);
+            assert!(client.search("cats").await.unwrap().is_empty());
+            assert_eq!(transport.requests.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]

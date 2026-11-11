@@ -979,6 +979,7 @@ impl ImageService {
         &self,
         seeds: Vec<CandidateSeed>,
     ) -> Result<Vec<ImageCandidate>, String> {
+        let had_results = !seeds.is_empty();
         let mut pending = seeds.into_iter().enumerate();
         let mut active = JoinSet::new();
         let mut completed = Vec::new();
@@ -1003,6 +1004,12 @@ impl ImageService {
             if let Ok((position, Ok(candidate))) = result {
                 completed.push((position, candidate));
             }
+        }
+        if had_results && completed.is_empty() {
+            return Err(
+                "検索結果は取得できましたが、表示できる画像を読み込めませんでした。通信状態を確認するか、検索語を変えて再試行してください。"
+                    .to_owned(),
+            );
         }
         completed.sort_by_key(|(position, _)| *position);
         let mut seen = HashSet::new();
@@ -1399,10 +1406,12 @@ async fn prepare_candidate(
     buffer_slots: Arc<Semaphore>,
     seed: CandidateSeed,
 ) -> Result<ImageCandidate, String> {
-    let buffer_permit = buffer_slots
-        .acquire_owned()
-        .await
-        .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+    let buffer_permit = Arc::new(
+        buffer_slots
+            .acquire_owned()
+            .await
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?,
+    );
     let (image_url, source_url) = if let Some(image_url) = seed.image_url {
         (image_url, seed.source_url)
     } else {
@@ -1413,20 +1422,26 @@ async fn prepare_candidate(
     };
     let thumbnail_url = seed
         .thumbnail_url
-        .filter(|url| validate_public_url(url).is_ok())
-        .unwrap_or_else(|| image_url.clone());
-    let resource = transport.fetch(&thumbnail_url, MAX_IMAGE_BYTES).await?;
-    let thumbnail = tokio::task::spawn_blocking(move || {
-        // A cancelled search cannot release capacity while its blocking decoder owns bytes.
-        let _buffer_permit = buffer_permit;
-        let bytes = resource.bytes;
-        let _permit = decode_gate
-            .lock()
-            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
-        normalize_image(&bytes, 320)
-    })
-    .await
-    .map_err(|_| "画像のプレビューを作成できませんでした。".to_owned())??;
+        .filter(|url| validate_public_url(url).is_ok() && url != &image_url);
+    let thumbnail = if let Some(thumbnail_url) = thumbnail_url {
+        match prepare_preview(
+            &transport,
+            decode_gate.clone(),
+            buffer_permit.clone(),
+            &thumbnail_url,
+        )
+        .await
+        {
+            Ok(thumbnail) => thumbnail,
+            // A broken or inaccessible thumbnail does not make the original unusable.
+            // Try only this result's original URL, using the same validation and limits.
+            Err(_) => {
+                prepare_preview(&transport, decode_gate, buffer_permit, &image_url).await?
+            }
+        }
+    } else {
+        prepare_preview(&transport, decode_gate, buffer_permit, &image_url).await?
+    };
     Ok(ImageCandidate {
         id: image_url,
         title: seed.title,
@@ -1436,6 +1451,27 @@ async fn prepare_candidate(
         ),
         source_url,
     })
+}
+
+async fn prepare_preview(
+    transport: &Arc<dyn ImageTransport>,
+    decode_gate: Arc<Mutex<()>>,
+    buffer_permit: Arc<OwnedSemaphorePermit>,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let resource = transport.fetch(url, MAX_IMAGE_BYTES).await?;
+    tokio::task::spawn_blocking(move || {
+        // Cancellation must not release capacity while a blocking decoder owns bytes.
+        // The caller also retains the permit between thumbnail and original attempts.
+        let _buffer_permit = buffer_permit;
+        let bytes = resource.bytes;
+        let _permit = decode_gate
+            .lock()
+            .map_err(|_| "画像処理を続けられません。アプリを再起動してください。".to_owned())?;
+        normalize_image(&bytes, 320)
+    })
+    .await
+    .map_err(|_| "画像のプレビューを作成できませんでした。".to_owned())?
 }
 
 fn representative_image(bytes: &[u8], page_url: &str) -> Option<String> {
@@ -3857,6 +3893,85 @@ mod tests {
                 .iter()
                 .all(|url| url == image_url || url == invalid_url)
         );
+    }
+
+    #[tokio::test]
+    async fn openai_previews_fall_back_to_original_after_thumbnail_fetch_or_decode_failure() {
+        let image_url = "https://images.example.test/original.png";
+        let thumbnail_url = "https://images.example.test/thumbnail.png";
+        let source_url = "https://example.test/source";
+        for thumbnail_bytes in [None, Some(b"not an image".to_vec())] {
+            let mut resources = vec![resource(image_url, png(640, 320))];
+            if let Some(bytes) = thumbnail_bytes {
+                resources.push(resource(thumbnail_url, bytes));
+            }
+            let (_directory, service, transport) = service(Ok(Vec::new()), resources);
+            let response = serde_json::json!({"output": [{
+                "type": "web_search_call", "status": "completed", "results": [{
+                    "type": "image_result", "image_url": image_url,
+                    "thumbnail_url": thumbnail_url, "source_website_url": source_url,
+                    "caption": "original survives"
+                }]
+            }]});
+            let seeds = crate::openai::image_results(&response, "saved-model").unwrap();
+            let candidates = service.prepare_candidates(seeds).await.unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].id, image_url);
+            assert_eq!(candidates[0].source_url, source_url);
+            assert_eq!(candidates[0].title, "original survives");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(candidates[0].preview_url.strip_prefix("data:image/png;base64,").unwrap())
+                .unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (320, 160));
+            assert_eq!(*transport.fetches.lock().unwrap(), vec![thumbnail_url, image_url]);
+            assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
+            assert!(transport.searches.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn previews_do_not_fetch_original_when_thumbnail_succeeds_or_retry_the_same_url() {
+        let image_url = "https://images.example.test/original.png";
+        let thumbnail_url = "https://images.example.test/thumbnail.png";
+        for (thumbnail, resources, expected_url, succeeds) in [
+            (Some(thumbnail_url), vec![resource(thumbnail_url, png(4, 3))], thumbnail_url, true),
+            (Some(image_url), vec![resource(image_url, png(4, 3))], image_url, true),
+            (Some(image_url), vec![], image_url, false),
+            (None, vec![], image_url, false),
+            (Some("http://127.0.0.1/private.png"), vec![resource(image_url, png(4, 3))], image_url, true),
+        ] {
+            let (_directory, service, transport) = service(Ok(Vec::new()), resources);
+            let candidates = service.prepare_candidates(vec![CandidateSeed {
+                title: "image".to_owned(),
+                source_url: "https://example.test/source".to_owned(),
+                image_url: Some(image_url.to_owned()),
+                thumbnail_url: thumbnail.map(str::to_owned),
+            }]).await;
+            assert_eq!(candidates.is_ok(), succeeds);
+            assert_eq!(*transport.fetches.lock().unwrap(), vec![expected_url]);
+            assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_previews_are_errors_but_empty_searches_are_successful() {
+        let image_url = "https://images.example.test/original.png";
+        let thumbnail_url = "https://images.example.test/thumbnail.png";
+        let (_directory, service, transport) = service(Ok(Vec::new()), vec![]);
+        let error = service.prepare_candidates(vec![CandidateSeed {
+            title: "image".to_owned(),
+            source_url: "https://example.test/source".to_owned(),
+            image_url: Some(image_url.to_owned()),
+            thumbnail_url: Some(thumbnail_url.to_owned()),
+        }]).await.unwrap_err();
+        assert!(error.contains("検索結果は取得できました"));
+        assert!(error.contains("画像を読み込めませんでした"));
+        assert!(!error.contains("mock"));
+        assert!(!error.contains(image_url));
+        assert_eq!(*transport.fetches.lock().unwrap(), vec![thumbnail_url, image_url]);
+        assert!(service.prepare_candidates(vec![]).await.unwrap().is_empty());
+        assert_eq!(service.buffer_slots.available_permits(), MAX_BUFFERED_IMAGES);
     }
 
     #[test]

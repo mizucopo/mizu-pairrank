@@ -24,6 +24,31 @@ describe("native error presentation", () => {
     );
   });
 
+  it("distinguishes image retrieval failures from empty search results in English", () => {
+    setLanguagePreference("en");
+    expect(
+      localizeBackendError(
+        "検索結果は取得できましたが、表示できる画像を読み込めませんでした。通信状態を確認するか、検索語を変えて再試行してください。",
+      ),
+    ).toBe(
+      "Search results were returned, but no image previews could be loaded. Check your connection or change the query and try again.",
+    );
+    expect(
+      localizeBackendError(
+        "OpenAIの画像検索結果に利用できる画像URL・出典URLがありませんでした。検索語を変えて再試行してください。",
+      ),
+    ).toBe(
+      "OpenAI image search returned no usable image and source URLs. Change the query and try again.",
+    );
+    expect(
+      localizeBackendError(
+        "OpenAIのモデル「chosen-model」は検索結果を返しましたが、画像が含まれていませんでした。検索語やモデルの画像検索への対応状況を確認してください。",
+      ),
+    ).toBe(
+      "OpenAI model ‘chosen-model’ returned search results without images. Check the query and the model's image-search support.",
+    );
+  });
+
   it("preserves arbitrary diagnostic details and Japanese file paths verbatim", () => {
     setLanguagePreference("en");
     const details = "権限エラー: /Users/名前/項目が見つかりません。\n$& {name}";
