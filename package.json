@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
-    "pdfmake": "0.3.13",
+    "pdfmake": "0.3.14",
     "unicode-segmenter": "0.17.3"
   },
   "devDependencies": {
@@ -34,12 +34,12 @@
     "@types/node": "^26.6.6",
     "@types/pdfmake": "0.3.3",
     "happy-dom": "^21.0.4",
-    "oxlint": "^1.91.0",
-    "oxlint-tsgolint": "^7.0.2006",
+    "oxlint": "^1.93.0",
+    "oxlint-tsgolint": "^7.0.2007",
     "pdf-lib": "1.17.1",
-    "prettier": "^3.9.10",
+    "prettier": "^3.10.1",
     "typescript": "^7.0.2",
-    "vite": "^8.3.6",
+    "vite": "^8.3.8",
     "vitest": "^5.1.0"
   }
 }
