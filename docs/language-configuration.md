@@ -17,6 +17,10 @@ repo-template 側を変更してから、専用ブランチで通常の `copier 
 
 - Oxlint、Prettier、TypeScript、Vitest の共通設定、共通の開発ツールと
   `package.json` の品質コマンド（lint／format／typecheck／test／check）は上流が管理する。
+  PR ポリシーは、生成プロファイルごとの `tsconfig.json` と
+  `tsconfig.build.json` の型検査・コンパイル共通オプションをキー単位で検査する。
+  共通の `lib`／`types` は保持しつつ製品で追加でき、`include`／`exclude`、
+  入出力のパス、独自のオプションは製品側で管理する。
 - 製品の package 名、版と識別子、ランタイム依存、固有 dev 依存、lockfile、
   bundler、build コマンド、アセットとテストのフィクスチャは製品側で管理する。
 - 製品固有の追加チェックは npm の `precheck` または `postcheck` に置く。

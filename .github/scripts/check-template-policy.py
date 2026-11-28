@@ -5,26 +5,48 @@ import argparse
 import json
 import re
 import shutil
-import subprocess  # nosec B404 - checked Git and Copier argument vectors only
+# Subprocesses use fixed Git and Copier commands with explicit argument vectors.
+import subprocess  # nosec B404
 import sys
 import tempfile
 import tomllib
 from pathlib import Path
 
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 POLICY = ".github/repo-template-policy.json"
 WORKFLOW = ".github/workflows/repo-template-policy.yml"
 CHECKER = ".github/scripts/check-template-policy.py"
 WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml\Z")
 MISSING = object()
+TS_ROOT = "tsconfig.json"
+TS_BUILD = "tsconfig.build.json"
+TS_CONFIGS = {TS_ROOT, TS_BUILD}
+TS_LISTS = {("compilerOptions", "lib"), ("compilerOptions", "types")}
+TS_ROOT_OPTIONS = (
+    "allowJs", "exactOptionalPropertyTypes", "forceConsistentCasingInFileNames",
+    "isolatedModules", "lib", "module", "moduleResolution", "noEmit",
+    "noFallthroughCasesInSwitch", "noImplicitOverride", "noUncheckedIndexedAccess",
+    "noUnusedLocals", "noUnusedParameters", "skipLibCheck", "strict", "target", "types",
+)
+TS_BUILD_OPTIONS = ("declaration", "noEmit", "sourceMap", "types")
+PYTHON_TOOLS = ("mypy", "pytest", "pytest-mock", "ruff", "taskipy", "vulture")
+PYTHON_DEV = ("dependency-groups", "dev")
+JSON_STRING = r'"(?:[^"\\]|\\.)*"'
+JSONC_COMMENTS = re.compile(rf"{JSON_STRING}|//[^\r\n]*|/\*[\s\S]*?\*/")
+JSONC_TRAILING_COMMAS = re.compile(rf"{JSON_STRING}|,(?=\s*[}}\]])")
 CONFIG = {
     "pyproject.toml": (
         ("tool", "ruff", "line-length"), ("tool", "ruff", "target-version"),
         ("tool", "ruff", "lint", "select"), ("tool", "mypy", "strict"),
         ("tool", "mypy", "python_version"),
         *(("tool", "taskipy", "tasks", key) for key in ("check", "fix", "test")),
+        *((*PYTHON_DEV, tool) for tool in PYTHON_TOOLS),
     ),
+    TS_ROOT: tuple(("compilerOptions", key) for key in TS_ROOT_OPTIONS),
+    TS_BUILD: (("extends",), *(("compilerOptions", key) for key in TS_BUILD_OPTIONS)),
     "Cargo.toml": (("package", "edition"), ("profile", "release", "lto"),
                    ("profile", "release", "strip")),
     "src-tauri/Cargo.toml": (("package", "edition"),),
@@ -161,7 +183,18 @@ def render(repo, rev, values, dest):
 def parsed(name, data):
     if data is None:
         return {}
-    result = json.loads(data) if name.endswith(".json") else tomllib.loads(data.decode())
+    if name in TS_CONFIGS:
+        # TypeScript permits JSON comments and trailing commas; protect the
+        # content of quoted strings (such as paths and URLs) while stripping them.
+        uncommented = JSONC_COMMENTS.sub(
+            lambda match: match[0] if match[0].startswith('"') else " ",
+            data.decode("utf-8-sig"),
+        )
+        result = json.loads(JSONC_TRAILING_COMMAS.sub(
+            lambda match: match[0] if match[0].startswith('"') else "", uncommented
+        ))
+    else:
+        result = json.loads(data) if name.endswith(".json") else tomllib.loads(data.decode())
     if not isinstance(result, dict):
         raise ValueError(f"{name} is not structured configuration")
     return result
@@ -173,6 +206,68 @@ def field(value, key):
             return MISSING
         value = value[part]
     return value
+
+
+def shared_python_requirements(config):
+    """Project onto the shared package identities in the PEP 735 dev group."""
+    groups = config.get("dependency-groups", {})
+    if not isinstance(groups, dict):
+        raise ValueError("pyproject.toml: dependency-groups must be a table")
+    normalized = {canonicalize_name(name): value for name, value in groups.items()}
+    if len(normalized) != len(groups):
+        raise ValueError("pyproject.toml: duplicate normalized dependency group names")
+    groups = normalized
+    visited = set()
+
+    def requirements(group, active):
+        if group in active:
+            raise ValueError("pyproject.toml: cyclic dependency group include")
+        if group in visited:
+            return
+        entries = groups.get(group)
+        if not isinstance(entries, list):
+            raise ValueError(f"pyproject.toml: invalid or missing dependency group {group!r}")
+        for entry in entries:
+            if isinstance(entry, str):
+                yield Requirement(entry)
+            elif (isinstance(entry, dict) and set(entry) == {"include-group"}
+                  and isinstance(entry["include-group"], str)):
+                yield from requirements(
+                    canonicalize_name(entry["include-group"]), active | {group}
+                )
+            else:
+                raise ValueError(f"pyproject.toml: invalid dependency in group {group!r}")
+        visited.add(group)
+
+    shared = {}
+    if "dev" in groups:
+        for requirement in requirements("dev", set()):
+            package = canonicalize_name(requirement.name)
+            if package in PYTHON_TOOLS:
+                # Requirement handles PEP 508 operators, extras, direct URLs and
+                # markers; the package identity itself is compared normalized.
+                shared.setdefault(package, set()).add(requirement)
+    return shared
+
+
+def managed_values(name, key, configs):
+    values = [field(config, key) for config in configs]
+    if name not in TS_CONFIGS:
+        return values
+    if key in TS_LISTS:
+        def members(value):
+            if value is MISSING:
+                return set()
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"{name}:{'.'.join(key)} must be a list of strings")
+            return {item.casefold() if key[-1] == "lib" else item for item in value}
+
+        canonical = set().union(*(members(value) for value in values[2:]))
+        return [
+            value if value is MISSING else members(value) & canonical for value in values
+        ]
+    # For JSON booleans, 0/1 must not compare equal to false/true.
+    return [value if value is MISSING else (type(value), value) for value in values]
 
 
 def differences(base, head, old, new, migration, rules):
@@ -209,19 +304,27 @@ def differences(base, head, old, new, migration, rules):
         expected_before, expected = old.read(name), new.read(name)
         if expected_before is None and expected is None:
             continue
-        a, b, c, d, m = [parsed(name, raw) for raw in (
+        configs = [parsed(name, raw) for raw in (
             before, after, expected_before, expected, migration.read(name)
         )]
+        python_tools = (
+            [shared_python_requirements(config) for config in configs]
+            if name == "pyproject.toml" else None
+        )
         for key in keys:
             label = f"{name}:{'.'.join(key)}"
-            if label in local_keys or field(a, key) == field(b, key):
+            if label in local_keys:
                 continue
-            old_value, expected_value = field(c, key), field(d, key)
-            if old_value is MISSING and expected_value is MISSING:
+            if python_tools is not None and key[:-1] == PYTHON_DEV:
+                values = [tools.get(key[-1], MISSING) for tools in python_tools]
+            else:
+                values = managed_values(name, key, configs)
+            before_value, after_value, old_value, expected_value, migration_value = values
+            if before_value == after_value or old_value is expected_value is MISSING:
                 continue
             disabled = (old_value is not MISSING and expected_value is MISSING and
-                        field(m, key) is not MISSING)
-            if disabled or field(b, key) != expected_value:
+                        migration_value is not MISSING)
+            if disabled or after_value != expected_value:
                 failures.append(label)
     return failures
 
