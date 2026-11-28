@@ -44,3 +44,9 @@ Within the platform's instruction hierarchy, repository guidance takes precedenc
 - Generated configuration and source files remain Copier-managed. For routine updates, use `copier update`, not `copier recopy`.
 - Update from `repo-template/main` with `copier update --trust --defaults --vcs-ref HEAD` on a clean non-`main` branch.
 - Review the complete diff and resolve every Copier conflict before running the repository quality gate.
+
+## Shared implementation
+
+- Do not create a second implementation of a generated workflow, build/check command, or language-tool baseline in a consumer. Make reusable fixes in repo-template first, then apply them with Copier.
+- Keep product-specific code, dependencies, hooks and deployment contracts local. Use a documented extension point. If one is missing, propose it upstream rather than forking a managed file.
+- The Repository Template Policy check rejects new drift in managed settings and unapproved local workflow files. A necessary local workflow or supported key exception must be documented and reviewed in a separate policy update before relying on it.

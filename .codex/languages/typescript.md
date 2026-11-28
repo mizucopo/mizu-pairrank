@@ -9,3 +9,5 @@
 ```bash
 npm run check
 ```
+
+See [language configuration](../../docs/language-configuration.md) for the boundary between the shared baseline and project settings.

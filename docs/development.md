@@ -27,7 +27,9 @@ npm run check
 
 TypeScript 7・type-aware Oxlint・Prettier・Vitest・Viteビルドと、Rustのfmt・Clippy・テストを実行します。画像検索のテストはモックを利用し、実APIキーやOSの資格情報ストアにはアクセスしません。
 
-Rust依存の更新時も、テスト専用APIの互換性を含めて `npm run check` で確認し、PRのTauri Quality Checksと全OSのStorage Checksが成功したことを確認してください。特に0.xのminor更新ではAPI変更があり得るため、変更履歴と利用箇所を確認します。SQLトレースを使うテストは、登録・解除とエラー処理を `src-tauri/src/database.rs` の `set_profile_trace` に集約しています。
+Rust依存の更新時も、テスト専用APIの互換性を含めて `npm run check` で確認し、PRのTauri Quality ChecksでLinuxの品質ゲートと全OSのネイティブ回帰（`native-pr-checks`）が成功したことを確認してください。特に0.xのminor更新ではAPI変更があり得るため、変更履歴と利用箇所を確認します。SQLトレースを使うテストは、登録・解除とエラー処理を `src-tauri/src/database.rs` の `set_profile_trace` に集約しています。
+
+ネイティブ回帰は [repo-template の共通プロファイル](native-pr-checks.md)で macOS ARM64／Windows x64／Windows ARM64 に対して実行します。資材のビルド、Clippy、全機能のRustテストを維持し、Rustの依存はロックファイルに固定します。アプリ内のサードパーティー通知と配布ZIPの検証は引き続き既存の品質ゲート・リリースフローで行います。
 
 Rust依存の脆弱性は、[Security Checks](security-checks.md#rust-cargo-audit) の手順で `src-tauri/Cargo.lock` 全体を監査し、PRのSecurity Checksも成功したことを確認します。現在のビルドで選択していない任意依存や他OS向け依存も監査対象です。検出された場合は依存経路と修正版の互換性を調べ、`cargo update --manifest-path src-tauri/Cargo.toml -p <crate> --precise <修正版>` でlockfileを更新して再監査し、品質チェックを実行してください。監査の除外や失敗の無視で通さず、既存のDependabot更新と定期監査を継続します。
 

@@ -1,4 +1,4 @@
-_commit: 4208ae0
+_commit: c168aa3
 _src_path: git@github.com:mizucopo/repo-template.git
 author_email: mizu.copo@gmail.com
 author_name: みず
@@ -10,6 +10,10 @@ project_name: mizu-pairrank
 project_version: 0.7.0
 rust_version: stable
 tauri_identifier: dev.mizu.pairrank
+tauri_native_pr_targets:
+- x86_64-pc-windows-msvc
+- aarch64-pc-windows-msvc
+- aarch64-apple-darwin
 tauri_package_name: mizu-pairrank
 tauri_product_name: mizu-pairrank
 tauri_version: 0.7.0
@@ -19,11 +23,14 @@ use_docker: false
 use_gh_actions_bandit: false
 use_gh_actions_cargo_audit: true
 use_gh_actions_codeql: false
+use_gh_actions_native_pr: true
 use_gh_actions_release: false
 use_gh_actions_tauri_build: true
 use_gh_actions_tauri_homebrew_notify: true
 use_mit_license: false
+use_native_pr_hook: false
 use_python: false
+use_repo_template_policy: true
 use_rust: false
 use_tauri: true
 use_version_management: true

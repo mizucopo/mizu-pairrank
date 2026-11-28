@@ -1,0 +1,48 @@
+name: Repository Template Policy
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-template-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+          persist-credentials: false
+      - name: Check out proposed merge tree as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Check out canonical template history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mizucopo/repo-template
+          ref: main
+          fetch-depth: 0
+          path: canonical-template
+          persist-credentials: false
+      - name: Set up policy runtime
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - name: Install Copier
+        run: python -m pip install copier==9.17.1
+      - name: Check policy on committed files
+        shell: bash
+        run: |
+          if ! git -C trusted-base cat-file -e 'HEAD:.github/scripts/check-template-policy.py'; then
+            echo "Initial adoption: review the policy, then enable the check after merge."
+            exit 0
+          fi
+          python trusted-base/.github/scripts/check-template-policy.py \
+            --base trusted-base --head candidate --template canonical-template
