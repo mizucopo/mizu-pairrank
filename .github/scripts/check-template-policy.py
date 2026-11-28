@@ -4,7 +4,8 @@
 import argparse
 import json
 import re
-import subprocess
+import shutil
+import subprocess  # nosec B404 - checked Git and Copier argument vectors only
 import sys
 import tempfile
 import tomllib
@@ -47,8 +48,20 @@ SOURCES = {
 }
 
 
+def git_result(repo, *parts, check=True):
+    executable = shutil.which("git")
+    if executable is None:
+        raise ValueError("Git is required for the template policy check")
+    # Only the trusted checker selects read-only Git commands. Revisions are
+    # fixed names, verified commit IDs, or Git-provided blob IDs, not shell text.
+    return subprocess.run(  # nosec B603
+        [str(Path(executable).resolve()), "-C", str(repo), *parts],
+        check=check, capture_output=True, timeout=60,
+    )
+
+
 def git(repo, *parts):
-    return subprocess.check_output(["git", "-C", str(repo), *parts], timeout=60)
+    return git_result(repo, *parts).stdout
 
 
 class Tree:
@@ -125,8 +138,7 @@ def sha_at(repo, name):
 
 
 def ancestor(repo, earlier, later):
-    run = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", earlier, later],
-                         timeout=60, capture_output=True, check=False)
+    run = git_result(repo, "merge-base", "--is-ancestor", earlier, later, check=False)
     if run.returncode:
         raise ValueError("template commit must advance on canonical main, not a separate branch")
 
@@ -134,7 +146,9 @@ def ancestor(repo, earlier, later):
 def render(repo, rev, values, dest):
     answer_file = dest.parent / f"{dest.name}.json"
     answer_file.write_text(json.dumps(values, allow_nan=False), encoding="utf-8")
-    run = subprocess.run(
+    # Use the current Python interpreter with a fixed Copier command; the
+    # candidate answers are data and template tasks remain disabled.
+    run = subprocess.run(  # nosec B603
         [sys.executable, "-m", "copier", "copy", "--trust", "--skip-tasks",
          "--defaults", "--vcs-ref", rev, "--data-file", str(answer_file), str(repo), str(dest)],
         timeout=180, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
