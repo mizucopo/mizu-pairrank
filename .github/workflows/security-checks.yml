@@ -8,7 +8,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "37 3 * * 1"
+    - cron: "37 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -19,6 +19,8 @@ jobs:
     name: Rust dependency vulnerabilities
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      fingerprint: ${{ steps.audit.outputs.fingerprint }}
     defaults:
       run:
         working-directory: src-tauri
@@ -27,10 +29,50 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Require committed lockfile
-        run: git ls-files --error-unmatch Cargo.lock && test -s Cargo.lock
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
       - name: Install cargo-audit
         working-directory: ${{ runner.temp }}
         run: cargo install cargo-audit --version 0.22.2 --locked --root "$RUNNER_TEMP/security-tools"
       - name: Audit Rust dependencies
-        run: '"$RUNNER_TEMP/security-tools/bin/cargo-audit" audit --file Cargo.lock --no-yanked'
+        id: audit
+        env:
+          AUDIT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: >-
+          python3 -I "$GITHUB_WORKSPACE/.github/scripts/run-cargo-audit.py"
+          "$RUNNER_TEMP/security-tools/bin/cargo-audit" src-tauri/Cargo.lock
+
+  notify-rust-audit:
+    name: Notify maintainers of scheduled Rust audit findings
+    needs: cargo-audit
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.cargo-audit.outputs.fingerprint != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    concurrency:
+      group: scheduled-rust-audit-notification
+    steps:
+      - name: Open a notification issue if needed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ENTERPRISE_TOKEN: ${{ github.token }}
+          AUDIT_ASSIGNEE: ${{ vars.RUST_AUDIT_ASSIGNEE }}
+          AUDIT_FINGERPRINT: ${{ needs.cargo-audit.outputs.fingerprint }}
+        run: |
+          export GH_HOST="${GITHUB_SERVER_URL#https://}"
+          marker="<!-- scheduled-rust-audit:$AUDIT_FINGERPRINT -->"
+          open_issue=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" |
+            jq -r --arg marker "$marker" '.[] | select(.pull_request == null and .user.type == "Bot" and ((.body // "") | contains($marker))) | .number')
+          if [[ -n "$open_issue" ]]; then
+            exit 0
+          fi
+          assignee=()
+          if [[ -n "$AUDIT_ASSIGNEE" ]]; then
+            assignee=(--assignee="$AUDIT_ASSIGNEE")
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Rust dependency audit blocked on the default branch" \
+            --body "$(printf '%s\nThe scheduled audit found blocking Rust advisories. See the [workflow run](%s) for affected dependencies and advisory IDs.' "$marker" "$run_url")" \
+            "${assignee[@]}"
