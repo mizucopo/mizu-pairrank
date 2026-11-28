@@ -18,7 +18,7 @@ copier update --trust --defaults --vcs-ref HEAD -d use_gh_actions_cargo_audit=tr
 
 両方のruntimeを使うprojectでは、両方の回答を同じコマンドへ追加できます。Python検査には `use_python=true`、Rust検査には `use_rust=true` または `use_tauri=true` が必要です。CodeQLの回答・GitHub設定は変更しません。無効化するときは対応する回答をfalseにしてupdateし、生成ファイルの削除差分も確認します。独自に変更したファイルはCopierが競合として残す場合があるため、不要な検査だけを取り除きます。
 
-検査はmain向けPR、mainへのpush、毎週月曜03:37 UTC、手動実行で動きます。Actionsの **Security Checks** と各jobのログで対象・結果を確認してください。検出と検査そのものの失敗を区別して確認し、失敗を無視して成功扱いにしません。必要な必須チェック設定は運用者が別途判断します。
+検査はmain向けPR、mainへのpush、手動実行で動きます。定期実行は既定ブランチが対象です。Python検査は毎週月曜03:37 UTC、Rust検査は毎日03:37 UTCです。Actionsの **Security Checks** で各jobの結果を確認できます。必要な必須チェック設定は運用者が別途判断します。
 
 ## Python: Bandit
 
@@ -50,15 +50,23 @@ git ls-files --error-unmatch Cargo.lock && test -s Cargo.lock
 "$SECURITY_TOOLS/bin/cargo-audit" audit --file Cargo.lock --no-yanked
 ```
 
-advisory DBの取得・読取り失敗や脆弱性の検出はjobを失敗させます。`--file` の明示によりlockfileの自動生成を避けます。`--no-yanked` は既知脆弱性への照合に範囲を限定し、registry取得失敗を警告だけで続行するyanked検査を使わないための指定です。運用で `--no-fetch`、`--stale`、`continue-on-error` を追加しないでください。
+advisory DBの取得・読取りや検査結果の出力に失敗した場合、またはブロック対象を検出した場合はjobが失敗します。`--file` の明示によりlockfileの自動生成を避けます。`--no-yanked` は既知アドバイザリへの照合に範囲を限定する指定です。
+
+PRの監査対象はGitHub Actionsがcheckoutしたマージコミットです。ブロック対象があるときは、PRイベントが示すベースコミットの `Cargo.lock` を、監査対象と同じ設定・同じadvisory DBで検査します。判定の照合とベースの検査は `--no-fetch` を指定し、最初の検査で使ったDBを再利用します。jobのログとサマリーにcrate・バージョン・アドバイザリIDを表示し、この組み合わせがベースでも検出された場合は「ベースにも存在」、PR側で初めて検出された場合は「PRで新規」と表示します。ベースのコミットやlockfileを取得できない場合、または照合に失敗した場合は「未確認」と表示します。これらの分類にかかわらず、PR側にブロック対象があればjobは失敗します。
 
 依存関係に脆弱性がある場合は更新・置換を優先し、受容する場合は影響と理由をレビューしてください。既存の `.cargo/audit.toml` がある場合は、適用範囲・除外・DB設定も確認します。Tauriでは `src-tauri/.cargo/audit.toml` が対象です。
 
 cargo-auditはRustソースの静的セキュリティ解析ではなく、ライセンス・禁止crate・取得元を制限するcargo-denyの代わりでもありません。通常のClippyとテストを維持します。ソースの追加解析には、利用条件を満たすrepositoryで既存のCodeQLオプションを検討します。
 
+### 定期実行の通知
+
+既定ブランチの定期監査でブロック対象を検出すると、同じリポジトリの Issues にログへのリンクを含む通知を作成します。通知を担当者に割り当てるには、リポジトリの Actions 変数 `RUST_AUDIT_ASSIGNEE` に、Issue に割り当て可能な GitHub ユーザー名を設定してください。未設定の場合はリポジトリの Issues を購読しているメンテナーが通知を受け取れます。同じ検出の組み合わせを通知する Issue が開いている間は重複作成を抑止します。対応した検出が解消されたことを確認後、メンテナーが Issue を閉じてください。
+
+この通知には Issues の有効化が必要です。GitHub Actions 標準の定期実行通知は、受信設定に従いcronを最後に変更したユーザーに届きます。監査処理自体が失敗した場合はActionsの失敗ログを確認してください。
+
 ## 権限、結果、更新
 
-jobの権限は `contents: read` だけで、checkout credentialを保存しません。`pull_request_target`、独自token、本番Secret、外部SASTサービス、SARIFのCode scanning uploadを使いません。ソース・検査結果はrunnerと既存のActionsログ内で扱います。別のSAST SaaSへ送る構成ではありません。依存パッケージ・advisory DBの取得にはネットワーク接続が必要です。
+検査jobの権限は `contents: read` で、checkout credentialを保存しません。定期監査の通知jobだけが標準のGitHub tokenの `issues: write` 権限を使います。個別の検査結果はActionsのログとサマリーに記録します。独自token、本番Secret、外部SASTサービス、SARIF uploadは不要です。依存パッケージ・advisory DBの取得にはネットワーク接続が必要です。
 
 private repositoryではGitHub Actionsの利用枠・料金・保存条件が適用されます。GitHub Code scanningがDisabledのままでも、このworkflowは独立して実行できます。検査成功は脆弱性が一切ないことの保証ではありません。
 

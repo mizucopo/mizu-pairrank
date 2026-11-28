@@ -29,6 +29,8 @@ TypeScript 7・type-aware Oxlint・Prettier・Vitest・Viteビルドと、Rust�
 
 Rust依存の更新時も、テスト専用APIの互換性を含めて `npm run check` で確認し、PRのTauri Quality Checksと全OSのStorage Checksが成功したことを確認してください。特に0.xのminor更新ではAPI変更があり得るため、変更履歴と利用箇所を確認します。SQLトレースを使うテストは、登録・解除とエラー処理を `src-tauri/src/database.rs` の `set_profile_trace` に集約しています。
 
+Rust依存の脆弱性は、[Security Checks](security-checks.md#rust-cargo-audit) の手順で `src-tauri/Cargo.lock` 全体を監査し、PRのSecurity Checksも成功したことを確認します。現在のビルドで選択していない任意依存や他OS向け依存も監査対象です。検出された場合は依存経路と修正版の互換性を調べ、`cargo update --manifest-path src-tauri/Cargo.toml -p <crate> --precise <修正版>` でlockfileを更新して再監査し、品質チェックを実行してください。監査の除外や失敗の無視で通さず、既存のDependabot更新と定期監査を継続します。
+
 ## 評価と順位判定
 
 「大好き」は相手との好みの差が大きいことを意味します。5段階へ拡張したTrueSkillで評価と不確実性σを更新し、期待情報量の大きいペアを自動選択します。順位は推定評価μの順です。
