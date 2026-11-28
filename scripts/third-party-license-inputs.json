@@ -1,8 +1,8 @@
 {
   "description": "Offline licensing inputs for components embedded in pdfmake. Component versions are not asserted; licenseSourceVersion identifies the original license text source. Bundle/source-map hashes bind this inventory to the distributed bytes.",
-  "pdfmakeVersion": "0.3.13",
-  "bundleSha256": "3accf415ced26156d9806781711b723826ca0a91e8b9eafc93d7a5b46e81117c",
-  "sourceMapSha256": "c652f2d1cb1a1c0b4aa673012187c80ac7eef897b7afcd1ddfe6f437a7192096",
+  "pdfmakeVersion": "0.3.14",
+  "bundleSha256": "1f3a40370240e0ac8ea8f4e5f4aad7beb5c8db42b88db5959d503b6a8246f060",
+  "sourceMapSha256": "09b6b7811319c23515e381e2a70d29c9281e52bd05f1bc21c9746ffd12dffb63",
   "bundlePackages": {
     "@noble/ciphers": {
       "license": "MIT",
@@ -253,20 +253,6 @@
         }
       ]
     },
-    "tslib": {
-      "license": "0BSD",
-      "licenseSourceVersion": "2.8.1",
-      "records": [
-        {
-          "source": "npm:tslib@2.8.1/CopyrightNotice.txt",
-          "text": "/******************************************************************************\nCopyright (c) Microsoft Corporation.\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH\nREGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY\nAND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,\nINDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM\nLOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR\nOTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR\nPERFORMANCE OF THIS SOFTWARE.\n***************************************************************************** */\n\n"
-        },
-        {
-          "source": "npm:tslib@2.8.1/LICENSE.txt",
-          "text": "Copyright (c) Microsoft Corporation.\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH\nREGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY\nAND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,\nINDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM\nLOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR\nOTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR\nPERFORMANCE OF THIS SOFTWARE."
-        }
-      ]
-    },
     "unicode-properties": {
       "license": "MIT",
       "licenseSourceVersion": "1.4.1",
@@ -366,6 +352,14 @@
     {
       "source": "https://registry.color.org/profile-library/ (sRGB2014 profile embedded from npm:pdfkit@0.20.2/js/data/sRGB_IEC61966_2_1.icc; SHA-256: 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a)",
       "text": "Copyright International Color Consortium, 2015\n\nThis profile is made available by the International Color Consortium, and may be copied, distributed, embedded, made, used, and sold without restriction. Altered versions of this profile shall have the original identification and copyright information removed and shall not be misrepresented as the original profile.\n"
+    },
+    {
+      "source": "npm:tslib@2.8.1/CopyrightNotice.txt (decorator attribution retained: the bundled SWC helper matches the previous tslib decorator implementation)",
+      "text": "/******************************************************************************\nCopyright (c) Microsoft Corporation.\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH\nREGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY\nAND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,\nINDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM\nLOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR\nOTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR\nPERFORMANCE OF THIS SOFTWARE.\n***************************************************************************** */\n\n"
+    },
+    {
+      "source": "npm:tslib@2.8.1/LICENSE.txt (decorator attribution retained: the bundled SWC helper matches the previous tslib decorator implementation)",
+      "text": "Copyright (c) Microsoft Corporation.\n\nPermission to use, copy, modify, and/or distribute this software for any\npurpose with or without fee is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH\nREGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY\nAND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,\nINDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM\nLOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR\nOTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR\nPERFORMANCE OF THIS SOFTWARE."
     }
   ]
 }
