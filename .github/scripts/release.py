@@ -202,8 +202,12 @@ def publication(policy, version, revision=None):
         "release_paths": spec["release_paths"],
         "latest_image": spec.get("latest_image"),
         "github_release": spec["github_release"],
-        "is_prerelease": policy["version"]["scheme"] != "chrome"
-        and version_key(version, "semver")[1] == 0,
+        "is_prerelease": (
+            spec["github_release_prerelease"]
+            if "github_release_prerelease" in spec
+            else policy["version"]["scheme"] != "chrome"
+            and version_key(version, "semver")[1] == 0
+        ),
     }
 
 
@@ -741,6 +745,19 @@ def policy_at(git, commit):
         set(policy) == {"version", "publication"},
         "release.json requires version and publication only",
     )
+    version = policy["version"]
+    if "revision_policy" in version:
+        require(
+            version["revision_policy"] == "authored"
+            and version["scheme"] == "upstream-revision"
+            and version.get("revision_path"),
+            "Authored revisions require an upstream-revision path",
+        )
+    if "github_release_prerelease" in policy["publication"]:
+        require(
+            type(policy["publication"]["github_release_prerelease"]) is bool,
+            "github_release_prerelease must be boolean",
+        )
     return policy
 
 
@@ -1073,6 +1090,59 @@ def verify_squash_merge(git, gh, commit, pr):
     )
 
 
+def filtered_release_paths(policy):
+    # A wake-up on controller edits must not turn implementation changes into
+    # release input. A project can still explicitly declare its own hook.
+    controller_files = {
+        POLICY,
+        ".github/scripts/release.py",
+        ".github/scripts/docker-image-pipeline.py",
+        ".github/scripts/manage-docker-image-owner.sh",
+    }
+    return [
+        safe_path(path)
+        for path in policy["publication"]["release_paths"]
+        if path not in controller_files and not path.startswith(".github/workflows/")
+    ]
+
+
+def release_filter_baseline(git, main):
+    # With no prior release record, enabling the option establishes a baseline
+    # without reserving a historical tag. Continue through later policy edits.
+    baseline = main
+    for commit in git.text(
+        "log", "--first-parent", "--format=%H", main, "--", POLICY
+    ).splitlines():
+        blob = git.blob(commit, POLICY, optional=True)
+        if (
+            not blob
+            or json.loads(blob).get("publication", {}).get("filter_release_push")
+            is not True
+        ):
+            break
+        baseline = commit
+    return baseline
+
+
+def pending_release_input_commits(git, main, last, policy):
+    paths = filtered_release_paths(policy)
+    require(paths, "Filtered release requires at least one release input path")
+    baseline = last["commit"] if last else release_filter_baseline(git, main)
+    before, after = git.entries(baseline), git.entries(main)
+    if all(before.get(path) == after.get(path) for path in paths):
+        return set()
+    return set(
+        git.text(
+            "log",
+            "--first-parent",
+            "--format=%H",
+            f"{baseline}..{main}",
+            "--",
+            *(f":(literal){path}" for path in paths),
+        ).splitlines()
+    )
+
+
 def preparation_input(git, gh, run_id, control_commit=None):
     require(str(run_id).isdigit(), "GITHUB_RUN_ID is required")
     require(
@@ -1097,6 +1167,22 @@ def preparation_input(git, gh, run_id, control_commit=None):
             # The newer push has its own queued run with the updated workflow.
             return None
     last = history[0] if history else None
+    policy = policy_at(git, main)
+    input_commits = None
+    if (
+        os.environ.get("GITHUB_EVENT_NAME") == "push"
+        and policy["publication"].get("filter_release_push") is True
+    ):
+        input_commits = pending_release_input_commits(git, main, last, policy)
+        if not input_commits:
+            return None
+    if policy["version"].get("revision_policy") == "authored":
+        # A fresh manual run can resume the exact current frozen publication.
+        if last and last["commit"] == main:
+            if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+                return {"record": last}
+            return None
+        return {"main": main, "authored": True}
     introduction = None
     if last:
         boundary = last["commit"]
@@ -1116,6 +1202,8 @@ def preparation_input(git, gh, run_id, control_commit=None):
         boundary = parents[1] if len(parents) == 2 else None
     commits = git.ancestors(main)
     pending = commits[: commits.index(boundary)] if boundary else commits
+    if input_commits is not None:
+        pending = [commit for commit in pending if commit in input_commits]
     if not pending:
         return None
     # Stop at the newest merge on main; older PR classifications are irrelevant.
@@ -1151,7 +1239,7 @@ def preparation_input(git, gh, run_id, control_commit=None):
         return None
     # Upstream numbering preserves the project-provided version; a new merged
     # PR always publishes, including docs-only changes. Labels are irrelevant.
-    if policy_at(git, main)["version"]["scheme"] == "upstream-revision":
+    if policy["version"]["scheme"] == "upstream-revision":
         level = None
     else:
         level = classification(pr)
@@ -1183,9 +1271,7 @@ def prepare(git, gh, run_id, control_commit=None):
             return {"publish": "false"}
         if "record" in candidate:
             return prepared(git, candidate["record"])
-        main, last = candidate["main"], candidate["last"]
-        pr, level = candidate["pr"], candidate["level"]
-        numbers = [pr["number"]]
+        main = candidate["main"]
         policy = policy_at(git, main)
         version = read_version(git, main, policy)
         revision_path = policy["version"].get("revision_path")
@@ -1194,42 +1280,59 @@ def prepare(git, gh, run_id, control_commit=None):
             if revision_path
             else None
         )
-        baseline = candidate["baseline"]
-        base_version = (
-            read_version(
-                git,
-                baseline,
-                policy,
-                allow_missing=not last,
-                allow_legacy_prefix=not last and baseline != candidate["introduction"],
+        if candidate.get("authored"):
+            # Adopt the version/revision already committed by the project.
+            # Preserve source bytes and bind the selected tags to the usual
+            # numbering record even when the resulting tree is unchanged.
+            plan = publication(policy, version, revision)
+            require(
+                not remote_collisions(gh, plan),
+                "Authored tag or image already exists; declare an unused revision",
             )
-            if baseline
-            else None
-        )
-        if base_version is None:
-            # A newly introduced source has no parent value. Preserve its
-            # adoption value even when unlabeled PRs defer the first release.
-            baseline = candidate["introduction"]
-            base_version = read_version(git, baseline, policy_at(git, baseline))
-        base_revision = (
-            (git.blob(baseline, revision_path, True) or b"r0").decode().strip()
-            if baseline and revision_path
-            else revision
-        )
-        explicit = version if version != base_version and not revision_path else None
-        version, revision, plan = choose(
-            policy,
-            base_version,
-            level,
-            explicit,
-            lambda p: remote_collisions(gh, p),
-            base_revision=base_revision,
-            input_version=version,
-            explicit_revision=revision
-            if revision_path and revision != base_revision
-            else None,
-        )
-        tree = update_versions(git, main, policy, version, revision)
+            tree = git.text("rev-parse", main + "^{tree}").strip()
+            numbers = []
+        else:
+            numbers = [candidate["pr"]["number"]]
+            level, last = candidate["level"], candidate["last"]
+            baseline = candidate["baseline"]
+            base_version = (
+                read_version(
+                    git,
+                    baseline,
+                    policy,
+                    allow_missing=not last,
+                    allow_legacy_prefix=not last
+                    and baseline != candidate["introduction"],
+                )
+                if baseline
+                else None
+            )
+            if base_version is None:
+                # A newly introduced source has no parent value. Preserve its
+                # adoption value even when unlabeled PRs defer the first release.
+                baseline = candidate["introduction"]
+                base_version = read_version(git, baseline, policy_at(git, baseline))
+            base_revision = (
+                (git.blob(baseline, revision_path, True) or b"r0").decode().strip()
+                if baseline and revision_path
+                else revision
+            )
+            explicit = (
+                version if version != base_version and not revision_path else None
+            )
+            version, revision, plan = choose(
+                policy,
+                base_version,
+                level,
+                explicit,
+                lambda p: remote_collisions(gh, p),
+                base_revision=base_revision,
+                input_version=version,
+                explicit_revision=revision
+                if revision_path and revision != base_revision
+                else None,
+            )
+            tree = update_versions(git, main, policy, version, revision)
         message = (
             f"chore(release): {plan['release_tag']}\n\nRepo-Template-Release: 1\n"
             f"Release-Source: {main}\nRelease-Run: {run_id}\n"

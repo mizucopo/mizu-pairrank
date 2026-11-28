@@ -54,3 +54,6 @@ coverage/
 
 # Superpowers docs
 docs/superpowers/
+
+# Repository-local workflow tools
+.tools/
